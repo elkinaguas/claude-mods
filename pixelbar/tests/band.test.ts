@@ -197,6 +197,46 @@ test('starts up even when a command name is refused', async ($, on) => {
   expect(row).toContain('Opus 5.5 · high (200k) │ ~/code')
 })
 
+const paneProps = { title: 'Session files', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 30 } } as never
+
+const editResult = (filePath: string, lines: string[]) => ({
+  result: {
+    filePath,
+    oldString: 'a',
+    newString: 'b',
+    originalFile: 'a\n',
+    structuredPatch: [{ oldStart: 3, oldLines: 1, newStart: 3, newLines: 2, lines }],
+    userModified: false,
+    replaceAll: false,
+  },
+})
+
+test('the files pane lists edited files and shows the chosen diff', async ($, on) => {
+  on('tool.call', { tool: 'Edit' }, (_$, e) =>
+    e.file_path.endsWith('app.ts') ? editResult(e.file_path, ['-old', '+new', '+more']) : editResult(e.file_path, ['+x']),
+  )
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/w/app.ts', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/w/util.ts', old_string: 'a', new_string: 'b' })
+
+  const ran = await $.command.run({ command: 'session-files', args: '', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  expect(ran).toMatchObject({ text: '2 files edited this session.' })
+
+  const pane = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'Pane', requestId: 'pixelbar-files', props: paneProps })
+  // Most recent first, and its diff shown.
+  expect((await pane.find({ key: 'file:/w/util.ts' }))?.props.label).toContain('▸')
+  expect(String((await pane.find({ type: 'Code' }))?.props.source)).toBe('@@ -3,0 +3,1 @@\n+x')
+
+  await pane.press({ key: 'file:/w/app.ts' })
+  expect((await pane.find({ key: 'file:/w/app.ts' }))?.props.label).toContain('▸')
+  expect(String((await pane.find({ type: 'Code' }))?.props.source)).toBe('@@ -3,1 +3,2 @@\n-old\n+new\n+more')
+})
+
+test('the files pane says when nothing was edited', async $ => {
+  const pane = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'Pane', requestId: 'pixelbar-files', props: paneProps })
+  expect(await pane.drawn()).toMatchObject({ type: 'Text' })
+})
+
 test('yields the band to a survey', async ($, on) => {
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Text } = $.ui.resolve(e)

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, SessionRateLimit, StateDollar } from 'claude-code'
 
-import type { PixelbarBadge, PixelbarFocus, PixelbarPace, PixelbarTurn } from '../types'
+import type { PixelbarBadge, PixelbarFile, PixelbarFocus, PixelbarPace, PixelbarTurn } from '../types'
 
 // Status bar++: one Raster above the prompt, repainted ~8 times a second
 // with $.ui.blit. Left: an animated pixel Clawd. Right: three rows of info.
@@ -92,7 +92,48 @@ function paceLeft(now: number): number | undefined {
   return left < reset ? left : undefined
 }
 
-type Hunk = { lines: string[] }
+type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }
+
+// ---------- files pane ----------
+
+const filesAtom = atom({ plugin: 'pixelbar', key: 'files' } as const, [])
+const selectedAtom = atom({ plugin: 'pixelbar', key: 'selectedFile' } as const, null)
+const FILES_COMMAND = 'session-files'
+const FILES_PANE = 'pixelbar-files'
+const MAX_FILES = 200
+const MAX_PATCHES = 30
+
+// An Edit's or Write's hunks; a new file with no patch is all added lines.
+function hunksOf(hunks: readonly Hunk[], created?: string): readonly Hunk[] {
+  if (hunks.length > 0 || created === undefined) return hunks
+  const lines = created.split('\n').map(l => '+' + l)
+  return [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: lines.length, lines }]
+}
+
+// The header's counts come from the lines themselves, so the diff always parses.
+function patchOf(h: Hunk): string {
+  const oldLines = h.lines.filter(l => !l.startsWith('+')).length
+  const newLines = h.lines.filter(l => !l.startsWith('-')).length
+  return `@@ -${h.oldStart},${oldLines} +${h.newStart},${newLines} @@\n${h.lines.join('\n')}`
+}
+
+function withEdit(files: PixelbarFile[], path: string, added: number, removed: number, patches: string[]): PixelbarFile[] {
+  const old = files.find(f => f.path === path)
+  const file: PixelbarFile = {
+    path,
+    added: (old?.added ?? 0) + added,
+    removed: (old?.removed ?? 0) + removed,
+    patches: [...(old?.patches ?? []), ...patches].slice(-MAX_PATCHES),
+    at: Date.now(),
+  }
+  return [...files.filter(f => f.path !== path), file].slice(-MAX_FILES)
+}
+
+// A path as the person reads it: relative to the session's folder when inside it.
+function shownPath(p: string): string {
+  if (data.cwd && p.startsWith(data.cwd + '/')) return p.slice(data.cwd.length + 1)
+  return prettyPath(p, data.home, 200)
+}
 
 // Lines added and removed by an Edit or Write, from the patch it reported.
 function countLines(hunks: readonly Hunk[]): { added: number; removed: number } {
@@ -642,6 +683,10 @@ export const register: Register = on => {
     const commands = [
       { name: 'pixelbar', description: 'Show or hide the pixel status bar above the prompt' },
       {
+        name: FILES_COMMAND,
+        description: 'Open a pane of the files edited this session, with their diffs',
+      },
+      {
         name: FOCUS_COMMAND,
         description: `Start a focus timer: /${FOCUS_COMMAND} [minutes] (default ${FOCUS_DEFAULT_MIN}), /${FOCUS_COMMAND} off`,
       },
@@ -718,6 +763,46 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('command.run', { command: FILES_COMMAND }, async $ => {
+    const files = await read($, filesAtom)
+    await $.ui.open({ id: FILES_PANE, title: 'Session files', closeOnEscape: true })
+    const n = files.length
+    return { text: n === 0 ? 'No files edited yet this session.' : `${n} file${n === 1 ? '' : 's'} edited this session.` }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: FILES_PANE }, async ($, e) => {
+    const { Box, Text, Button, Code } = $.ui.resolve(e)
+    const files = [...(await read($, filesAtom))].reverse()
+    if (files.length === 0) return <Text dimColor>No files edited yet this session.</Text>
+    const selected = await read($, selectedAtom)
+    const chosen = files.find(f => f.path === selected) ?? files[0]!
+    const total = files.reduce((n, f) => ({ added: n.added + f.added, removed: n.removed + f.removed }), { added: 0, removed: 0 })
+
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row">
+          <Text bold>{files.length} file{files.length === 1 ? '' : 's'} edited </Text>
+          <Text color="green">+{total.added}</Text>
+          <Text color="red"> −{total.removed}</Text>
+        </Box>
+        {files.map(f => (
+          <Box flexDirection="row" key={`row:${f.path}`}>
+            <Button
+              key={`file:${f.path}`}
+              plain
+              label={`${f.path === chosen.path ? '▸' : ' '} ${shownPath(f.path)}`}
+              onPress={() => update($, selectedAtom, () => f.path)}
+            />
+            <Text color="green"> +{f.added}</Text>
+            <Text color="red"> −{f.removed}</Text>
+          </Box>
+        ))}
+        <Text> </Text>
+        <Code source={chosen.patches.join('\n')} format="diff" path={chosen.path} />
+      </Box>
+    )
+  })
+
   on('command.run', { command: 'pixelbar' }, async $ => {
     isHidden = !isHidden
     $.ui.invalidate('ui.render')
@@ -756,18 +841,23 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // Count the main conversation's tool calls, and the lines its edits change.
-  on('tool.call', async (_$, e, next) => {
+  // Record every edit for the files pane (subagents' too); count the main
+  // conversation's tool calls and edited lines for the turn summary.
+  on('tool.call', async ($, e, next) => {
     const r = await next(e)
-    if (!turn || e.agentId !== undefined) return r
-    turn.tools++
+    const isMain = turn !== undefined && e.agentId === undefined
+    if (isMain) turn!.tools++
     if ((e.tool === 'Edit' || e.tool === 'Write') && !r.isError && r.deny === undefined) {
       const res = r.result as { filePath?: string; structuredPatch?: Hunk[]; type?: string; content?: string } | undefined
-      let { added, removed } = countLines(res?.structuredPatch ?? [])
-      if (res?.type === 'create' && added === 0 && res.content !== undefined) added = res.content.split('\n').length
-      turn.files.add(res?.filePath ?? e.file_path)
-      turn.added += added
-      turn.removed += removed
+      const path = res?.filePath ?? e.file_path
+      const hunks = hunksOf(res?.structuredPatch ?? [], res?.type === 'create' ? res.content : undefined)
+      const { added, removed } = countLines(hunks)
+      await update($, filesAtom, files => withEdit(files, path, added, removed, hunks.map(patchOf)))
+      if (isMain) {
+        turn!.files.add(path)
+        turn!.added += added
+        turn!.removed += removed
+      }
     }
     return r
   })

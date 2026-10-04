@@ -21,6 +21,9 @@ export type PixelbarPace = { at: number; pct: number; resetsAt?: string }
 /** A running focus timer: when it ends (ms) and how long it was set for. */
 export type PixelbarFocus = { endsAt: number; minutes: number }
 
+/** A file edited this session: lines changed, and its edits as unified-diff hunks. */
+export type PixelbarFile = { path: string; added: number; removed: number; patches: string[]; at: number }
+
 declare module 'claude-code' {
   interface PluginState {
     pixelbar: {
@@ -33,6 +36,10 @@ declare module 'claude-code' {
       /** When the working tree was first seen with uncommitted changes (ms), or null while clean. */
       dirtySince: number | null
       focus: PixelbarFocus | null
+      /** Files edited this session, most recent last. */
+      files: PixelbarFile[]
+      /** The file whose diff the files pane shows; the most recent when null. */
+      selectedFile: string | null
     }
   }
 }
