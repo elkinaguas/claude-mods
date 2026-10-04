@@ -1,0 +1,12 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "Elkin Aguas" },
+  "description": "Personal Claude Code mods",
+  "plugins": [
+    {
+      "name": "pixelbar",
+      "source": "./pixelbar",
+      "description": "Status bar++: an animated pixel-art band above the prompt with model, context, rate limits, cost and git"
+    }
+  ]
+}
