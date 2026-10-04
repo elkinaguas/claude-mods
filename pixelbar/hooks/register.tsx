@@ -931,9 +931,30 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (isHidden || e.props.hasSurvey || e.surface !== 'terminal') return next(e)
     bandId = e.requestId
-    cols = Math.max(MASCOT_COLS + 20, Math.min(512, e.props.bodyColumns))
     isWorking = e.props.isWorking
-    const { Raster } = $.ui.resolve(e)
-    return <Raster key={KEY} columns={cols} rows={ROWS} cells={frame()} />
+    const { Raster, Box, Button } = $.ui.resolve(e)
+
+    // Reading the files subscribes the band, so the button appears (and its
+    // count moves) as edits land. Before the first edit there is no button.
+    const edited = (await read($, filesAtom)).length
+    const label = `${edited} file${edited === 1 ? '' : 's'}`
+    const buttonCols = edited > 0 ? label.length + 5 : 0 // "[ label ]" and a gap
+    cols = Math.max(MASCOT_COLS + 20, Math.min(512, e.props.bodyColumns - buttonCols))
+    const raster = <Raster key={KEY} columns={cols} rows={ROWS} cells={frame()} />
+    if (edited === 0) return raster
+
+    return (
+      <Box flexDirection="row">
+        {raster}
+        <Box marginLeft={1}>
+          <Button
+            key="files"
+            label={label}
+            hotkey="f"
+            onPress={() => $.ui.open({ id: FILES_PANE, title: 'Session files', closeOnEscape: true })}
+          />
+        </Box>
+      </Box>
+    )
   })
 }

@@ -60,7 +60,7 @@ test('warns once at 80% and 90% context, and hints /compact', async ($, on) => {
 
   const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
   const bar = await ui.find({ key: 'bar' })
-  const text = rows(String(bar?.props.cells), 120)
+  const text = rows(String(bar?.props.cells), Number(bar?.props.columns))
   expect(text[1]).toContain('/compact?')
   expect(text[2]).toContain('ctx ▁▆▇██')
 })
@@ -71,7 +71,7 @@ test('a small climb in context still rises in the sparkline', async ($, on) => {
   for (const p of [8, 10, 12, 15]) await $.session.measure(measure(p))
   const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
   const bar = await ui.find({ key: 'bar' })
-  expect(rows(String(bar?.props.cells), 120)[2]).toContain('ctx ▁▃▅█')
+  expect(rows(String(bar?.props.cells), Number(bar?.props.columns))[2]).toContain('ctx ▁▃▅█')
 })
 
 test('re-arms the warning after a compaction', async ($, on) => {
@@ -88,7 +88,7 @@ test('re-arms the warning after a compaction', async ($, on) => {
 async function statusRow($: Engine): Promise<string> {
   const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
   const bar = await ui.find({ key: 'bar' })
-  return rows(String(bar?.props.cells), 120)[2]!
+  return rows(String(bar?.props.cells), Number(bar?.props.columns))[2]!
 }
 
 test('the crab celebrates passing tests', async ($, on) => {
@@ -147,7 +147,7 @@ test('summarizes the last turn', async ($, on) => {
 
   const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
   const bar = await ui.find({ key: 'bar' })
-  expect(rows(String(bar?.props.cells), 120)[3]).toContain('last turn ✓ 2m14s · 2 tools · 1 file +2 −1 · turn $0.00')
+  expect(rows(String(bar?.props.cells), Number(bar?.props.columns))[3]).toContain('last turn ✓ 2m14s · 2 tools · 1 file +2 −1 · turn $0.00')
 })
 
 const runFocus = ($: Engine, args: string) =>
@@ -235,6 +235,28 @@ test('the files pane lists edited files and shows the chosen diff', async ($, on
 test('the files pane says when nothing was edited', async $ => {
   const pane = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'Pane', requestId: 'pixelbar-files', props: paneProps })
   expect(await pane.drawn()).toMatchObject({ type: 'Text' })
+})
+
+test('the band shows a files button with the count once a file is edited', async ($, on) => {
+  const opened: string[] = []
+  on('ui.open', (_$, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } } as never
+  })
+  on('tool.call', { tool: 'Edit' }, (_$, e) => editResult(e.file_path, ['+x']))
+
+  let band = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
+  expect(await band.find({ key: 'files' })).toBeUndefined()
+
+  await $.tool.call({ tool: 'Edit', file_path: '/w/a.ts', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: '/w/b.ts', old_string: 'a', new_string: 'b' })
+  band = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
+  expect((await band.find({ key: 'files' }))?.props.label).toBe('2 files')
+  // The bar gives up the button's width: "[ 2 files ]" and a gap.
+  expect((await band.find({ key: 'bar' }))?.props.columns).toBe(120 - 12)
+
+  await band.press({ key: 'files' })
+  expect(opened).toEqual(['pixelbar-files'])
 })
 
 test('yields the band to a survey', async ($, on) => {
