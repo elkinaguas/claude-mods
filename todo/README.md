@@ -4,8 +4,11 @@ A task board in one `TODO.md` at the project root, with `## Todo`, `## Doing` an
 
 - **Capture fast.** Type a task in the panel's field, run `/todo <task>`, or write `- <task>` under `## Todo` yourself. No ID, no format to remember.
 - **Enrich later.** *Enrich* (panel, hotkey `a`, or `/todo enrich`) asks Claude to give every task without an ID the next free `T-<n>` and 3 to 4 lines of context: where it lands in the code, what to reuse, risks, the decisions that are yours.
-- **Work it.** Pick a task and press *Start* (`s`): the panel moves it to Doing and asks Claude to start. Claude records the questions it asks you, and your answers, under the task. A `?` marks a task with an open question. The task in Doing is pinned in the status line.
+- **Work it.** The panel lists Doing (yellow), Todo (cyan) and Done (green); Enter on a task opens its notes and actions under it, and Enter again or *Close* (`c`) folds them. Press *Start* (`s`): the panel moves it to Doing and asks Claude to start. Claude records the questions it asks you, and your answers, under the task. A `?` marks a task with an open question. The task in Doing is pinned in the status line.
+- **Fix it.** *Rename* (`r`) edits a Todo or Doing task's title in place; its ID and notes stay, and when it has notes Claude checks them against the new title.
+- **Reorder it.** *Up* (`k`) and *Down* (`j`) move a Todo or Doing task within its section. *Back to Todo* (`b`) returns a Doing task to the top of Todo and tells Claude to stop on it.
 - **Log it.** *Done* (`d`) asks Claude to move the task to Done with the date and replace its notes with a log: what was done, the decisions and why, the result, the files touched.
+  In Done, a task's log shows folded to its first line; *Open log* (`o`) unfolds it.
 
 ```md
 ## Todo

@@ -54,6 +54,7 @@ function project(on: On, files: Record<string, string>) {
   })
   on('ui.panes', () => ({ value: [...panes].map(id => ({ id, isPlaced: true })) as never }))
   on('ui.status', () => ({ value: undefined }))
+  on('ui.focus', () => ({ value: undefined as never }))
   return { files, prompts, panes, paths }
 }
 
@@ -103,6 +104,7 @@ test('/todo init creates TODO.md and the rules block, and replaces it on a rerun
   expect(files['TODO.md']).toContain('## Todo')
   expect(files['CLAUDE.md']).toContain('Use pnpm.\n\n<!-- todo:start -->')
   expect(files['CLAUDE.md']).toContain('next free ID')
+  expect(files['CLAUDE.md']).toContain('first check its `file:line` references')
   const once = files['CLAUDE.md']
   await run('init')($)
   expect(files['CLAUDE.md']).toBe(once)
@@ -185,6 +187,134 @@ test('two raw tasks with the same title are told apart', async ($, on) => {
   expect(text.indexOf('- add dark mode to settings')).toBeLessThan(text.indexOf('## Doing'))
 })
 
+test('a done task shows its log folded, and o opens and folds it', async ($, on) => {
+  const board = BOARD.replace('  > Log: cached for 5s.\n', '  > Log: cached for 5s.\n  > Files: src/git.ts.\n')
+  project(on, { 'TODO.md': board })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-1' })
+  expect(await ui.find({ text: 'Log: cached for 5s.' })).toBeDefined()
+  expect(await ui.find({ text: 'Files: src/git.ts.' })).toBeUndefined()
+  expect(await ui.find({ text: '+1 more' })).toBeDefined()
+  await ui.press({ key: 'log' })
+  expect(await ui.find({ text: 'Files: src/git.ts.' })).toBeDefined()
+  expect(await ui.find({ text: '+1 more' })).toBeUndefined()
+  await ui.press({ key: 'log' })
+  expect(await ui.find({ text: 'Files: src/git.ts.' })).toBeUndefined()
+})
+
+test('a Todo task keeps its notes unfolded', async ($, on) => {
+  project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ text: 'Decision: how many retries.' })).toBeDefined()
+  expect(await ui.find({ key: 'log' })).toBeUndefined()
+})
+
+test('the action buttons are spaced apart, not padded with spaces', async ($, on) => {
+  project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:raw:add dark mode to settings' })
+  expect((await ui.find({ key: 'actions' }))?.props.columnGap).toBe(2)
+  expect((await ui.find({ key: 'start' }))?.props.label).toBe('Start')
+  expect((await ui.find({ key: 'enrich' }))?.props.label).toBe('Enrich')
+})
+
+test('r renames a task, keeping its ID and notes, and asks Claude to check the notes', async ($, on) => {
+  const { files, prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'rename-open' })
+  await ui.input({ key: 'rename', text: 'Add retry and backoff to upload client' })
+  expect(files['TODO.md']).toContain('- T-3 Add retry and backoff to upload client\n  > Uploads fail silently')
+  expect(await ui.find({ key: 'rename' })).toBeUndefined()
+  expect(prompts[0]).toContain('T-3 in TODO.md was renamed from "Add retry to upload client" to "Add retry and backoff to upload client"')
+})
+
+test('renaming a raw task without notes keeps it selected and asks Claude nothing', async ($, on) => {
+  const { files, prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:raw:add dark mode to settings' })
+  await ui.press({ key: 'rename-open' })
+  await ui.input({ key: 'rename', text: 'add a dark theme to settings' })
+  expect(files['TODO.md']).toContain('- add a dark theme to settings\n\n## Doing')
+  expect(prompts).toEqual([])
+  expect((await ui.find({ key: 'task:raw:add a dark theme to settings' }))?.props.label).toContain('▾')
+})
+
+test('an empty or unchanged title leaves the task alone; done tasks cannot be renamed', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'rename-open' })
+  await ui.input({ key: 'rename', text: '   ' })
+  expect(files['TODO.md']).toBe(BOARD)
+  await ui.press({ key: 'task:T-1' })
+  expect(await ui.find({ key: 'rename-open' })).toBeUndefined()
+})
+
+test('the panel shows only the lists; Enter opens a task, Enter again or Close folds it', async ($, on) => {
+  project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  expect(await ui.find({ text: 'Decision: how many retries.' })).toBeUndefined()
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ text: 'Decision: how many retries.' })).toBeDefined()
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('▾ T-3 Add retry to upload client')
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'task:T-2' })
+  expect(await ui.find({ text: 'Decision: how many retries.' })).toBeUndefined()
+  expect(await ui.find({ text: 'Q: Mock the clock or raise the timeout?' })).toBeDefined()
+  await ui.press({ key: 'close' })
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+})
+
+test('sections and IDs are coloured: Doing yellow, Todo cyan, Done green', async ($, on) => {
+  project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect((await ui.find({ type: 'Text', text: /^Doing/ }))?.props.color).toBe('yellow')
+  expect((await ui.find({ type: 'Text', text: /^Todo/ }))?.props.color).toBe('cyan')
+  expect((await ui.find({ type: 'Text', text: /^Done/ }))?.props.color).toBe('green')
+  expect((await ui.find({ type: 'Text', text: 'T-3' }))?.props.color).toBe('cyan')
+  expect((await ui.find({ key: 'task:T-1' }))?.props.dimColor).toBe(true)
+})
+
+test('b moves a Doing task back to the top of Todo and tells Claude to stop', async ($, on) => {
+  const { files, prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'back' })
+  expect(files['TODO.md']).toContain('## Todo\n\n- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n- T-3 Add retry')
+  expect(files['TODO.md']).toContain('## Doing\n\n## Done')
+  expect(prompts[0]).toContain('T-2 "Fix flaky auth test" is back in Todo in TODO.md. Stop working on it')
+})
+
+test('k and j move a task up and down within its section, notes and all', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ key: 'up' })).toBeUndefined()
+  await ui.press({ key: 'down' })
+  expect(files['TODO.md']).toContain('## Todo\n\n- add dark mode to settings\n- T-3 Add retry to upload client\n  > Uploads fail silently on 5xx: src/upload/client.ts:88.\n  > Decision: how many retries.\n\n## Doing')
+  expect(await ui.find({ key: 'down' })).toBeUndefined()
+  await ui.press({ key: 'up' })
+  expect(files['TODO.md']).toBe(BOARD)
+  await ui.press({ key: 'task:T-1' })
+  expect(await ui.find({ key: 'up' })).toBeUndefined()
+  expect(await ui.find({ key: 'down' })).toBeUndefined()
+})
+
 for (const surface of ['terminal', 'desktop'] as const) {
   test(`the panel lists the sections and starts a task (${surface})`, async ($, on) => {
     const { files, prompts } = project(on, { 'TODO.md': BOARD, 'CLAUDE.md': '<!-- todo:start -->\n<!-- todo:end -->\n' })
@@ -193,7 +323,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ key: 'task:T-2' })).toBeDefined()
     expect(await ui.find({ key: 'task:raw:add dark mode to settings' })).toBeDefined()
     expect(await ui.find({ key: 'enrich-all' })).toBeDefined()
-    // The Doing task is chosen first, with its open question.
+    // Nothing is open at first: Enter on the Doing task shows its actions.
+    expect(await ui.find({ key: 'done' })).toBeUndefined()
+    await ui.press({ key: 'task:T-2' })
     expect(await ui.find({ key: 'done' })).toBeDefined()
 
     await ui.press({ key: 'task:T-3' })
@@ -202,6 +334,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(text.indexOf('- T-3 Add retry')).toBeGreaterThan(text.indexOf('## Doing'))
     expect(text).toContain('  > Decision: how many retries.\n\n## Done')
     expect(prompts[0]).toContain('Start working on T-3 "Add retry to upload client"')
+    expect(prompts[0]).toContain('check its `file:line` references against the code')
   })
 
   test(`the panel adds a task typed in its field (${surface})`, async ($, on) => {

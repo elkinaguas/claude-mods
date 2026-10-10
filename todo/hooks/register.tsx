@@ -16,6 +16,8 @@ const TITLE = 'Tasks'
 const COMMAND = 'todo'
 const POLL_MS = 1500
 const DONE_SHOWN = 5
+// Named colours only, so light and dark terminal themes both read.
+const SECTION_COLOR = { doing: 'yellow', todo: 'cyan', done: 'green' } as const
 const MARK_START = '<!-- todo:start -->'
 const MARK_END = '<!-- todo:end -->'
 const RULES_HEADING = '## Task board (TODO.md)'
@@ -24,6 +26,8 @@ const fileAtom = atom({ plugin: 'todo', key: 'file' } as const, { exists: false,
 const selectedAtom = atom({ plugin: 'todo', key: 'selected' } as const, null)
 const draftAtom = atom({ plugin: 'todo', key: 'draft' } as const, '')
 const rulesAtom = atom({ plugin: 'todo', key: 'hasRules' } as const, false)
+const expandedAtom = atom({ plugin: 'todo', key: 'expanded' } as const, null)
+const renamingAtom = atom({ plugin: 'todo', key: 'renaming' } as const, null)
 
 const TEMPLATE = `# TODO
 
@@ -41,7 +45,7 @@ ${RULES_HEADING}
 
 - **Capture.** The engineer adds tasks as one short line under \`## Todo\` (\`- fix flaky auth test\`), with no ID. Keep their wording.
 - **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID, \`T-<n>\`: one more than the highest ID in TODO.md and TODO-archive.md. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines.
-- **Doing.** A task being worked on sits under \`## Doing\`. When a decision is the engineer's, ask them; record each question under the task as \`> Q: ...\` and their answer as \`> A: ...\`.
+- **Doing.** A task being worked on sits under \`## Doing\`. When a decision is the engineer's, ask them; record each question under the task as \`> Q: ...\` and their answer as \`> A: ...\`. On starting a task, first check its \`file:line\` references against the code and fix any that drifted.
 - **Done.** When a task is finished, move it to the top of \`## Done\`, append the date to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets.
 - **Format.** A task is a line \`- T-<n> <title>\` (or \`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
 ${MARK_END}`
@@ -141,12 +145,58 @@ function addTask(text: string, title: string): string {
   return insertInto(lines, 'todo', [`- ${title}`]).join('\n')
 }
 
-function moveTask(text: string, key: string, to: Section): string | null {
+// Removes a task's lines and closes the gap they leave (no other blank lines touched).
+function removeBlock(lines: string[], t: Task): string[] {
+  const block = lines.splice(t.start, t.end - t.start)
+  while (t.start > 0 && t.start < lines.length && !lines[t.start - 1]!.trim() && !lines[t.start]!.trim()) lines.splice(t.start, 1)
+  return block
+}
+
+function moveTask(text: string, key: string, to: Section, atTop = false): string | null {
   const task = parse(text).find(t => keyOf(t) === key)
   if (!task || task.section === to) return null
   const lines = text.split('\n')
-  const block = lines.splice(task.start, task.end - task.start)
+  const block = removeBlock(lines, task)
+  const first = atTop ? parse(lines.join('\n')).find(t => t.section === to) : undefined
+  if (first) {
+    lines.splice(first.start, 0, ...block)
+    return lines.join('\n')
+  }
   return insertInto(lines, to, block).join('\n')
+}
+
+// Swaps a task with its neighbour in the same section (-1 up, 1 down).
+function reorderTask(text: string, key: string, dir: -1 | 1): string | null {
+  const tasks = parse(text)
+  const task = tasks.find(t => keyOf(t) === key)
+  if (!task) return null
+  const peers = tasks.filter(t => t.section === task.section)
+  const other = peers[peers.indexOf(task) + dir]
+  if (!other) return null
+  const [a, b] = dir === -1 ? [other, task] : [task, other]
+  const lines = text.split('\n')
+  return [
+    ...lines.slice(0, a.start),
+    ...lines.slice(b.start, b.end),
+    ...lines.slice(a.end, b.start),
+    ...lines.slice(a.start, a.end),
+    ...lines.slice(b.end),
+  ].join('\n')
+}
+
+// The task line's bullet, checkbox and ID kept, its title replaced.
+const LINE_HEAD_RE = /^([-*]\s+(?:\[[ xX]\]\s+)?(?:T-\d+\b[:.]?\s*)?)/
+
+function renameTask(text: string, key: string, title: string): { text: string; key: string } | null {
+  const task = parse(text).find(t => keyOf(t) === key)
+  if (!task) return null
+  const lines = text.split('\n')
+  const head = LINE_HEAD_RE.exec(lines[task.start]!)?.[1] ?? '- '
+  lines[task.start] = `${head}${head.endsWith(' ') ? '' : ' '}${title}`
+  const next = lines.join('\n')
+  // A raw task's key is its title: find it again where it sits.
+  const renamed = parse(next).find(t => t.start === task.start)
+  return { text: next, key: renamed ? keyOf(renamed) : key }
 }
 
 // The board sits at the project root, not wherever a shell cd left the session.
@@ -242,11 +292,7 @@ async function archive($: EngineInterface) {
   if (done.length === 0) return 0
   const lines = text.split('\n')
   const moved = done.flatMap(t => lines.slice(t.start, t.end))
-  for (const t of [...done].reverse()) {
-    lines.splice(t.start, t.end - t.start)
-    // Close the gap the task leaves, not blank lines elsewhere in the file.
-    while (t.start > 0 && t.start < lines.length && !lines[t.start - 1]!.trim() && !lines[t.start]!.trim()) lines.splice(t.start, 1)
-  }
+  for (const t of [...done].reverse()) removeBlock(lines, t)
   const old = await $.fs.read(await inRoot($, ARCHIVE)).catch(() => '# TODO archive\n')
   const head = typeof old === 'string' ? old.trimEnd() : '# TODO archive'
   await $.fs.write(await inRoot($, ARCHIVE), `${head}\n\n${moved.join('\n')}\n`)
@@ -272,9 +318,38 @@ async function start($: EngineInterface, t: Task) {
   await ask(
     $,
     t.id
-      ? `Start working on ${ref(t)} (now under Doing in ${FILE}). Follow the task board rules: ask me when a decision is mine and record the Q/A under the task.`
+      ? `Start working on ${ref(t)} (now under Doing in ${FILE}). First check its \`file:line\` references against the code and fix any that drifted. Follow the task board rules: ask me when a decision is mine and record the Q/A under the task.`
       : `Start working on ${ref(t)} (now under Doing in ${FILE}). It is not enriched yet: give it the next free ID and its context lines first, then follow the task board rules.`,
   )
+}
+
+async function sendBack($: EngineInterface, t: Task) {
+  const moved = moveTask(await current($), keyOf(t), 'todo', true)
+  if (moved === null) return
+  await save($, moved)
+  await ask($, `${ref(t)} is back in Todo in ${FILE}. Stop working on it and leave its notes as they are.`)
+}
+
+async function reorder($: EngineInterface, t: Task, dir: -1 | 1) {
+  const out = reorderTask(await current($), keyOf(t), dir)
+  if (out !== null) await save($, out)
+}
+
+async function rename($: EngineInterface, t: Task, value: string) {
+  await update($, renamingAtom, () => null)
+  const title = value.trim()
+  if (!title || title === t.title) return
+  const out = renameTask(await current($), keyOf(t), title)
+  if (!out) return
+  await save($, out.text)
+  await update($, selectedAtom, () => out.key)
+  // Notes written for the old title may no longer fit: Claude reviews them.
+  if (t.notes.length > 0) {
+    await ask(
+      $,
+      `${t.id ?? 'A task'} in ${FILE} was renamed from "${t.title}" to "${title}". Check its notes against the new title and update them if they no longer fit, following the task board rules.`,
+    )
+  }
 }
 
 function finish($: EngineInterface, t: Task) {
@@ -362,24 +437,113 @@ export const register: Register = (on, options) => {
     const by = (s: Section) => tasks.filter(t => t.section === s)
     const [todo, doing, done] = [by('todo'), by('doing'), by('done')]
     const raw = tasks.filter(t => !t.id && t.section !== 'done')
+    const peers = (t: Task) => by(t.section)
+    // The open task: its detail shows under its row until Enter or Close folds it.
     const selectedKey = await read($, selectedAtom)
-    const chosen = tasks.find(t => keyOf(t) === selectedKey) ?? doing[0] ?? todo[0]
+    const chosen = tasks.find(t => keyOf(t) === selectedKey)
+    // A done task's log folds to its first line until opened with `o`.
+    const foldable = chosen?.section === 'done' && chosen.notes.length > 1
+    const folded = foldable && (await read($, expandedAtom)) !== keyOf(chosen)
+    const notes = chosen ? (folded ? chosen.notes.slice(0, 1) : chosen.notes) : []
+    const renaming = await read($, renamingAtom)
 
-    const row = (t: Task) => (
-      <Box flexDirection="row" key={`row:${keyOf(t)}`}>
-        <Button
-          key={`task:${keyOf(t)}`}
-          plain
-          dimColor={t.section === 'done'}
-          label={`${chosen && keyOf(t) === keyOf(chosen) ? '▸' : ' '} ${t.id ?? '·'} ${t.title}`}
-          onPress={() => void update($, selectedAtom, () => keyOf(t))}
-        />
-        {t.hasOpenQuestion && <Text color="yellow"> ?</Text>}
+    const detail = (t: Task) => (
+      <Box flexDirection="column" paddingLeft={4} key="detail">
+        {renaming === keyOf(t) && Input && (
+          <Box flexDirection="row" columnGap={2} key="rename-row">
+            <Input key="rename" value={t.title} submitLabel="save" onSubmit={value => void rename($, t, value)} />
+            <Button key="rename-cancel" plain label="Cancel" onPress={() => void update($, renamingAtom, () => null)} />
+          </Box>
+        )}
+        {t.notes.length === 0 && <Text dimColor>{t.id ? 'No notes.' : 'Not enriched yet.'}</Text>}
+        {notes.map(n => (
+          <Text dimColor={!/^[QA]:/i.test(n)} color={/^Q:/i.test(n) ? 'yellow' : undefined} wrap={folded ? 'truncate-end' : undefined}>
+            {n}
+          </Text>
+        ))}
+        {folded && <Text dimColor>+{t.notes.length - 1} more</Text>}
+        <Box flexDirection="row" columnGap={2} key="actions">
+          {t.section === 'todo' && <Button key="start" plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
+          {t.section === 'doing' && <Button key="done" plain hotkey="d" label="Done" onPress={() => void finish($, t)} />}
+          {t.section === 'doing' && <Button key="back" plain hotkey="b" label="Back to Todo" onPress={() => void sendBack($, t)} />}
+          {t.section !== 'done' && peers(t).indexOf(t) > 0 && (
+            <Button key="up" plain hotkey="k" label="Up" onPress={() => void reorder($, t, -1)} />
+          )}
+          {t.section !== 'done' && peers(t).indexOf(t) < peers(t).length - 1 && (
+            <Button key="down" plain hotkey="j" label="Down" onPress={() => void reorder($, t, 1)} />
+          )}
+          {t.section !== 'done' && Input && renaming !== keyOf(t) && (
+            <Button
+              key="rename-open"
+              plain
+              hotkey="r"
+              label="Rename"
+              onPress={async () => {
+                await update($, renamingAtom, () => keyOf(t))
+                await $.ui.focus({ requestId: PANE, key: 'rename' }).catch(() => {})
+              }}
+            />
+          )}
+          {foldable && (
+            <Button
+              key="log"
+              plain
+              hotkey="o"
+              label={folded ? 'Open log' : 'Fold log'}
+              onPress={() => void update($, expandedAtom, () => (folded ? keyOf(t) : null))}
+            />
+          )}
+          {!t.id && t.section !== 'done' && (
+            <Button
+              key="enrich"
+              plain
+              hotkey="e"
+              label="Enrich"
+              onPress={() => void ask($, `Enrich ${ref(t)} in ${FILE}, following the task board rules.`)}
+            />
+          )}
+          <Button key="close" plain hotkey="c" label="Close" onPress={() => void close()} />
+        </Box>
       </Box>
     )
-    const heading = (name: string, n: number) => (
-      <Text bold>
-        {name} <Text dimColor>{n}</Text>
+    const close = async () => {
+      await update($, renamingAtom, () => null)
+      await update($, selectedAtom, () => null)
+    }
+    // Enter on a row opens its detail; on the open row, folds it.
+    const toggle = async (t: Task) => {
+      if (chosen && keyOf(chosen) === keyOf(t)) return close()
+      await update($, renamingAtom, () => null)
+      await update($, selectedAtom, () => keyOf(t))
+    }
+
+    const row = (t: Task) => {
+      const isOpen = chosen !== undefined && keyOf(chosen) === keyOf(t)
+      const isDone = t.section === 'done'
+      const marker = isOpen ? '▾' : ' '
+      return (
+        <Box flexDirection="column" key={`row:${keyOf(t)}`}>
+          <Box flexDirection="row">
+            <Button
+              key={`task:${keyOf(t)}`}
+              plain
+              dimColor={isDone}
+              label={`${marker} ${t.id ?? '·'} ${t.title}`}
+              onPress={() => void toggle(t)}
+            >
+              {`${marker} `}
+              {t.id ? <Text color={SECTION_COLOR[t.section]}>{t.id}</Text> : <Text dimColor>·</Text>}
+              {` ${t.title}`}
+            </Button>
+            {t.hasOpenQuestion && <Text color="yellow"> ?</Text>}
+          </Box>
+          {isOpen && detail(t)}
+        </Box>
+      )
+    }
+    const heading = (section: Section, n: number) => (
+      <Text bold color={SECTION_COLOR[section]}>
+        {section[0]!.toUpperCase()}{section.slice(1)} <Text dimColor>{n}</Text>
       </Text>
     )
 
@@ -398,41 +562,14 @@ export const register: Register = (on, options) => {
           <Button key="enrich-all" hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
         )}
         <Text> </Text>
-        {heading('Doing', doing.length)}
+        {heading('doing', doing.length)}
         {doing.map(row)}
-        {heading('Todo', todo.length)}
+        {heading('todo', todo.length)}
         {todo.map(row)}
-        {heading('Done', done.length)}
+        {heading('done', done.length)}
         {done.slice(0, DONE_SHOWN).map(row)}
         {done.length > DONE_SHOWN && <Text dimColor>  +{done.length - DONE_SHOWN} more · /todo archive</Text>}
-        {chosen && (
-          <Box flexDirection="column" key="detail">
-            <Text> </Text>
-            <Text bold>
-              {chosen.id ?? 'No ID yet'} <Text dimColor>· {chosen.section}</Text>
-            </Text>
-            <Text>{chosen.title}</Text>
-            {chosen.notes.length === 0 && !chosen.id && <Text dimColor>Not enriched yet.</Text>}
-            {chosen.notes.map(n => (
-              <Text dimColor={!/^[QA]:/i.test(n)} color={/^Q:/i.test(n) ? 'yellow' : undefined}>
-                {n}
-              </Text>
-            ))}
-            <Box flexDirection="row" key="actions">
-              {chosen.section === 'todo' && <Button key="start" plain hotkey="s" label="Start" onPress={() => void start($, chosen)} />}
-              {chosen.section === 'doing' && <Button key="done" plain hotkey="d" label="Done" onPress={() => void finish($, chosen)} />}
-              {!chosen.id && chosen.section !== 'done' && (
-                <Button
-                  key="enrich"
-                  plain
-                  hotkey="e"
-                  label="  Enrich"
-                  onPress={() => void ask($, `Enrich ${ref(chosen)} in ${FILE}, following the task board rules.`)}
-                />
-              )}
-            </Box>
-          </Box>
-        )}
+        {!chosen && tasks.length > 0 && <Text dimColor>Enter on a task shows its notes and actions.</Text>}
       </Box>
     )
   })

@@ -11,6 +11,10 @@ declare module 'claude-code' {
       draft: string
       /** Whether CLAUDE.md or AGENTS.md holds the task board rules. */
       hasRules: boolean
+      /** The done task whose log is unfolded in the panel (its key), if any. */
+      expanded: string | null
+      /** The task being renamed in the panel (its key), if any. */
+      renaming: string | null
     }
   }
 }
