@@ -2,3 +2,7 @@
 .claude-plugin/types/
 */.claude-plugin/types/
 */tsconfig.json
+
+# The task board stays local; its rules (CLAUDE.md) are committed.
+TODO.md
+TODO-archive.md
