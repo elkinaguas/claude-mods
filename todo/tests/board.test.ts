@@ -54,7 +54,6 @@ function project(on: On, files: Record<string, string>) {
   })
   on('ui.panes', () => ({ value: [...panes].map(id => ({ id, isPlaced: true })) as never }))
   on('ui.status', () => ({ value: undefined }))
-  on('ui.focus', () => ({ value: undefined as never }))
   return { files, prompts, panes, paths }
 }
 
@@ -313,6 +312,58 @@ test('k and j move a task up and down within its section, notes and all', async 
   await ui.press({ key: 'task:T-1' })
   expect(await ui.find({ key: 'up' })).toBeUndefined()
   expect(await ui.find({ key: 'down' })).toBeUndefined()
+})
+
+test('m marks Todo tasks and g starts them as one batch, worked one at a time in Todo order', async ($, on) => {
+  const board = BOARD.replace('- add dark mode to settings\n', '- add dark mode to settings\n- T-4 Bump node\n')
+  const { files, prompts } = project(on, { 'TODO.md': board })
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect(await ui.find({ key: 'start-marked' })).toBeUndefined()
+  await ui.press({ key: 'task:T-4' })
+  await ui.press({ key: 'mark' })
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'mark' })
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('● T-3 Add retry to upload client')
+  expect((await ui.find({ key: 'start-marked' }))?.props.label).toBe('Start 2 marked')
+  await ui.press({ key: 'start-marked' })
+  const text = files['TODO.md']!
+  const doing = text.slice(text.indexOf('## Doing'), text.indexOf('## Done'))
+  expect(doing).toContain('- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n- T-3 Add retry to upload client\n  > Uploads fail silently on 5xx: src/upload/client.ts:88.\n  > Decision: how many retries.\n- T-4 Bump node\n')
+  expect(text.slice(0, text.indexOf('## Doing'))).toContain('## Todo\n\n- add dark mode to settings\n\n')
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('Start working on these 2 tasks, now under Doing in TODO.md, one at a time in this order:\n1. T-3 "Add retry to upload client"\n2. T-4 "Bump node"')
+  expect(prompts[0]).toContain('move it to Done with its own log before starting the next')
+  expect(await ui.find({ key: 'start-marked' })).toBeUndefined()
+})
+
+test('m again unmarks; a raw task in a batch is enriched first', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'mark' })
+  await ui.press({ key: 'task:T-3' })
+  expect((await ui.find({ key: 'mark' }))?.props.label).toBe('Unmark')
+  await ui.press({ key: 'mark' })
+  expect(await ui.find({ key: 'start-marked' })).toBeUndefined()
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'mark' })
+  await ui.press({ key: 'task:raw:add dark mode to settings' })
+  await ui.press({ key: 'mark' })
+  await ui.press({ key: 'start-marked' })
+  expect(prompts[0]).toContain('2. "add dark mode to settings" (not enriched yet: give it the next free ID and its context lines first)')
+})
+
+test('a batch of one starts like a single task', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'mark' })
+  await ui.press({ key: 'start-marked' })
+  expect(prompts[0]).toContain('Start working on T-3 "Add retry to upload client" (now under Doing in TODO.md)')
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {

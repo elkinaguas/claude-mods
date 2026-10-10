@@ -15,6 +15,8 @@ declare module 'claude-code' {
       expanded: string | null
       /** The task being renamed in the panel (its key), if any. */
       renaming: string | null
+      /** The Todo tasks marked to start together (their keys), in no order. */
+      marked: string[]
     }
   }
 }

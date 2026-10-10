@@ -28,6 +28,7 @@ const draftAtom = atom({ plugin: 'todo', key: 'draft' } as const, '')
 const rulesAtom = atom({ plugin: 'todo', key: 'hasRules' } as const, false)
 const expandedAtom = atom({ plugin: 'todo', key: 'expanded' } as const, null)
 const renamingAtom = atom({ plugin: 'todo', key: 'renaming' } as const, null)
+const markedAtom = atom({ plugin: 'todo', key: 'marked' } as const, [] as string[])
 
 const TEMPLATE = `# TODO
 
@@ -323,6 +324,22 @@ async function start($: EngineInterface, t: Task) {
   )
 }
 
+// Starts the marked tasks as one batch, in Todo order: all move to Doing,
+// and Claude works them one at a time, each finished before the next.
+async function startBatch($: EngineInterface, ts: Task[]) {
+  await update($, markedAtom, () => [])
+  if (ts.length === 1) return start($, ts[0]!)
+  let text = await current($)
+  for (const t of ts) text = moveTask(text, keyOf(t), 'doing') ?? text
+  await save($, text)
+  const list = ts.map((t, i) => `${i + 1}. ${t.id ? `${t.id} "${t.title}"` : `"${t.title}" (not enriched yet: give it the next free ID and its context lines first)`}`)
+  await ask(
+    $,
+    `Start working on these ${ts.length} tasks, now under Doing in ${FILE}, one at a time in this order:\n${list.join('\n')}\n` +
+      `For each: first check its \`file:line\` references against the code and fix any that drifted, follow the task board rules (ask me when a decision is mine and record the Q/A under that task), and when it is finished move it to Done with its own log before starting the next.`,
+  )
+}
+
 async function sendBack($: EngineInterface, t: Task) {
   const moved = moveTask(await current($), keyOf(t), 'todo', true)
   if (moved === null) return
@@ -446,6 +463,17 @@ export const register: Register = (on, options) => {
     const folded = foldable && (await read($, expandedAtom)) !== keyOf(chosen)
     const notes = chosen ? (folded ? chosen.notes.slice(0, 1) : chosen.notes) : []
     const renaming = await read($, renamingAtom)
+    // Marks of tasks that left Todo (started, renamed, removed) drop out here.
+    const markedKeys = await read($, markedAtom)
+    const marked = todo.filter(t => markedKeys.includes(keyOf(t)))
+    const isMarked = (t: Task) => marked.includes(t)
+    // Marking folds the task and puts the keyboard on the next Todo row, ready
+    // for Enter then m again.
+    const toggleMark = async (t: Task) => {
+      const key = keyOf(t)
+      await update($, markedAtom, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key]))
+      await close(todo[todo.indexOf(t) + 1] ?? t)
+    }
 
     const detail = (t: Task) => (
       <Box flexDirection="column" paddingLeft={4} key="detail">
@@ -465,6 +493,9 @@ export const register: Register = (on, options) => {
         <Box flexDirection="row" columnGap={2} key="actions">
           {t.section === 'todo' && <Button key="start" plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
           {t.section === 'doing' && <Button key="done" plain hotkey="d" label="Done" onPress={() => void finish($, t)} />}
+          {t.section === 'todo' && (
+            <Button key="mark" plain hotkey="m" label={isMarked(t) ? 'Unmark' : 'Mark'} onPress={() => void toggleMark(t)} />
+          )}
           {t.section === 'doing' && <Button key="back" plain hotkey="b" label="Back to Todo" onPress={() => void sendBack($, t)} />}
           {t.section !== 'done' && peers(t).indexOf(t) > 0 && (
             <Button key="up" plain hotkey="k" label="Up" onPress={() => void reorder($, t, -1)} />
@@ -506,7 +537,11 @@ export const register: Register = (on, options) => {
         </Box>
       </Box>
     )
-    const close = async () => {
+    // Folding removes the button that holds the keyboard; the pane would hand
+    // the keys back to the prompt (a hotkey then types into the chat), so the
+    // focus moves to a row that stays first.
+    const close = async (focusOn = chosen) => {
+      if (focusOn) await $.ui.focus({ requestId: PANE, key: `task:${keyOf(focusOn)}` }).catch(() => {})
       await update($, renamingAtom, () => null)
       await update($, selectedAtom, () => null)
     }
@@ -520,7 +555,7 @@ export const register: Register = (on, options) => {
     const row = (t: Task) => {
       const isOpen = chosen !== undefined && keyOf(chosen) === keyOf(t)
       const isDone = t.section === 'done'
-      const marker = isOpen ? '▾' : ' '
+      const marker = isOpen ? '▾' : isMarked(t) ? '●' : ' '
       return (
         <Box flexDirection="column" key={`row:${keyOf(t)}`}>
           <Box flexDirection="row">
@@ -558,8 +593,15 @@ export const register: Register = (on, options) => {
           onInput={value => void update($, draftAtom, () => value)}
           onSubmit={value => void submitDraft($, value)}
         />)}
-        {raw.length > 0 && (
-          <Button key="enrich-all" hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
+        {(raw.length > 0 || marked.length > 0) && (
+          <Box flexDirection="row" columnGap={2} key="top-actions">
+            {raw.length > 0 && (
+              <Button key="enrich-all" hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
+            )}
+            {marked.length > 0 && (
+              <Button key="start-marked" hotkey="g" label={`Start ${marked.length} marked`} onPress={() => void startBatch($, marked)} />
+            )}
+          </Box>
         )}
         <Text> </Text>
         {heading('doing', doing.length)}
