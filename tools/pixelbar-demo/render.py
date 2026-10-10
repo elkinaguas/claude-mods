@@ -40,6 +40,7 @@ for i, ch in enumerate('▁▂▃▄▅▆▇', start=1):
 for i, ch in enumerate('▏▎▍▌▋▊▉', start=1):
     BLOCKS[ch] = (0, 0, i / 8, 1)
 LINES = {'━': 0.16, '─': 0.08}
+CAPS = {'\ue0b6': 'left', '\ue0b4': 'right'}
 
 
 def draw_frame(frame):
@@ -63,6 +64,12 @@ def draw_frame(frame):
             x0, y0, x1, y1 = BLOCKS[ch]
             d.rectangle([x + round(x0 * CELL_W), y + round(y0 * CELL_H),
                          x + round(x1 * CELL_W) - 1, y + round(y1 * CELL_H) - 1], fill=fgc)
+        elif ch in CAPS:
+            # The Powerline half circles, as a terminal that draws them has them.
+            if CAPS[ch] == 'left':
+                d.pieslice([x, y, x + 2 * CELL_W - 1, y + CELL_H - 1], 90, 270, fill=fgc)
+            else:
+                d.pieslice([x - CELL_W, y, x + CELL_W - 1, y + CELL_H - 1], 270, 90, fill=fgc)
         elif ch in LINES:
             t = max(2, round(LINES[ch] * CELL_H))
             mid = y + CELL_H // 2

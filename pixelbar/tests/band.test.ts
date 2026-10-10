@@ -1,4 +1,4 @@
-import type { RenderElement } from 'claude-code'
+import type { On, RenderElement } from 'claude-code'
 import { expect, mock, test, type Engine } from 'claude-code/testing'
 
 const props = (over: { hasSurvey?: boolean; isWorking?: boolean } = {}) => ({
@@ -267,4 +267,236 @@ test('yields the band to a survey', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props({ hasSurvey: true }) })
   expect(await ui.find({ key: 'bar' })).toBeUndefined()
   expect(await ui.drawn()).toMatchObject({ type: 'Text' })
+})
+
+const usage = (read: number, write: number, fresh: number, output = 0) => ({
+  cache_read_input_tokens: read,
+  cache_creation_input_tokens: write,
+  input_tokens: fresh,
+  output_tokens: output,
+  model: 'claude-opus-5-5',
+})
+
+// One main-loop model request answered with these token counts.
+async function step($: Engine, turnId: string, index: number) {
+  const s = $.turn.step({ turnId, index, model: 'claude-opus-5-5', messageCount: 1 })
+  for await (const _ of s);
+  return s.result
+}
+
+function answerSteps(on: On, counts: ReturnType<typeof usage>[]) {
+  let i = 0
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: counts[i++] ?? null }
+  })
+}
+
+test('splits the context bar by cache use and counts down to the cache lapsing', async ($, on) => {
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  answerSteps(on, [usage(60_000, 20_000, 15_000, 5_000)])
+  await $.session.measure(measure(50))
+  await step($, 't1', 0)
+
+  const bar = await bandOf($)
+  const cells = String(bar?.props.cells)
+  const text = rows(cells, 120)
+  expect(text[1]).toMatch(/50% · 63\.1% cached, expires [45]:\d\d/)
+
+  // The bar's filled half: blue (read), yellow (write) and red (new), 60/20/20.
+  const { eighths, filled } = ctxBar(cells, text[1]!)
+  expect(Math.abs(eighths(0x5f87d7) - filled * 0.6)).toBeLessThanOrEqual(1)
+  expect(Math.abs(eighths(0xd7af00) - filled * 0.2)).toBeLessThanOrEqual(1)
+  expect(Math.abs(eighths(0xd75f5f) - filled * 0.2)).toBeLessThanOrEqual(1)
+})
+
+test('the last turn shows how much input the cache served', async ($, on) => {
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  answerSteps(on, [usage(10_000, 8_000, 2_000), usage(18_000, 1_000, 1_000)])
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await step($, 't1', 0)
+  await step($, 't1', 1)
+  await $.turn.complete({ answer: 'done', durationMs: 5_000, isAborted: false, turnId: 't1', reason: 'answer' })
+
+  expect(rows(String((await bandOf($))?.props.cells), 120)[3]).toContain('· cache 70.0% ·')
+})
+
+test('a subagent request leaves the bar alone', async ($, on) => {
+  answerSteps(on, [usage(1000, 0, 0)])
+  const s = $.turn.step({ turnId: 'a1', index: 0, model: 'claude-opus-5-5', messageCount: 1, agentId: 'sub' })
+  for await (const _ of s);
+  expect(rows(String((await bandOf($))?.props.cells), 120)[1]).not.toContain('expires')
+})
+
+test('above 70% context the bar goes back to heat colors', async ($, on) => {
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  answerSteps(on, [usage(60_000, 20_000, 15_000, 5_000)])
+  await $.session.measure(measure(75))
+  await step($, 't1', 0)
+
+  const cells = String((await bandOf($))?.props.cells)
+  const { fgs } = ctxBar(cells, rows(cells, 120)[1]!)
+  expect(fgs).not.toContain(0x5f87d7)
+  expect(fgs[0]).toBe(0x5fff5f)
+})
+
+const PARTIAL = ['▏', '▎', '▍', '▌', '▋', '▊', '▉']
+
+// The context bar on row 1 (from "ctx " to the token count): each cell's
+// foreground, its width in cells, and how many eighths of a cell each color
+// covers, `filled` the eighths off the track.
+function ctxBar(cells: string, row: string, columns = 120) {
+  const bin = atob(cells)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  const words = new Uint32Array(bytes.buffer)
+  const start = row.indexOf('ctx ') + 4
+  const end = start + row.slice(start).search(/ ([\d.]+[kM]?|–)\/[\d.]+[kM]? /)
+  const fgs: number[] = []
+  const by = new Map<number, number>()
+  const seq: number[] = []
+  const add = (col: number, n: number) => {
+    by.set(col, (by.get(col) ?? 0) + n)
+    for (let i = 0; i < n; i++) seq.push(col)
+  }
+  for (let x = start; x < end; x++) {
+    const [ch, fg, bg] = [String.fromCodePoint(words[(columns + x) * 3]!), words[(columns + x) * 3 + 1]!, words[(columns + x) * 3 + 2]!]
+    fgs.push(fg)
+    const part = PARTIAL.indexOf(ch)
+    if (ch === ' ') add(bg, 8)
+    else if (part < 0) add(fg, 8)
+    else {
+      add(fg, part + 1)
+      add(bg, 7 - part)
+    }
+  }
+  const filled = [...by].reduce((n, [col, k]) => (col === 0x3a3a3a ? n : n + k), 0)
+  // The colors in the order drawn, one entry per change.
+  const order = seq.filter((col, i) => col !== seq[i - 1])
+  return { fgs, width: end - start, filled, order, eighths: (col: number) => by.get(col) ?? 0 }
+}
+
+test('the bars stretch to fill the row, the context bar the widest', async ($, on) => {
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  const limits = [
+    { kind: 'five_hour', percentUsed: 30, resetsAt: new Date(Date.now() + 3_600_000).toISOString() },
+    { kind: 'seven_day', percentUsed: 10, resetsAt: new Date(Date.now() + 86_400_000).toISOString() },
+  ]
+  await $.session.measure({ ...measure(40), rateLimits: limits } as never)
+
+  for (const columns of [100, 200]) {
+    const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: { ...props(), bodyColumns: columns } })
+    const bar = await ui.find({ key: 'bar' })
+    const cells = String(bar?.props.cells)
+    const row = rows(cells, columns)[1]!
+    // The row ends within a cell of the band's edge.
+    expect(row.trimEnd().length).toBeGreaterThanOrEqual(columns - 2)
+    const { width } = ctxBar(cells, row, columns)
+    const fiveH = row.slice(row.indexOf('5h ') + 3).search(/ \d+%/)
+    expect(width).toBeGreaterThanOrEqual(2 * fiveH - 1)
+  }
+})
+
+const ROUND = /ctx \uE0B6[^\uE0B4]*\uE0B4 /
+
+async function startIn($: Engine, on: On, env: Record<string, string>) {
+  on('env.get', (_$, e) => ({ value: env[e.name] }))
+  on('settings.read', () => ({ value: {} }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.cwd', () => ({ value: '/home/me/code' }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 200_000, tokens: 20_000, percent: 10 }, rateLimits: [], cost: { usd: 0 } },
+  }))
+  on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: '' } }) as never)
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/home/me/code' } as never)
+  return rows(String((await bandOf($))?.props.cells), 120)[1]!
+}
+
+test('rounds the bar ends in Ghostty', async ($, on) => {
+  mock.clock(on)
+  expect(await startIn($, on, { TERM_PROGRAM: 'ghostty' })).toMatch(ROUND)
+})
+
+test('keeps square ends in a terminal that may not draw the round glyphs', async ($, on) => {
+  mock.clock(on)
+  const row = await startIn($, on, { TERM_PROGRAM: 'gnome-terminal' })
+  expect(row).not.toContain('\uE0B6')
+  expect(row).toContain('ctx █')
+})
+
+test('the barEnds setting overrides the terminal', { options: { barEnds: 'rounded' } }, async ($, on) => {
+  mock.clock(on)
+  expect(await startIn($, on, {})).toMatch(ROUND)
+})
+
+test('square ends when set, even in Ghostty', { options: { barEnds: 'square' } }, async ($, on) => {
+  mock.clock(on)
+  expect(await startIn($, on, { TERM_PROGRAM: 'ghostty' })).not.toContain('\uE0B6')
+})
+
+test('the context bar colors add up the whole session, subagents included', async ($, on) => {
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  // A cache miss (all written), then a hit (all read), then a subagent's miss.
+  answerSteps(on, [usage(0, 40_000, 0), usage(40_000, 0, 0), usage(0, 0, 0, 20_000)])
+  await $.session.measure(measure(60))
+  await step($, 't1', 0)
+  await step($, 't1', 1)
+  const s = $.turn.step({ turnId: 'a1', index: 0, model: 'claude-opus-5-5', messageCount: 1, agentId: 'sub' })
+  for await (const _ of s);
+
+  const cells = String((await bandOf($))?.props.cells)
+  const { eighths, filled } = ctxBar(cells, rows(cells, 120)[1]!)
+  // 40k read, 40k written, 20k new: 40/40/20.
+  expect(Math.abs(eighths(0x5f87d7) - filled * 0.4)).toBeLessThanOrEqual(1)
+  expect(Math.abs(eighths(0xd7af00) - filled * 0.4)).toBeLessThanOrEqual(1)
+  expect(Math.abs(eighths(0xd75f5f) - filled * 0.2)).toBeLessThanOrEqual(1)
+})
+
+test('thin parts show at their size and in order, and the row says how much was cached', async ($, on) => {
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  answerSteps(on, [usage(980_000, 14_000, 0, 6_000)])
+  await $.session.measure(measure(40))
+  await step($, 't1', 0)
+
+  const cells = String((await bandOf($))?.props.cells)
+  const row = rows(cells, 120)[1]!
+  expect(row).toContain('· 98.5% cached')
+  // 98% / 1.4% / 0.6% of a 40% fill: the thin parts as many eighths as their
+  // share, at least one, and in order at the end: blue, yellow, red, track.
+  const { eighths, filled, order, width } = ctxBar(cells, row)
+  const nominal = Math.round(width * 0.4 * 8)
+  expect(eighths(0xd7af00)).toBe(Math.max(1, Math.round(nominal * 0.014)))
+  expect(eighths(0xd75f5f)).toBe(Math.max(1, Math.round(nominal * 0.006)))
+  expect(eighths(0x5f87d7) + eighths(0xd7af00) + eighths(0xd75f5f)).toBe(filled)
+  expect(Math.abs(filled - nominal)).toBeLessThan(8)
+  expect(order).toEqual([0x5f87d7, 0xd7af00, 0xd75f5f, 0x3a3a3a])
+})
+
+test('in a narrow band the labels shorten so the weekly bar still fits', async ($, on) => {
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  answerSteps(on, [usage(90_000, 8_000, 0, 2_000)])
+  const limits = [
+    { kind: 'five_hour', percentUsed: 34, resetsAt: new Date(Date.now() + 7_740_000).toISOString() },
+    { kind: 'seven_day', percentUsed: 12, resetsAt: new Date(Date.now() + 439_200_000).toISOString() },
+  ]
+  await $.session.measure({ ...measure(20), rateLimits: limits } as never)
+  await step($, 't1', 0)
+
+  const wide = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: { ...props(), bodyColumns: 160 } })
+  const wideRow = rows(String((await wide.find({ key: 'bar' }))?.props.cells), 160)[1]!
+  expect(wideRow).toMatch(/cached, expires [45]:\d\d   5h .* 34% 2h\d+m   wk .* 12% 5d\d+h/)
+
+  const narrow = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: { ...props(), bodyColumns: 96 } })
+  const narrowRow = rows(String((await narrow.find({ key: 'bar' }))?.props.cells), 96)[1]!
+  expect(narrowRow).toMatch(/wk .* 12%/)
+  expect(narrowRow.trimEnd().length).toBeLessThanOrEqual(95)
 })

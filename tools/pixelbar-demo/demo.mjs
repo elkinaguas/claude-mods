@@ -36,6 +36,9 @@ const gitStatus = [
 
 // ---------- the fake engine ----------
 const state = new Map()
+const store = new Map()
+// Ghostty, so the bars get their rounded ends.
+const env = { HOME, TERM_PROGRAM: 'ghostty' }
 const timers = []
 let blitted
 const $ = {
@@ -43,8 +46,12 @@ const $ = {
     get: async ref => ({ value: state.get(`${ref.plugin}.${ref.key}`) }),
     set: async ({ plugin, key, value }) => void state.set(`${plugin}.${key}`, value),
   },
+  store: {
+    get: async key => store.get(key),
+    set: async (key, value) => void store.set(key, value),
+  },
   command: { register: async () => {} },
-  env: { get: async () => HOME },
+  env: { get: async name => env[name] },
   settings: { read: async () => ({ effortLevel: 'high' }) },
   session: {
     usage: async () => structuredClone(usage),
@@ -91,12 +98,31 @@ async function render() {
     component: 'AbovePrompt',
     surface: 'terminal',
     requestId: 'band',
-    props: { hasSurvey: false, isWorking: working, maxRows: 10, bodyColumns: 112, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+    props: { hasSurvey: false, isWorking: working, maxRows: 10, bodyColumns: 128, scroll: { offset: 0, bodyRows: 9 }, view: {} },
   })
   const raster = tree.type === 'Raster' ? tree : tree.children.find(c => c.type === 'Raster')
   const button = tree.type === 'Box' ? JSON.stringify(tree).match(/"label":"([^"]+)"/)?.[1] : undefined
   band = { cols: raster.props.columns, button }
 }
+
+// A streaming hook (turn.step): each link's next() is a generator too.
+async function raiseStream(event, e, answer) {
+  const chain = (hooks.get(event) ?? []).filter(h => matches(h.matcher, e))
+  const run = (i, input) =>
+    i < chain.length ? chain[i].hook($, input, x => run(i + 1, x)) : (async function* () { return answer })()
+  const gen = run(0, e)
+  let r
+  while (!(r = await gen.next()).done);
+  return r.value
+}
+
+// One model request of a turn, answered with these token counts.
+let stepIndex = 0
+const step = (turnId, read, write, fresh, output) =>
+  raiseStream('turn.step', { turnId, index: stepIndex++, model: 'claude-opus-5-5', messageCount: 1 }, {
+    turnId, index: stepIndex, answer: '', toolUses: [], stopReason: 'end_turn',
+    usage: { cache_read_input_tokens: read, cache_creation_input_tokens: write, input_tokens: fresh, output_tokens: output, model: 'claude-opus-5-5' },
+  })
 
 const frameTimers = () => timers.filter(t => t.ms === 125)
 
@@ -129,16 +155,21 @@ const measure = async (percent, cost) => {
 // ---------- the script ----------
 await raise('session.start', { cwd: CWD }, { cwd: CWD })
 for (const [p, c] of [[8, 0.2], [11, 0.4], [13, 0.6], [17, 0.9], [20, 1.23]]) await measure(p, c)
+// The session so far: a cold start, then the cache serving it.
+await step('t0', 0, 30_000, 4, 900)
+for (let i = 1; i <= 12; i++) await step('t0', 30_000 + i * 1500, 1500, 2, 400)
 await render()
 await play(2.5) // idle: blinks and glances around
 
 await raise('prompt.submit', { text: 'add tests' }, {})
 working = true
 await raise('turn.start', { text: 'add tests', turnId: 't1' }, { turnId: 't1' })
+await step('t1', 0, 52_000, 3, 600) // a miss: the cache had lapsed
 await render()
 await play(1.5)
 await edit(`${CWD}/src/app.ts`, ['-old', '+new', '+more'])
 await edit(`${CWD}/src/app.test.ts`, ['+it("works")', '+expect(app()).toBe(1)', '+})'])
+for (let i = 1; i <= 6; i++) await step('t1', 52_000 + i * 2000, 2000, 2, 500)
 await render()
 await play(2) // working: waving claws and sparks
 
@@ -161,7 +192,10 @@ await raise('command.run', { command: 'focus-timer', args: '25' }, { text: '' })
 await play(2.5) // focus timer under the crab
 
 await raise('command.run', { command: 'focus-timer', args: 'off' }, { text: '' })
-now += 11 * 60_000 // nobody around for a while
+now += 4 * 60_000 + 25_000 // the cache is about to lapse: the crab shivers
+await play(3)
+
+now += 11 * 60_000 // nobody around for a while: the cache is cold
 await refresh()
 await play(3.5) // asleep
 

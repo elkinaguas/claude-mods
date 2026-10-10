@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Register, SessionRateLimit, StateDollar } from 'claude-code'
+import type { CoreEngineInterface, ModelUsage, Register, SessionRateLimit, StateDollar } from 'claude-code'
 
-import type { PixelbarBadge, PixelbarFile, PixelbarFocus, PixelbarPace, PixelbarTurn } from '../types'
+import type { PixelbarBadge, PixelbarCache, PixelbarFile, PixelbarFocus, PixelbarPace, PixelbarTotals, PixelbarTurn } from '../types'
 
 // Status bar++: one Raster above the prompt, repainted ~8 times a second
 // with $.ui.blit. Left: an animated pixel Clawd. Right: three rows of info.
@@ -24,7 +24,18 @@ let badge: PixelbarBadge | null = null
 const lastTurnAtom = atom({ plugin: 'pixelbar', key: 'lastTurn' } as const, null)
 
 // The turn in progress (main conversation only), and the last one finished.
-type TurnStats = { at: number; tools: number; files: Set<string>; added: number; removed: number; costAtStart: number }
+type TurnStats = {
+  at: number
+  tools: number
+  files: Set<string>
+  added: number
+  removed: number
+  costAtStart: number
+  // Input tokens of the turn's responses: read from, written to and outside the prompt cache.
+  read: number
+  write: number
+  fresh: number
+}
 let turn: TurnStats | undefined
 let lastTurn: PixelbarTurn | null = null
 
@@ -90,6 +101,75 @@ function paceLeft(now: number): number | undefined {
   const left = ((100 - lim.percentUsed) / used) * (now - pace.at)
   const reset = lim.resetsAt ? Date.parse(lim.resetsAt) - now : Infinity
   return left < reset ? left : undefined
+}
+
+// ---------- prompt cache ----------
+
+const cacheAtom = atom({ plugin: 'pixelbar', key: 'cache' } as const, null)
+const TTL_5M = 5 * 60_000
+const TTL_1H = 60 * 60_000
+const TTL_STORE_KEY = 'cacheTtlMs'
+// Past this much of the 5-minute TTL, a request that still reads most of the
+// last context from the cache shows the TTL is an hour.
+const TTL_SLACK_MS = 30_000
+const CACHE_SOON_MS = 60_000
+const SHIVER_MS = 30_000
+
+let cache: PixelbarCache | null = null
+
+// The session's tokens by kind, which the context bar's colors split by.
+const totalsAtom = atom({ plugin: 'pixelbar', key: 'totals' } as const, { read: 0, write: 0, fresh: 0, output: 0 })
+let totals: PixelbarTotals = { read: 0, write: 0, fresh: 0, output: 0 }
+
+async function addToTotals($: StateDollar, u: ModelUsage) {
+  const sum: PixelbarTotals = {
+    read: totals.read + u.cache_read_input_tokens,
+    write: totals.write + u.cache_creation_input_tokens,
+    fresh: totals.fresh + u.input_tokens,
+    output: totals.output + u.output_tokens,
+  }
+  totals = sum
+  await update($, totalsAtom, () => sum)
+}
+// Learned once and kept across sessions: from a model switch, which says, or
+// from a long pause the cache survived.
+let cacheTtl = TTL_5M
+
+// How much of the input the cache served, as a percentage to one decimal,
+// rounded down: 100.0 only when the cache served all of it.
+function hitRate(read: number, write: number, fresh: number): number | undefined {
+  const total = read + write + fresh
+  return total > 0 ? Math.floor((read / total) * 1000) / 10 : undefined
+}
+
+// Time left before the cache lapses; undefined before the first response.
+function cacheLeft(now: number): number | undefined {
+  return cache ? cache.at + cacheTtl - now : undefined
+}
+
+async function noteResponse($: Pick<CoreEngineInterface, 'state' | 'store'>, u: ModelUsage, sentAt: number) {
+  const before = cache
+  if (before && cacheTtl < TTL_1H && sentAt - before.at > TTL_5M + TTL_SLACK_MS) {
+    const prior = before.read + before.write + before.fresh + before.output
+    if (u.cache_read_input_tokens >= prior / 2) {
+      cacheTtl = TTL_1H
+      await $.store.set(TTL_STORE_KEY, TTL_1H).catch(() => {})
+    }
+  }
+  const now: PixelbarCache = {
+    read: u.cache_read_input_tokens,
+    write: u.cache_creation_input_tokens,
+    fresh: u.input_tokens,
+    output: u.output_tokens,
+    at: sentAt,
+  }
+  cache = now
+  await update($, cacheAtom, () => now)
+  if (turn) {
+    turn.read += now.read
+    turn.write += now.write
+    turn.fresh += now.fresh
+  }
 }
 
 type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }
@@ -167,6 +247,10 @@ const RED = 0xff3030
 const WHITE = 0xffffff
 const SWEAT = 0x87d7ff
 const LID = 0x3a1f14
+// The context bar's parts: read from the cache, written to it, and new.
+const CACHE_READ = 0x5f87d7
+const CACHE_WRITE = 0xd7af00
+const CACHE_NEW = 0xd75f5f
 const ORANGE_BASE = ORANGE
 const ORANGE_LIGHT_BASE = ORANGE_LIGHT
 const ORANGE_DARK_BASE = ORANGE_DARK
@@ -351,7 +435,8 @@ function mascot(t: number, mood: Mood, hot: number): Px[][] {
   return g
 }
 
-function drawMascot(c: Canvas, t: number, mood: Mood, hot: number) {
+// `dx` shifts the body sideways (a shiver).
+function drawMascot(c: Canvas, t: number, mood: Mood, hot: number, dx = 0) {
   const g = mascot(t, mood, hot)
   for (let row = 0; row < ROWS; row++) {
     for (let x = 0; x < 11; x++) {
@@ -359,10 +444,10 @@ function drawMascot(c: Canvas, t: number, mood: Mood, hot: number) {
       const bot = g[row * 2 + 1]?.[x] ?? null
       if (top === null && bot === null) continue
       if (top !== null && bot !== null) {
-        if (top === bot) c.put(x + 1, row, '█', top)
-        else c.put(x + 1, row, '▀', top, bot)
-      } else if (top !== null) c.put(x + 1, row, '▀', top)
-      else c.put(x + 1, row, '▄', bot!)
+        if (top === bot) c.put(x + 1 + dx, row, '█', top)
+        else c.put(x + 1 + dx, row, '▀', top, bot)
+      } else if (top !== null) c.put(x + 1 + dx, row, '▀', top)
+      else c.put(x + 1 + dx, row, '▄', bot!)
     }
   }
   if (mood === 'working') {
@@ -388,7 +473,7 @@ function drawMascot(c: Canvas, t: number, mood: Mood, hot: number) {
     // crab sits low (bob 1), so its eye row is pixel row 2: cell row 1.
     for (const eyeX of [3, 7]) {
       const face = g[2]?.[eyeX]
-      if (face != null) c.put(eyeX + 1, 1, '━', LID, face)
+      if (face != null) c.put(eyeX + 1 + dx, 1, '━', LID, face)
     }
     // Z's floating up.
     const z = Math.floor(t / 4) % 3
@@ -449,18 +534,109 @@ function prettyPath(p: string, home: string | undefined, room: number): string {
 
 const EIGHTHS = ['▏', '▎', '▍', '▌', '▋', '▊', '▉']
 
-function bar(c: Canvas, x: number, y: number, width: number, pct: number, t: number, working: boolean): number {
-  const filled = (Math.max(0, Math.min(100, pct)) / 100) * width
-  const sweep = (t % (width + 8)) - 4
-  for (let i = 0; i < width; i++) {
-    const f = Math.max(0, Math.min(1, filled - i))
-    let col = heat(width === 1 ? 0 : i / (width - 1))
-    if (working && f > 0) col = mix(col, WHITE, Math.max(0, 0.55 - Math.abs(i - sweep) * 0.2))
-    if (f >= 1) c.put(x + i, y, '█', col, TRACK)
-    else if (f > 0.0625) c.put(x + i, y, EIGHTHS[Math.min(6, Math.floor(f * 8) - 1)] ?? '▏', col, TRACK)
-    else c.put(x + i, y, ' ', DEF, TRACK)
+type Segment = { share: number; color: number }
+
+// One cell of a bar: `left` over its first `split` eighths, `right` over the
+// rest (TRACK is the empty track).
+type BarCell = { left: number; right: number; split: number }
+
+// Runs of colors, `sizes` in eighths, drawn into `width` cells with the track
+// after them; undefined when a cell would need more than two colors.
+function runCells(sizes: number[], colors: number[], width: number): BarCell[] | undefined {
+  const at = (slot: number) => {
+    let end = 0
+    for (let i = 0; i < sizes.length; i++) {
+      end += sizes[i]!
+      if (slot < end) return colors[i]!
+    }
+    return TRACK
   }
-  return x + width
+  const cells: BarCell[] = []
+  for (let i = 0; i < width; i++) {
+    const slots = Array.from({ length: 8 }, (_, k) => at(i * 8 + k))
+    const split = slots.findIndex(col => col !== slots[0])
+    if (split < 0) cells.push({ left: slots[0]!, right: slots[0]!, split: 8 })
+    else if (slots.slice(split).some(col => col !== slots[split])) return undefined
+    else cells.push({ left: slots[0]!, right: slots[split]!, split })
+  }
+  return cells
+}
+
+// A bar's cells split between `parts`, in order, to the eighth of a cell:
+// each part after the first (the thin ones) its exact size, at least an
+// eighth when above zero, the first part the rest. A cell holds two colors,
+// so where two thin parts would meet inside one cell the fill's end moves
+// (less than a cell) until they meet on a cell's edge.
+function partCells(parts: Segment[], filled: number, width: number): BarCell[] | undefined {
+  const [first, ...thin] = parts
+  if (!first || filled === 0) return undefined
+  const sizes = thin.map(p => (p.share > 0 ? Math.max(1, Math.round(p.share * filled)) : 0))
+  const thinTotal = sizes.reduce((a, b) => a + b, 0)
+  const colors = parts.map(p => p.color)
+  for (let shift = 0; shift <= 8; shift++) {
+    for (const end of shift === 0 ? [filled] : [filled - shift, filled + shift]) {
+      if (end <= thinTotal || end > width * 8) continue
+      const cells = runCells([end - thinTotal, ...sizes], colors, width)
+      if (cells) return cells
+    }
+  }
+  return undefined
+}
+
+// Rounded ends: the Powerline half circles. Only Nerd Fonts carry them, and
+// elsewhere they draw as boxes, so they are on where the terminal draws them
+// itself (or the person says their font has them).
+const CAP_LEFT = '\uE0B6'
+const CAP_RIGHT = '\uE0B4'
+const ROUNDING_TERMINALS = ['ghostty', 'wezterm']
+let roundEnds = false
+
+// Whether this session's terminal draws the Powerline glyphs whatever the font.
+async function drawsPowerline($: { env: CoreEngineInterface['env'] }): Promise<boolean> {
+  const none = () => undefined
+  const [program, ghostty, kitty, wezterm] = await Promise.all([
+    $.env.get('TERM_PROGRAM').catch(none),
+    $.env.get('GHOSTTY_RESOURCES_DIR').catch(none),
+    $.env.get('KITTY_WINDOW_ID').catch(none),
+    $.env.get('WEZTERM_PANE').catch(none),
+  ])
+  return ROUNDING_TERMINALS.includes((program ?? '').toLowerCase()) || !!ghostty || !!kitty || !!wezterm
+}
+
+// With `parts`, the filled length is split between them in order (shares
+// summing to 1); without, it is colored by how full the bar is. With rounded
+// ends, `outer` counts them.
+function bar(c: Canvas, x: number, y: number, outer: number, pct: number, t: number, working: boolean, parts?: Segment[]): number {
+  const caps = roundEnds ? 2 : 0
+  const width = Math.max(1, outer - caps)
+  if (roundEnds) x++
+  const filled = (Math.max(0, Math.min(100, pct)) / 100) * width
+  const whole = Math.floor(filled)
+  const frac = filled - whole
+  const edge = frac > 0.0625 ? Math.max(1, Math.min(7, Math.floor(frac * 8))) : 0
+  // By how full the bar is, unless the parts fit (a bar too short for them is too).
+  const cells =
+    (parts && partCells(parts, Math.round(filled * 8), width)) ??
+    Array.from({ length: whole + (edge > 0 ? 1 : 0) }, (_, i): BarCell => {
+      const col = heat(width === 1 ? 0 : i / (width - 1))
+      return i < whole ? { left: col, right: col, split: 8 } : { left: col, right: TRACK, split: edge }
+    })
+  const sweep = (t % (width + 8)) - 4
+  const glow = (col: number, i: number) =>
+    working && col !== TRACK ? mix(col, WHITE, Math.max(0, 0.55 - Math.abs(i - sweep) * 0.2)) : col
+  for (let i = 0; i < width; i++) {
+    const cell = cells[i] ?? { left: TRACK, right: TRACK, split: 8 }
+    const left = glow(cell.left, i)
+    const right = glow(cell.right, i)
+    if (cell.left === TRACK) c.put(x + i, y, ' ', DEF, TRACK)
+    else if (cell.split >= 8 || cell.left === cell.right) c.put(x + i, y, '█', left, TRACK)
+    else c.put(x + i, y, EIGHTHS[cell.split - 1]!, left, right)
+    if (!roundEnds) continue
+    // An end takes the color of the cell's side beside it, the track's while empty.
+    if (i === 0) c.put(x - 1, y, CAP_LEFT, left === TRACK ? TRACK : left)
+    if (i === width - 1) c.put(x + width, y, CAP_RIGHT, right)
+  }
+  return x + width + caps / 2
 }
 
 const LEVELS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
@@ -539,7 +715,9 @@ function frame(): string {
   const now = Date.now()
   const pct = data.percent ?? 0
   const mood = currentMood(now)
-  drawMascot(c, t, mood, Math.max(0, Math.min(1, (pct - CONTEXT_REARM) / 25)))
+  const cacheMs = isWorking ? undefined : cacheLeft(now)
+  const isShivering = cacheMs !== undefined && cacheMs > 0 && cacheMs < SHIVER_MS && mood !== 'sleeping'
+  drawMascot(c, t, mood, Math.max(0, Math.min(1, (pct - CONTEXT_REARM) / 25)), isShivering ? t % 2 : 0)
   const x0 = MASCOT_COLS
   const sep = (x: number, y: number) => c.text(x, y, ' │ ', DARK)
   const wave = (base: number) => (i: number) =>
@@ -572,31 +750,74 @@ function frame(): string {
     }
   }
 
-  // Row 1: ctx bar, 5h bar, wk bar
-  const barW = cols - x0 > 110 ? 16 : cols - x0 > 80 ? 10 : 6
-  x = c.text(x0, 1, 'ctx ', GRAY)
-  x = bar(c, x, 1, barW, data.percent ?? 0, t, isWorking)
-  const ctxLabel = data.tokens !== undefined ? ` ${k(data.tokens)}/${k(data.window)}` : ` –/${k(data.window)}`
-  x = c.text(x, 1, ctxLabel, GRAY)
-  if (data.percent !== undefined) {
-    const isHot = data.percent >= CONTEXT_WARN[0]!
-    x = c.text(x, 1, ` ${data.percent}%`, isHot && t % 8 < 4 ? WHITE : step(data.percent, [25, 50, 75]))
-    if (isHot) x = c.text(x, 1, ' /compact?', RED)
+  // Row 1: ctx bar, 5h bar, wk bar, stretched to fill the row: the bars share
+  // what the labels leave, the context bar twice what each limit bar gets.
+  // Where the row does not fit, the labels shorten a step at a time.
+  type Piece = { text: string; color: number } | { pct: number; parts?: Segment[]; share: number; min: number }
+  const cached = hitRate(totals.read, totals.write, totals.fresh)
+  const caps = roundEnds ? 2 : 0
+  // `terse` 0 is the full row; 1 drops "expires" and narrows the gaps, 2 the
+  // limits' reset times, 3 the token count.
+  const row1Of = (terse: number): Piece[] => {
+    const row: Piece[] = [{ text: 'ctx ', color: GRAY }]
+    // Past CONTEXT_REARM how full it is matters more than the cache: back to heat.
+    row.push({ pct, parts: pct < CONTEXT_REARM ? cacheParts() : undefined, share: 2, min: 6 })
+    if (terse < 3) row.push({ text: data.tokens !== undefined ? ` ${k(data.tokens)}/${k(data.window)}` : ` –/${k(data.window)}`, color: GRAY })
+    if (data.percent !== undefined) {
+      const isHot = data.percent >= CONTEXT_WARN[0]!
+      row.push({ text: ` ${data.percent}%`, color: isHot && t % 8 < 4 ? WHITE : step(data.percent, [25, 50, 75]) })
+      if (isHot) row.push({ text: ' /compact?', color: RED })
+    }
+    // How much of the session's input the cache served, as the bar's blue shows it.
+    if (cached !== undefined) {
+      row.push({ text: ' · ', color: DARK })
+      row.push({ text: `${cached.toFixed(1)}% cached`, color: cached >= 80 ? GREEN : cached >= 50 ? YELLOW : AMBER })
+    }
+    // Until the prompt cache lapses; the next prompt after that re-pays for the context.
+    if (cacheMs !== undefined) {
+      const lead = cached === undefined ? ' · cache ' : terse > 0 ? ' ' : ', '
+      const color = cacheMs >= CACHE_SOON_MS ? CACHE_READ : t % 8 < 4 ? AMBER : WHITE
+      if (cacheMs <= 0) row.push({ text: `${lead}❄ cold`, color: GRAY })
+      else row.push({ text: `${lead}${terse > 0 ? '' : 'expires '}${clock(cacheMs)}`, color })
+    }
+    for (const [kind, label] of [['five_hour', '5h'], ['seven_day', 'wk']] as const) {
+      const lim = data.limits.find(l => l.kind === kind)
+      if (!lim) continue
+      row.push({ text: `${terse > 0 ? '  ' : '   '}${label} `, color: GRAY })
+      row.push({ pct: lim.percentUsed, share: 1, min: 4 })
+      row.push({ text: ` ${Math.round(lim.percentUsed)}%`, color: step(lim.percentUsed, [50, 75, 90]) })
+      if (lim.resetsAt && terse < 2) {
+        const left = Date.parse(lim.resetsAt) - now
+        row.push({ text: left > 0 ? ` ${span(left)}` : ' resetting', color: DARK })
+      }
+      if (kind === 'five_hour') {
+        const out = paceLeft(now)
+        if (out !== undefined) row.push({ text: ` (out in ~${span(out)} at this pace)`, color: out < 30 * 60_000 ? RED : AMBER })
+      }
+    }
+    return row
   }
-  for (const [kind, label] of [['five_hour', '5h'], ['seven_day', 'wk']] as const) {
-    const lim = data.limits.find(l => l.kind === kind)
-    if (!lim) continue
-    x = c.text(x, 1, `   ${label} `, GRAY)
-    x = bar(c, x, 1, Math.max(4, barW - 4), lim.percentUsed, t, isWorking)
-    x = c.text(x, 1, ` ${Math.round(lim.percentUsed)}%`, step(lim.percentUsed, [50, 75, 90]))
-    if (lim.resetsAt) {
-      const left = Date.parse(lim.resetsAt) - now
-      x = c.text(x, 1, left > 0 ? ` ${span(left)}` : ' resetting', DARK)
+  const measured = (row: Piece[]) => {
+    let labels = 0
+    let shares = 0
+    let least = 0
+    for (const p of row) {
+      if ('text' in p) labels += [...p.text].length
+      else {
+        shares += p.share
+        least += p.min + caps
+      }
     }
-    if (kind === 'five_hour') {
-      const out = paceLeft(now)
-      if (out !== undefined) x = c.text(x, 1, ` (out in ~${span(out)} at this pace)`, out < 30 * 60_000 ? RED : AMBER)
-    }
+    return { labels, shares, fits: labels + least <= cols - x0 - 1 }
+  }
+  let row1 = row1Of(0)
+  for (let terse = 1; terse <= 3 && !measured(row1).fits; terse++) row1 = row1Of(terse)
+  const { labels, shares } = measured(row1)
+  const room = Math.max(0, cols - x0 - labels - 1)
+  x = x0
+  for (const p of row1) {
+    if ('text' in p) x = c.text(x, 1, p.text, p.color)
+    else x = bar(c, x, 1, Math.max(p.min + caps, Math.floor((room * p.share) / shares)), p.pct, t, isWorking, p.parts)
   }
 
   // Row 2: status │ cost │ session time │ context history
@@ -649,7 +870,7 @@ function frame(): string {
   }
 
   // Row 3: this turn so far while working, else the last turn's summary
-  const summary = (s: { ms: number; tools: number; files: number; added: number; removed: number }, dim: boolean) => {
+  const summary = (s: { ms: number; tools: number; files: number; added: number; removed: number; cacheHit?: number }, dim: boolean) => {
     x = c.text(x, 3, duration(s.ms), dim ? DARK : GRAY)
     x = c.text(x, 3, ` · ${s.tools} tool${s.tools === 1 ? '' : 's'}`, dim ? DARK : GRAY)
     if (s.files > 0) {
@@ -657,11 +878,17 @@ function frame(): string {
       x = c.text(x, 3, `+${s.added}`, dim ? mix(GREEN, DARK, 0.5) : GREEN)
       x = c.text(x, 3, ` −${s.removed}`, dim ? mix(RED, DARK, 0.5) : RED)
     }
+    if (s.cacheHit !== undefined) {
+      x = c.text(x, 3, ' · cache ', dim ? DARK : GRAY)
+      const col = s.cacheHit >= 80 ? GREEN : s.cacheHit >= 50 ? YELLOW : AMBER
+      x = c.text(x, 3, `${s.cacheHit.toFixed(1)}%`, dim ? mix(col, DARK, 0.5) : col)
+    }
   }
   x = x0
   if (isWorking && turn) {
     x = c.text(x, 3, 'this turn ', DARK)
-    summary({ ms: now - turn.at, tools: turn.tools, files: turn.files.size, added: turn.added, removed: turn.removed }, true)
+    const cacheHit = hitRate(turn.read, turn.write, turn.fresh)
+    summary({ ms: now - turn.at, tools: turn.tools, files: turn.files.size, added: turn.added, removed: turn.removed, cacheHit }, true)
   } else if (lastTurn) {
     x = c.text(x, 3, 'last turn ', GRAY)
     x = c.text(x, 3, lastTurn.isOk ? '✓ ' : '✗ ', lastTurn.isOk ? GREEN : RED)
@@ -675,9 +902,23 @@ function frame(): string {
   return c.encode()
 }
 
+// The session's tokens as shares: cache read, cache write, new (input and output).
+function cacheParts(): Segment[] | undefined {
+  const total = totals.read + totals.write + totals.fresh + totals.output
+  if (total === 0) return undefined
+  return [
+    { share: totals.read / total, color: CACHE_READ },
+    { share: totals.write / total, color: CACHE_WRITE },
+    { share: (totals.fresh + totals.output) / total, color: CACHE_NEW },
+  ]
+}
+
 // ---------- the mod ----------
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const ends = options.barEnds
+  roundEnds = ends === 'rounded'
+
   on('session.start', async ($, e, next) => {
     // A refused command (say, a name a built-in takes) must not stop the bar.
     const commands = [
@@ -695,6 +936,7 @@ export const register: Register = on => {
       await $.command.register(command).catch((err: unknown) => $.ui.log(`pixelbar: /${command.name} not registered: ${String(err)}`))
     }
     data.home = await $.env.get('HOME')
+    if (ends !== 'rounded' && ends !== 'square') roundEnds = await drawsPowerline($)
     const settings = (await $.settings.read()) as { effortLevel?: string }
     data.effort ??= settings.effortLevel
 
@@ -738,6 +980,10 @@ export const register: Register = on => {
     pace = await read($, paceAtom)
     dirtySince = await read($, dirtySinceAtom)
     focus = await read($, focusAtom)
+    cache = await read($, cacheAtom)
+    totals = await read($, totalsAtom)
+    const ttl = await $.store.get(TTL_STORE_KEY).catch(() => undefined)
+    if (ttl === TTL_1H || ttl === TTL_5M) cacheTtl = ttl
     await refresh().catch(() => {})
     await refreshGit().catch(() => {})
     data.history = await read($, historyAtom)
@@ -837,7 +1083,7 @@ export const register: Register = on => {
     lastActivity = Date.now()
     const usage = await $.session.usage().catch(() => undefined)
     const costAtStart = usage?.cost?.usd ?? data.cost ?? 0
-    turn = { at: Date.now(), tools: 0, files: new Set(), added: 0, removed: 0, costAtStart }
+    turn = { at: Date.now(), tools: 0, files: new Set(), added: 0, removed: 0, costAtStart, read: 0, write: 0, fresh: 0 }
     return next(e)
   })
 
@@ -876,10 +1122,28 @@ export const register: Register = on => {
     return r
   })
 
-  on('turn.step', async function* (_$, e, next) {
+  on('turn.step', async function* ($, e, next) {
     if (e.effort !== undefined) data.effort = String(e.effort)
-    return yield* next(e)
+    const sentAt = Date.now()
+    const r = yield* next(e)
+    if (r.usage) await addToTotals($, r.usage)
+    if (e.agentId === undefined && r.usage) await noteResponse($, r.usage, sentAt)
+    return r
   })
+
+  // A model switch says how long the cache lives (and forfeits it).
+  on('classic.PostModelSwitch', async ($, e, next) => {
+    cacheTtl = e.cache_ttl === '1h' ? TTL_1H : TTL_5M
+    await $.store.set(TTL_STORE_KEY, cacheTtl)
+    return next(e)
+  }).catch((_$, e, next) => next(e))
+
+  // A compaction replaces the context: nothing of it is cached any more.
+  on('classic.PostCompact', async ($, e, next) => {
+    cache = null
+    await update($, cacheAtom, () => null)
+    return next(e)
+  }).catch((_$, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     lastActivity = Date.now()
@@ -898,6 +1162,7 @@ export const register: Register = on => {
         removed: t.removed,
         cost: Math.max(0, costNow - t.costAtStart),
         isOk: !e.isAborted && e.reason === 'answer',
+        cacheHit: hitRate(t.read, t.write, t.fresh),
       }
       lastTurn = done
       await update($, lastTurnAtom, () => done)

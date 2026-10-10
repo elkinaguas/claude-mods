@@ -1,7 +1,16 @@
 {
   "name": "pixelbar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Status bar++: an animated pixel-art band above the prompt with model, context, rate limits, cost and git",
   "author": { "name": "Elkin Aguas" },
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "barEnds": {
+      "type": "string",
+      "title": "Bar ends",
+      "description": "Rounded or square ends on the context and usage bars. auto: rounded in terminals that draw them themselves (Ghostty, kitty, WezTerm), square elsewhere. rounded: always (needs a Nerd Font). square: always.",
+      "default": "auto",
+      "options": ["auto", "rounded", "square"]
+    }
+  }
 }
