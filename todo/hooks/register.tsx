@@ -30,6 +30,7 @@ const expandedAtom = atom({ plugin: 'todo', key: 'expanded' } as const, null)
 const renamingAtom = atom({ plugin: 'todo', key: 'renaming' } as const, null)
 const markedAtom = atom({ plugin: 'todo', key: 'marked' } as const, [] as string[])
 const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as string | null)
+const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as string | null)
 
 const TEMPLATE = `# TODO
 
@@ -395,7 +396,7 @@ async function startBatch($: EngineInterface, ts: Task[]) {
   await ask(
     $,
     `Start working on these ${ts.length} tasks, now under Doing in ${FILE}, one at a time in this order:\n${list.join('\n')}\n` +
-      `For each: first check its \`file:line\` references against the code and fix any that drifted, follow the task board rules (ask me when a decision is mine and record the Q/A under that task), and when it is finished move it to Done with its own log before starting the next.`,
+      `For each: first check its \`file:line\` references against the code and fix any that drifted, follow the task board rules (ask me when a decision is mine and record the Q/A under that task), and when it is finished move it to Done with its own log before starting the next. ${COMMIT_STEP}`,
   )
 }
 
@@ -414,6 +415,17 @@ function quickDoneTask(text: string, key: string, date: string): string | null {
 
 async function quickDone($: EngineInterface, t: Task) {
   await editBoard($, text => quickDoneTask(text, keyOf(t), today()))
+}
+
+// A task given up on: one with an ID goes to the top of Done marked
+// `(dropped <date>)`, notes kept, so its ID stays taken; a raw one is deleted.
+function dropTask(text: string, key: string, date: string): string | null {
+  const task = parse(text).find(t => keyOf(t) === key)
+  if (!task || task.section === 'done') return null
+  if (task.id) return moveTask(text, key, 'done', true, ([line, ...notes]) => [`${line!.trimEnd()} (dropped ${date})`, ...notes])
+  const lines = text.split('\n')
+  removeBlock(lines, task)
+  return lines.join('\n')
 }
 
 async function sendBack($: EngineInterface, t: Task) {
@@ -447,10 +459,17 @@ async function rename($: EngineInterface, t: Task, value: string) {
   }
 }
 
+// What Done asks about commits: the log names them; work not yet committed
+// is offered for a commit first (only the task's files), never committed
+// without a yes.
+const COMMIT_STEP =
+  `If the task's changes are not committed yet, ask me whether to commit them now (staging only that task's files) before writing the log. ` +
+  `The log names the commit(s) holding the work, or says "Uncommitted".`
+
 function finish($: EngineInterface, t: Task) {
   return ask(
     $,
-    `${t.id ?? `The task "${t.title}"`} is done. Following the task board rules, move it to Done in ${FILE} with today's date and replace its notes with the done log: what was done, the decisions and why, the result, the files touched.`,
+    `${t.id ?? `The task "${t.title}"`} is done. Following the task board rules, move it to Done in ${FILE} with today's date and replace its notes with the done log: what was done, the decisions and why, the result, the files touched. ${COMMIT_STEP}`,
   )
 }
 
@@ -577,6 +596,16 @@ export const register: Register = (on, options) => {
     const folded = foldable && (await read($, expandedAtom)) !== keyOf(chosen)
     const notes = chosen ? (folded ? chosen.notes.slice(0, 1) : chosen.notes) : []
     const renaming = await read($, renamingAtom)
+    const dropping = await read($, droppingAtom)
+    // The keyboard goes to a row that stays: the task's own once in Done, or
+    // a neighbour when a raw task is deleted.
+    const drop = async (t: Task) => {
+      const peers = by(t.section)
+      const i = peers.indexOf(t)
+      const stays = t.id ? t : peers[i + 1] ?? peers[i - 1]
+      await close(stays)
+      await editBoard($, text => dropTask(text, keyOf(t), today()))
+    }
     // Marks of tasks that left Todo (started, renamed, removed) drop out here.
     const markedKeys = await read($, markedAtom)
     const marked = todo.filter(t => markedKeys.includes(keyOf(t)))
@@ -614,6 +643,15 @@ export const register: Register = (on, options) => {
           {t.section === 'doing' && <Button key={k('done')} plain hotkey="d" label="Done" onPress={() => void finish($, t)} />}
           {t.section !== 'done' && (
             <Button key={k('quick-done')} plain hotkey="q" label="Quick done" onPress={() => void quickDone($, t)} />
+          )}
+          {t.section !== 'done' && (
+            <Button
+              key={k('drop')}
+              plain
+              hotkey="x"
+              label={dropping === keyOf(t) ? 'Confirm drop' : 'Drop'}
+              onPress={() => void (dropping === keyOf(t) ? drop(t) : update($, droppingAtom, () => keyOf(t)))}
+            />
           )}
           {t.section === 'doing' && <Button key={k('back')} plain hotkey="b" label="Back to Todo" onPress={() => void sendBack($, t)} />}
           {t.section !== 'done' && peers(t).indexOf(t) > 0 && (
@@ -661,12 +699,14 @@ export const register: Register = (on, options) => {
     // focus moves to a row that stays first.
     const close = async (focusOn = chosen) => {
       if (focusOn) await $.ui.focus({ requestId: PANE, key: `task:${keyOf(focusOn)}` }).catch(() => {})
+      await update($, droppingAtom, () => null)
       await update($, renamingAtom, () => null)
       await update($, selectedAtom, () => null)
     }
     // Enter on a row opens its detail; on the open row, folds it.
     const toggle = async (t: Task) => {
       if (chosen && keyOf(chosen) === keyOf(t)) return close()
+      await update($, droppingAtom, () => null)
       await update($, renamingAtom, () => null)
       await update($, selectedAtom, () => keyOf(t))
     }

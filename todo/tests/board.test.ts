@@ -513,6 +513,47 @@ test('q works on a Todo task too, and done tasks have no quick done', async ($, 
   expect(await ui.find({ key: 'quick-done' })).toBeUndefined()
 })
 
+test('x twice drops a task with an ID to the top of Done, notes kept; once does nothing', async ($, on) => {
+  const { files, prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'drop' })
+  expect(files['TODO.md']).toBe(BOARD)
+  expect((await ui.find({ key: 'drop' }))?.props.label).toBe('Confirm drop')
+  await ui.press({ key: 'drop' })
+  expect(files['TODO.md']).toMatch(
+    /## Done\n\n- T-3 Add retry to upload client \(dropped \d{4}-\d{2}-\d{2}\)\n  > Uploads fail silently on 5xx: src\/upload\/client\.ts:88\.\n  > Decision: how many retries\.\n- T-1 /,
+  )
+  expect(prompts).toEqual([])
+})
+
+test('dropping a raw task deletes it; closing between presses cancels the drop', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:raw:add dark mode to settings' })
+  await ui.press({ key: 'drop' })
+  await ui.press({ key: 'close' })
+  await ui.press({ key: 'task:raw:add dark mode to settings' })
+  expect((await ui.find({ key: 'drop' }))?.props.label).toBe('Drop')
+  await ui.press({ key: 'drop' })
+  await ui.press({ key: 'drop' })
+  expect(files['TODO.md']).not.toContain('dark mode')
+  expect(files['TODO.md']).toContain('  > Decision: how many retries.\n\n## Doing')
+})
+
+test('Done asks Claude to name the commit, or offer one for uncommitted work, before the log', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'done' })
+  expect(prompts[0]).toContain('T-2 is done.')
+  expect(prompts[0]).toContain('ask me whether to commit them now (staging only that task\'s files) before writing the log')
+  expect(prompts[0]).toContain('The log names the commit(s) holding the work, or says "Uncommitted".')
+})
+
 for (const surface of ['terminal', 'desktop'] as const) {
   test(`the panel lists the sections and starts a task (${surface})`, async ($, on) => {
     const { files, prompts } = project(on, { 'TODO.md': BOARD, 'CLAUDE.md': '<!-- todo:start -->\n<!-- todo:end -->\n' })

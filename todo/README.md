@@ -9,6 +9,7 @@ A task board in one `TODO.md` at the project root, with `## Todo`, `## Doing` an
 - **Batch it.** *Mark* (`m`) the Todo task the focus is on (or the open one) to add it to a batch: its row shows `●` and the focus moves to the next Todo task, so `m`, `m`, `m` marks a run; *Start N marked* (`g`) moves them all to Doing and asks Claude to work them one at a time, in Todo order, each finished and logged before the next.
 - **Reorder it.** *Up* (`k`) and *Down* (`j`) move a Todo or Doing task within its section. *Back to Todo* (`b`) returns a Doing task to the top of Todo and tells Claude to stop on it.
 - **Close it quickly.** *Quick done* (`q`) moves a trivial Todo or Doing task to the top of Done with today's date, keeping its notes and adding "Done from the panel, no log."; Claude is not asked.
+- **Drop it.** *Drop* (`x`, pressed twice) gives up on a Todo or Doing task: one with an ID goes to the top of Done marked `(dropped <date>)` with its notes, so its ID stays taken; one without an ID is deleted.
 - **Log it.** *Done* (`d`) asks Claude to move the task to Done with the date and replace its notes with a log: what was done, the decisions and why, the result, the files touched.
   In Done, a task's log shows folded to its first line; *Open log* (`o`) unfolds it.
 

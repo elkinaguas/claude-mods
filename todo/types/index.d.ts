@@ -19,6 +19,8 @@ declare module 'claude-code' {
       marked: string[]
       /** The panel element the person's focus is on (`task:<key>` for a row), if known. */
       focused: string | null
+      /** The task whose Drop was pressed once and waits for a second press (its key). */
+      dropping: string | null
     }
   }
 }
