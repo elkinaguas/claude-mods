@@ -1,0 +1,15 @@
+{
+  "name": "todo",
+  "version": "0.1.1",
+  "description": "A TODO.md task board (Todo / Doing / Done) with a side panel: quick capture, Claude enrichment with IDs, and done logs",
+  "author": { "name": "Elkin Aguas" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open the panel on start",
+      "description": "Open the task panel when a session starts in a project that has a TODO.md (it docks beside the transcript on wide terminals).",
+      "default": true
+    }
+  }
+}

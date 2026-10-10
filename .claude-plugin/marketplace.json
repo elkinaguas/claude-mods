@@ -1,12 +1,19 @@
 {
   "name": "claude-mods",
-  "owner": { "name": "Elkin Aguas" },
+  "owner": {
+    "name": "Elkin Aguas"
+  },
   "description": "Personal Claude Code mods",
   "plugins": [
     {
       "name": "pixelbar",
       "source": "./pixelbar",
       "description": "Status bar++: an animated pixel-art band above the prompt with model, context, rate limits, cost and git"
+    },
+    {
+      "name": "todo",
+      "source": "./todo",
+      "description": "A TODO.md task board (Todo / Doing / Done) with a side panel: quick capture, Claude enrichment with IDs, and done logs"
     }
   ]
 }
