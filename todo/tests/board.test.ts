@@ -554,6 +554,35 @@ test('Done asks Claude to name the commit, or offer one for uncommitted work, be
   expect(prompts[0]).toContain('The log names the commit(s) holding the work, or says "Uncommitted".')
 })
 
+test('an open question is answered from the panel: > A: under it, and Claude carries on', async ($, on) => {
+  const { files, prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ key: 'answer' })).toBeUndefined()
+  await ui.press({ key: 'task:T-2' })
+  await ui.input({ key: 'answer', text: 'Mock the clock' })
+  expect(files['TODO.md']).toContain('- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n  > A: Mock the clock\n\n## Done')
+  expect(prompts[0]).toBe(
+    'T-2 "Fix flaky auth test": I answered its open question in TODO.md. Q: Mock the clock or raise the timeout? A: Mock the clock. Carry on with it, following the task board rules.',
+  )
+  expect(await ui.find({ key: 'answer' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: ' ?' })).toBeUndefined()
+})
+
+test('the answer goes under the open question, not at the end of the notes; empty answers are ignored', async ($, on) => {
+  const board = BOARD.replace('  > Q: Mock the clock or raise the timeout?\n', '  > Q: Mock the clock or raise the timeout?\n  > Note: flaky on CI only.\n')
+  const { files, prompts } = project(on, { 'TODO.md': board })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-2' })
+  await ui.input({ key: 'answer', text: '  ' })
+  expect(files['TODO.md']).toBe(board)
+  await ui.input({ key: 'answer', text: 'Raise the timeout' })
+  expect(files['TODO.md']).toContain('  > Q: Mock the clock or raise the timeout?\n  > A: Raise the timeout\n  > Note: flaky on CI only.\n')
+  expect(prompts).toHaveLength(1)
+})
+
 for (const surface of ['terminal', 'desktop'] as const) {
   test(`the panel lists the sections and starts a task (${surface})`, async ($, on) => {
     const { files, prompts } = project(on, { 'TODO.md': BOARD, 'CLAUDE.md': '<!-- todo:start -->\n<!-- todo:end -->\n' })

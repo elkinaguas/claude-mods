@@ -63,6 +63,8 @@ type Task = {
   title: string
   notes: string[]
   hasOpenQuestion: boolean
+  // The open question's text and its line in the file, while one is open.
+  question?: { text: string; line: number }
   // Lines [start, end) of the file, the task line and its notes.
   start: number
   end: number
@@ -110,8 +112,13 @@ function parse(text: string): Task[] {
       const note = line.trim().replace(/^>\s?/, '')
       task.notes.push(note)
       task.end = i + 1
-      if (/^Q:/i.test(note)) task.hasOpenQuestion = true
-      else if (/^A:/i.test(note)) task.hasOpenQuestion = false
+      if (/^Q:/i.test(note)) {
+        task.hasOpenQuestion = true
+        task.question = { text: note.replace(/^Q:\s*/i, ''), line: i }
+      } else if (/^A:/i.test(note)) {
+        task.hasOpenQuestion = false
+        task.question = undefined
+      }
     } else if (line.trim()) {
       task = null
     }
@@ -417,6 +424,27 @@ async function quickDone($: EngineInterface, t: Task) {
   await editBoard($, text => quickDoneTask(text, keyOf(t), today()))
 }
 
+// Writes `> A: <answer>` right under the task's open question.
+function answerTask(text: string, key: string, answer: string): string | null {
+  const task = parse(text).find(t => keyOf(t) === key)
+  if (!task?.question) return null
+  const lines = text.split('\n')
+  lines.splice(task.question.line + 1, 0, `  > A: ${answer}`)
+  return lines.join('\n')
+}
+
+async function answer($: EngineInterface, t: Task, value: string) {
+  const text = value.trim()
+  if (!text || !t.question) return
+  const written = await editBoard($, board => answerTask(board, keyOf(t), text))
+  if (written === null) return
+  await ask(
+    $,
+    `${ref(t)}: I answered its open question in ${FILE}. Q: ${t.question.text} A: ${text}. ` +
+      (t.section === 'doing' ? 'Carry on with it, following the task board rules.' : 'It is not started; no need to work on it now.'),
+  )
+}
+
 // A task given up on: one with an ID goes to the top of Done marked
 // `(dropped <date>)`, notes kept, so its ID stays taken; a raw one is deleted.
 function dropTask(text: string, key: string, date: string): string | null {
@@ -638,6 +666,9 @@ export const register: Register = (on, options) => {
           </Text>
         ))}
         {folded && <Text dimColor>+{t.notes.length - 1} more</Text>}
+        {t.question && Input && (
+          <Input key={k('answer', true)} label="Answer:" submitLabel="answer" onSubmit={value => void answer($, t, value)} />
+        )}
         <Box flexDirection="row" columnGap={2} key="actions">
           {t.section === 'todo' && <Button key={k('start')} plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
           {t.section === 'doing' && <Button key={k('done')} plain hotkey="d" label="Done" onPress={() => void finish($, t)} />}
