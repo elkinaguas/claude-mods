@@ -21,6 +21,10 @@ declare module 'claude-code' {
       focused: string | null
       /** The task whose Drop was pressed once and waits for a second press (its key). */
       dropping: string | null
+      /** The dependency graph's zoom: 1 pills, 2 ovals, 3 ovals with titles. */
+      graphZoom: number
+      /** How many columns the dependency graph is scrolled to the right. */
+      graphScroll: number
     }
   }
 }

@@ -13,6 +13,8 @@ A task board in one `TODO.md` at the project root, with `## Todo`, `## Doing` an
 - **Log it.** *Done* (`d`) asks Claude to move the task to Done with the date and replace its notes with a log: what was done, the decisions and why, the result, the files touched.
   In Done, a task's log shows folded to its first line; *Open log* (`o`) unfolds it.
 
+**Dependencies.** At enrichment Claude adds `> Depends: T-3, T-5` to a task that waits on others. Once an open task has one, a graph appears under the lists, flowing left to right: each task a thin oval with its ID in its section's colour (the open task in white), arrows to what it unblocks. *Zoom* (`z`) cycles pills, ovals, and ovals with titles; `h` / `l` scroll it when it is wider than the panel. Starting a task whose dependencies aren't done shows a warning (it still starts), and a batch runs each task after the ones it waits on.
+
 Done keeps itself short: when a task starts and Done holds more than 20 tasks, the oldest move to `TODO-archive.md` and the newest 10 stay (option `autoArchive`; 0 turns it off).
 
 ```md

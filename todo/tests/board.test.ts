@@ -583,6 +583,147 @@ test('the answer goes under the open question, not at the end of the notes; empt
   expect(prompts).toHaveLength(1)
 })
 
+// A board where T-5 waits on T-3, T-6 on T-5 and T-2: three graph columns.
+const DEPS_BOARD = BOARD.replace(
+  '- add dark mode to settings\n',
+  '- add dark mode to settings\n- T-5 Retry metrics\n  > Depends: T-3\n- T-6 Ship retries\n  > Depends: T-5, T-2\n',
+)
+
+// A Raster's cells back to text, one line per row, trailing blanks trimmed.
+function rasterText(found: { props: Record<string, unknown> } | undefined): string {
+  const { columns, rows, cells } = found!.props as { columns: number; rows: number; cells: string }
+  const bytes = Uint8Array.from(atob(cells), ch => ch.charCodeAt(0))
+  const words = new Uint32Array(bytes.buffer)
+  const lines: string[] = []
+  for (let y = 0; y < rows; y++) {
+    let line = ''
+    for (let x = 0; x < columns; x++) line += String.fromCodePoint(words[(y * columns + x) * 3]!)
+    lines.push(line.trimEnd())
+  }
+  return lines.join('\n')
+}
+
+test('Depends lines draw a left-to-right graph of thin ovals and arrows under the lists', async ($, on) => {
+  project(on, { 'TODO.md': DEPS_BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  const text = rasterText(await ui.find({ key: 'graph-cells' }))
+  // T-3 → T-5 → T-6, and T-2 (Doing) → T-6, joining T-5's arrow on T-6's lane.
+  expect(text).toBe(
+    [
+      ' ╭───╮         ╭───╮         ╭───╮',
+      '( T-3 )──────▶( T-5 )─┬────▶( T-6 )',
+      ' ╰───╯         ╰───╯  │      ╰───╯',
+      '                      │',
+      ' ╭───╮                │',
+      '( T-2 )───────────────╯',
+      ' ╰───╯',
+    ].join('\n'),
+  )
+  // Ovals take their section's colour: T-3 is in Todo (cyan), T-2 in Doing (yellow).
+  const { cells, columns } = (await ui.find({ key: 'graph-cells' }))!.props as { cells: string; columns: number }
+  const words = new Uint32Array(Uint8Array.from(atob(cells), ch => ch.charCodeAt(0)).buffer)
+  const fgAt = (x: number, y: number) => words[(y * columns + x) * 3 + 1]
+  expect(fgAt(2, 1)).toBe(0x5fc4d4)
+  expect(fgAt(2, 5)).toBe(0xe8c547)
+})
+
+test('an arrow skipping columns runs through free slots, never into another task', async ($, on) => {
+  // T-20, T-21 wait on T-19; T-22 on T-20 and T-18 (two columns away); T-23 on T-21, T-22.
+  const board = [
+    '# TODO', '', '## Todo', '',
+    '- T-19 Design schema',
+    '- T-20 Migrations', '  > Depends: T-19',
+    '- T-21 Seed data', '  > Depends: T-19',
+    '- T-22 API', '  > Depends: T-20, T-18',
+    '- T-23 Release', '  > Depends: T-21, T-22',
+    '', '## Doing', '', '- T-18 Graph', '', '## Done', '',
+  ].join('\n')
+  project(on, { 'TODO.md': board })
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect(rasterText(await ui.find({ key: 'graph-cells' }))).toBe(
+    [
+      ' ╭────╮         ╭────╮         ╭────╮         ╭────╮',
+      '( T-19 )──┬───▶( T-20 )─┬────▶( T-22 )─┬────▶( T-23 )',
+      ' ╰────╯   │     ╰────╯  │      ╰────╯  │      ╰────╯',
+      '          │             │              │',
+      ' ╭────╮   │     ╭────╮  │              │',
+      '( T-18 )─╮╰───▶( T-21 )─│──────────────╯',
+      ' ╰────╯  │      ╰────╯  │',
+      '         │              │',
+      '         │              │',
+      '         ╰──────────────╯',
+      '',
+    ].join('\n'),
+  )
+})
+
+test('no graph when no open task has a dependency', async ($, on) => {
+  project(on, { 'TODO.md': BOARD })
+  await start($)
+  const plain = await mount($, 'terminal')
+  expect(await plain.find({ key: 'graph-cells' })).toBeUndefined()
+})
+
+test('zoom 1 draws pills, zoom 3 adds titles; opening a task whitens its node', async ($, on) => {
+  project(on, { 'TODO.md': DEPS_BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 2/3')
+  await ui.press({ key: 'graph-zoom' })
+  expect(rasterText(await ui.find({ key: 'graph-cells' }))).toContain('Add retry to up…       Retry metrics')
+  await ui.press({ key: 'graph-zoom' })
+  expect(rasterText(await ui.find({ key: 'graph-cells' })).split('\n')[0]).toBe('(T-3)────▶(T-5)─┬──▶(T-6)')
+  await ui.press({ key: 'graph-zoom' })
+  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 2/3')
+  await ui.press({ key: 'task:T-5' })
+  const { cells, columns } = (await ui.find({ key: 'graph-cells' }))!.props as { cells: string; columns: number }
+  const words = new Uint32Array(Uint8Array.from(atob(cells), ch => ch.charCodeAt(0)).buffer)
+  expect(words[(1 * columns + 16) * 3 + 1]).toBe(0xffffff)
+})
+
+test('a graph wider than the pane scrolls with l and h', async ($, on) => {
+  project(on, { 'TODO.md': DEPS_BOARD })
+  await start($)
+  const ui = await $.ui.mount({
+    plugin: 'todo',
+    surface: 'terminal',
+    component: 'Pane' as const,
+    requestId: 'todo',
+    props: { title: 'Tasks', bodyColumns: 20, placement: 'dock' } as never,
+  })
+  expect((await ui.find({ key: 'graph-cells' }))?.props.columns).toBe(20)
+  expect(await ui.find({ key: 'graph-left' })).toBeUndefined()
+  expect(rasterText(await ui.find({ key: 'graph-cells' })).split('\n')[1]).toBe('( T-3 )──────▶( T-5')
+  await ui.press({ key: 'graph-right' })
+  expect(rasterText(await ui.find({ key: 'graph-cells' })).split('\n')[1]).toBe('───▶( T-5 )─┬────▶(')
+  await ui.press({ key: 'graph-right' })
+  expect(await ui.find({ key: 'graph-right' })).toBeUndefined()
+  await ui.press({ key: 'graph-left' })
+  await ui.press({ key: 'graph-left' })
+  expect(await ui.find({ key: 'graph-left' })).toBeUndefined()
+})
+
+test('starting a task before its deps are done warns; a batch runs deps first', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': DEPS_BOARD })
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-6' })
+  await ui.press({ key: 'mark' })
+  await ui.press({ key: 'task:T-5' })
+  await ui.press({ key: 'mark' })
+  await ui.press({ key: 'start-marked' })
+  // T-5 goes first: T-6 waits on it. T-6 also waits on T-2 (Doing, outside the batch): warned.
+  expect(prompts[0]).toContain('1. T-5 "Retry metrics"\n2. T-6 "Ship retries"')
+  expect(toasts).toContain('todo: T-5 waits on T-3; T-6 waits on T-2')
+})
+
 for (const surface of ['terminal', 'desktop'] as const) {
   test(`the panel lists the sections and starts a task (${surface})`, async ($, on) => {
     const { files, prompts } = project(on, { 'TODO.md': BOARD, 'CLAUDE.md': '<!-- todo:start -->\n<!-- todo:end -->\n' })

@@ -31,6 +31,8 @@ const renamingAtom = atom({ plugin: 'todo', key: 'renaming' } as const, null)
 const markedAtom = atom({ plugin: 'todo', key: 'marked' } as const, [] as string[])
 const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as string | null)
 const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as string | null)
+const graphZoomAtom = atom({ plugin: 'todo', key: 'graphZoom' } as const, 2)
+const graphScrollAtom = atom({ plugin: 'todo', key: 'graphScroll' } as const, 0)
 
 const TEMPLATE = `# TODO
 
@@ -47,7 +49,7 @@ ${RULES_HEADING}
 \`TODO.md\` at the project root is the task board, in three sections: \`## Todo\`, \`## Doing\`, \`## Done\`. Older done tasks move to \`TODO-archive.md\`.
 
 - **Capture.** The engineer adds tasks as one short line under \`## Todo\` (\`- fix flaky auth test\`), with no ID. Keep their wording.
-- **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID, \`T-<n>\`: one more than the highest ID in TODO.md and TODO-archive.md. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines.
+- **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID, \`T-<n>\`: one more than the highest ID in TODO.md and TODO-archive.md. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines. When the task can only be done after other open tasks, one of those lines is \`> Depends: T-<n>, T-<m>\`.
 - **Doing.** A task being worked on sits under \`## Doing\`. When a decision is the engineer's, ask them; record each question under the task as \`> Q: ...\` and their answer as \`> A: ...\`. On starting a task, first check its \`file:line\` references against the code and fix any that drifted.
 - **Done.** When a task is finished, move it to the top of \`## Done\`, append the date to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets.
 - **Format.** A task is a line \`- T-<n> <title>\` (or \`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
@@ -65,6 +67,8 @@ type Task = {
   hasOpenQuestion: boolean
   // The open question's text and its line in the file, while one is open.
   question?: { text: string; line: number }
+  // IDs from a `> Depends: T-3, T-5` note: the tasks this one waits on.
+  deps: string[]
   // Lines [start, end) of the file, the task line and its notes.
   start: number
   end: number
@@ -102,6 +106,7 @@ function parse(text: string): Task[] {
         title,
         notes: [],
         hasOpenQuestion: false,
+        deps: [],
         start: i,
         end: i + 1,
       }
@@ -118,6 +123,8 @@ function parse(text: string): Task[] {
       } else if (/^A:/i.test(note)) {
         task.hasOpenQuestion = false
         task.question = undefined
+      } else if (/^Depends:/i.test(note)) {
+        task.deps.push(...(note.match(/T-\d+/g) ?? []))
       }
     } else if (line.trim()) {
       task = null
@@ -381,7 +388,30 @@ function enrichAll($: EngineInterface, n: number) {
   )
 }
 
+// A toast for tasks starting before what they wait on is done; they still
+// start (the person may know better).
+function warnUnmet($: EngineInterface, ts: Task[], tasks: Task[], alsoDone: Task[] = []) {
+  const notes = ts.flatMap(t => {
+    const unmet = unmetDeps(t, tasks).filter(d => !alsoDone.some(o => o.id === d))
+    return unmet.length ? [`${t.id ?? t.title} waits on ${unmet.join(', ')}`] : []
+  })
+  if (notes.length) void $.ui.toast(`todo: ${notes.join('; ')}`)
+}
+
+// A batch in an order that puts each task after the batch tasks it waits on,
+// Todo order kept otherwise (a cycle falls back to it).
+function depsFirst(ts: Task[]): Task[] {
+  const out: Task[] = []
+  const left = [...ts]
+  while (left.length) {
+    const i = left.findIndex(t => !t.deps.some(d => left.some(o => o !== t && o.id === d)))
+    out.push(...left.splice(i === -1 ? 0 : i, 1))
+  }
+  return out
+}
+
 async function start($: EngineInterface, t: Task) {
+  warnUnmet($, [t], parse(await current($)))
   await autoArchive($)
   await editBoard($, text => moveTask(text, keyOf(t), 'doing'))
   await ask(
@@ -392,11 +422,15 @@ async function start($: EngineInterface, t: Task) {
   )
 }
 
-// Starts the marked tasks as one batch, in Todo order: all move to Doing,
+// Starts the marked tasks as one batch, in Todo order with each task after
+// the batch tasks it waits on: all move to Doing,
 // and Claude works them one at a time, each finished before the next.
-async function startBatch($: EngineInterface, ts: Task[]) {
+async function startBatch($: EngineInterface, marked: Task[]) {
   await update($, markedAtom, () => [])
-  if (ts.length === 1) return start($, ts[0]!)
+  if (marked.length === 1) return start($, marked[0]!)
+  const ts = depsFirst(marked)
+  // Deps inside the batch are met by the time their turn comes.
+  warnUnmet($, ts, parse(await current($)), ts)
   await autoArchive($)
   await editBoard($, text => ts.reduce((acc, t) => moveTask(acc, keyOf(t), 'doing') ?? acc, text))
   const list = ts.map((t, i) => `${i + 1}. ${t.id ? `${t.id} "${t.title}"` : `"${t.title}" (not enriched yet: give it the next free ID and its context lines first)`}`)
@@ -509,6 +543,284 @@ async function submitDraft($: EngineInterface, value: string) {
   await update($, draftAtom, () => '')
   if (value.trim()) await capture($, value)
 }
+
+// ---- The dependency graph -------------------------------------------------
+// Drawn left to right under the lists as a grid of terminal cells (a
+// Raster): each task a thin oval with its ID, outlined in its section's
+// colour, and arrows from each task to the tasks it unblocks. Pure: tasks
+// in, cells out.
+
+type GraphNode = { id: string; title: string; section: Section; deps: string[]; isOpen: boolean }
+// A waypoint is the free slot an arrow takes in each column it crosses.
+type Placed = GraphNode & { layer: number; x: number; y: number; waypoint?: true }
+// One arrow segment between neighbouring columns; `src` / `dst` are the tasks
+// at the ends of the whole arrow it belongs to.
+type GraphEdge = { from: string; to: string; src: string; dst: string }
+// Zoom 1: one-row pills; 2: three-row ovals; 3: ovals with the title under.
+type Zoom = 1 | 2 | 3
+type Shape = { zoom: Zoom; nodeW: number; colW: number; gap: number; slot: number; mid: number }
+type Cells = { columns: number; rows: number; char: string[]; fg: number[] }
+type Drawn = Cells & { nodes: Placed[] }
+
+const TITLE_W = 16
+
+function shapeFor(zoom: Zoom, idW: number): Shape {
+  if (zoom === 1) return { zoom, nodeW: idW + 2, colW: idW + 2, gap: 5, slot: 2, mid: 0 }
+  const nodeW = idW + 4
+  if (zoom === 2) return { zoom, nodeW, colW: nodeW, gap: 7, slot: 4, mid: 1 }
+  return { zoom, nodeW, colW: Math.max(nodeW, TITLE_W), gap: 7, slot: 5, mid: 1 }
+}
+
+// Columns by depth: a task sits one column right of the deepest task it
+// waits on (a cycle is cut where it closes). Within a column, tasks follow
+// the average row of what they wait on, which keeps arrows short and level.
+function layoutGraph(input: GraphNode[], shape: Shape): { nodes: Placed[]; edges: GraphEdge[]; columns: number; rows: number } {
+  const byId = new Map(input.map(n => [n.id, n]))
+  const layer = new Map<string, number>()
+  const visiting = new Set<string>()
+  const depth = (id: string): number => {
+    const known = layer.get(id)
+    if (known !== undefined) return known
+    if (visiting.has(id)) return 0
+    visiting.add(id)
+    const deps = byId.get(id)!.deps.filter(d => byId.has(d))
+    const d = deps.length ? 1 + Math.max(...deps.map(depth)) : 0
+    visiting.delete(id)
+    layer.set(id, d)
+    return d
+  }
+  input.forEach(n => depth(n.id))
+
+  // An arrow that skips columns gets a waypoint in each column it crosses,
+  // so it runs through a free slot there, never through another task.
+  type Slot = GraphNode & { waypoint?: true; preds: string[] }
+  const layers: Slot[][] = []
+  const add = (slot: Slot, l: number) => (layers[l] ??= []).push(slot)
+  const edges: GraphEdge[] = []
+  for (const n of input) {
+    const preds: string[] = []
+    for (const d of n.deps.filter(d => byId.has(d) && layer.get(d)! < layer.get(n.id)!)) {
+      let prev = d
+      for (let l = layer.get(d)! + 1; l < layer.get(n.id)!; l++) {
+        const id = `${d}>${n.id}@${l}`
+        add({ id, title: '', section: n.section, deps: [prev], isOpen: false, waypoint: true, preds: [prev] }, l)
+        edges.push({ from: prev, to: id, src: d, dst: n.id })
+        prev = id
+      }
+      edges.push({ from: prev, to: n.id, src: d, dst: n.id })
+      preds.push(prev)
+    }
+    add({ ...n, preds }, layer.get(n.id)!)
+  }
+  // Within a column, follow the average row of the slots feeding in from the
+  // column before; tasks before waypoints when tied.
+  const rowOf = new Map<string, number>()
+  layers.forEach((col, l) => {
+    if (l > 0) {
+      const weight = (n: Slot) => {
+        const rows = n.preds.map(d => rowOf.get(d)).filter((r): r is number => r !== undefined)
+        return rows.length ? rows.reduce((a, b) => a + b, 0) / rows.length : Number.MAX_SAFE_INTEGER
+      }
+      col.sort((a, b) => weight(a) - weight(b) || Number(!!a.waypoint) - Number(!!b.waypoint))
+    }
+    col.forEach((n, i) => rowOf.set(n.id, i))
+  })
+
+  const step = shape.colW + shape.gap
+  const nodes: Placed[] = []
+  layers.forEach((col, l) =>
+    col.forEach(({ preds: _, ...n }, i) => nodes.push({ ...n, layer: l, x: l * step, y: i * shape.slot })),
+  )
+  const tallest = Math.max(0, ...layers.map(c => c.length))
+  return { nodes, edges, columns: layers.length ? layers.length * step - shape.gap : 0, rows: tallest ? tallest * shape.slot - 1 : 0 }
+}
+
+// Colours as 0x00RRGGBB; CELL_DEFAULT is the terminal's own (Raster's bit 24).
+const CELL_DEFAULT = 0x01000000
+const EDGE_COLOR = 0x8a8a8a
+const OPEN_COLOR = 0xffffff
+const NODE_COLOR: Record<Section, number> = { doing: 0xe8c547, todo: 0x5fc4d4, done: 0x6f9a6f }
+
+// Line pieces by the directions they join: up 1, right 2, down 4, left 8.
+const PIECE: Record<number, string> = {
+  2: '─', 8: '─', 10: '─', 1: '│', 4: '│', 5: '│',
+  6: '╭', 12: '╮', 3: '╰', 9: '╯',
+  7: '├', 13: '┤', 14: '┬', 11: '┴', 15: '┼',
+}
+
+// A width-1 BMP character, or '?' (Raster refuses wide and control ones).
+function cellChar(ch: string): string {
+  const c = ch.codePointAt(0)!
+  const wide =
+    (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
+    (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6)
+  return c < 0x20 || (c >= 0x7f && c < 0xa0) || c > 0xffff || wide ? '?' : ch
+}
+
+const fitCells = (text: string, width: number) => {
+  const chars = [...text].map(cellChar)
+  return chars.length <= width ? chars : [...chars.slice(0, width - 1), '…']
+}
+
+function drawGraph(input: GraphNode[], zoom: Zoom): Drawn {
+  const shape = shapeFor(zoom, Math.max(3, ...input.map(n => n.id.length)))
+  const g = layoutGraph(input, shape)
+  const columns = Math.max(1, g.columns)
+  const rows = Math.max(1, g.rows)
+  const char = new Array<string>(columns * rows).fill(' ')
+  const fg = new Array<number>(columns * rows).fill(CELL_DEFAULT)
+  const at = (x: number, y: number) => (x >= 0 && x < columns && y >= 0 && y < rows ? y * columns + x : -1)
+  const put = (x: number, y: number, ch: string, color: number) => {
+    const i = at(x, y)
+    if (i === -1) return
+    char[i] = ch
+    fg[i] = color
+  }
+
+  // Arrows first, nodes over them. Each leaves its node's middle row on the
+  // right, turns in the gap before its target's column (one lane per target,
+  // so arrows into one task join), and ends in ▶. Arrows sharing a source or
+  // a target join where they meet; unrelated ones cross, the vertical over.
+  const pos = new Map(g.nodes.map(p => [p.id, p]))
+  const pieces = new Map<number, { dirs: number; edge: GraphEdge }[]>()
+  const join = (x: number, y: number, dirs: number, edge: GraphEdge) => {
+    const i = at(x, y)
+    if (i === -1) return
+    const list = pieces.get(i) ?? []
+    list.push({ dirs, edge })
+    pieces.set(i, list)
+  }
+  // Lanes: in each gap, one column per target where its arrows turn. A line
+  // leaving a row must turn before a line arriving on that row begins, or
+  // the two would run together: so a target reached from row r gets an
+  // earlier lane than the target sitting on row r (a cycle keeps file order).
+  const lanes = new Map<string, number>()
+  const byLayer = new Map<number, GraphEdge[]>()
+  for (const e of g.edges) {
+    const l = pos.get(e.to)!.layer
+    byLayer.set(l, [...(byLayer.get(l) ?? []), e])
+  }
+  for (const list of byLayer.values()) {
+    const targets = [...new Set(list.map(e => e.to))]
+    const after = new Map<string, Set<string>>(targets.map(t => [t, new Set<string>()]))
+    for (const e of list) {
+      const rowA = pos.get(e.from)!.y
+      const onRow = targets.find(t => t !== e.to && pos.get(t)!.y === rowA)
+      if (onRow) after.get(e.to)!.add(onRow)
+    }
+    const order: string[] = []
+    const left = [...targets]
+    while (left.length) {
+      const i = left.findIndex(t => !left.some(o => o !== t && after.get(o)!.has(t)))
+      order.push(...left.splice(i === -1 ? 0 : i, 1))
+    }
+    order.forEach((t, i) => lanes.set(t, i))
+  }
+  const heads: [number, number][] = []
+  for (const e of g.edges) {
+    const a = pos.get(e.from)!
+    const b = pos.get(e.to)!
+    // Out of a task's right edge, or a waypoint's far side; into a task's
+    // arrowhead, or straight through a waypoint.
+    const sx = a.x + (a.waypoint ? shape.colW : shape.nodeW)
+    const sy = a.y + shape.mid
+    const tx = b.waypoint ? b.x : b.x - 1
+    const ty = b.y + shape.mid
+    const bend = Math.min(tx - 1, b.x - shape.gap + 1 + (lanes.get(e.to)! % Math.max(1, shape.gap - 3)))
+    for (let x = sx; x < bend; x++) join(x, sy, 2 | 8, e)
+    if (sy === ty) {
+      join(bend, sy, 2 | 8, e)
+    } else {
+      const down = ty > sy
+      join(bend, sy, 8 | (down ? 4 : 1), e)
+      for (let y = Math.min(sy, ty) + 1; y < Math.max(sy, ty); y++) join(bend, y, 1 | 4, e)
+      join(bend, ty, 2 | (down ? 1 : 4), e)
+    }
+    for (let x = bend + 1; x < tx; x++) join(x, ty, 2 | 8, e)
+    if (b.waypoint) for (let x = b.x; x < b.x + shape.colW; x++) join(x, ty, 2 | 8, e)
+    else heads.push([tx, ty])
+  }
+  const related = (a: GraphEdge, b: GraphEdge) => a.src === b.src || a.dst === b.dst
+  for (const [i, list] of pieces) {
+    const vertical = list.find(p => p.dirs === (1 | 4))
+    const keep = vertical && list.some(p => !related(p.edge, vertical.edge)) ? list.filter(p => related(p.edge, vertical.edge)) : list
+    char[i] = PIECE[keep.reduce((acc, p) => acc | p.dirs, 0)] ?? '┼'
+    fg[i] = EDGE_COLOR
+  }
+  for (const [x, y] of heads) put(x, y, '▶', EDGE_COLOR)
+
+  // Nodes: a pill `(T-12)` at zoom 1; a thin oval at 2 and 3, the title
+  // under it at 3. The open task is drawn in white.
+  for (const p of g.nodes.filter(n => !n.waypoint)) {
+    const color = p.isOpen ? OPEN_COLOR : NODE_COLOR[p.section]
+    const w = shape.nodeW
+    const id = [...p.id]
+    const pad = Math.floor((w - 2 - id.length) / 2)
+    const midRow = p.y + shape.mid
+    for (let x = p.x + 1; x < p.x + w - 1; x++) put(x, midRow, ' ', color)
+    put(p.x, midRow, '(', color)
+    put(p.x + w - 1, midRow, ')', color)
+    id.forEach((ch, i) => put(p.x + 1 + pad + i, midRow, ch, color))
+    if (zoom === 1) continue
+    put(p.x + 1, p.y, '╭', color)
+    put(p.x + w - 2, p.y, '╮', color)
+    put(p.x + 1, p.y + 2, '╰', color)
+    put(p.x + w - 2, p.y + 2, '╯', color)
+    for (let x = p.x + 2; x < p.x + w - 2; x++) {
+      put(x, p.y, '─', color)
+      put(x, p.y + 2, '─', color)
+    }
+    if (zoom === 3) fitCells(p.title, shape.colW).forEach((ch, i) => put(p.x + i, p.y + 3, ch, p.isOpen ? OPEN_COLOR : EDGE_COLOR))
+  }
+  return { columns, rows, char, fg, nodes: g.nodes }
+}
+
+// The visible window of a drawing: `width` columns from `from` (clamped).
+function windowOf(c: Cells, from: number, width: number): Cells {
+  const start = Math.max(0, Math.min(from, c.columns - width))
+  const columns = Math.max(1, Math.min(width, c.columns))
+  const char: string[] = []
+  const fg: number[] = []
+  for (let y = 0; y < c.rows; y++) {
+    for (let x = start; x < start + columns; x++) {
+      char.push(c.char[y * c.columns + x] ?? ' ')
+      fg.push(c.fg[y * c.columns + x] ?? CELL_DEFAULT)
+    }
+  }
+  return { columns, rows: c.rows, char, fg }
+}
+
+// Raster's `cells`: base64 of little-endian u32 triplets [codePoint, fg, bg].
+function encodeCells(c: Cells): string {
+  const words = new Uint32Array(c.columns * c.rows * 3)
+  for (let i = 0; i < c.columns * c.rows; i++) {
+    words[i * 3] = c.char[i]!.codePointAt(0)!
+    words[i * 3 + 1] = c.fg[i]!
+    words[i * 3 + 2] = CELL_DEFAULT
+  }
+  const bytes = new Uint8Array(words.buffer)
+  const native = bytes as unknown as { toBase64?: () => string }
+  if (typeof native.toBase64 === 'function') return native.toBase64()
+  let bin = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(bin)
+}
+
+// What the graph shows: open tasks with an ID, plus the done tasks they wait
+// on; null when no open task waits on another (nothing to draw). A
+// dependency missing from the file counts as done and archived.
+function graphNodes(tasks: Task[], openKey: string | null): GraphNode[] | null {
+  const open = tasks.filter(t => t.id && t.section !== 'done')
+  const ids = new Set(tasks.filter(t => t.id).map(t => t.id!))
+  if (!open.some(t => t.deps.some(d => ids.has(d)))) return null
+  const wanted = new Set(open.flatMap(t => t.deps))
+  return tasks
+    .filter(t => t.id && (t.section !== 'done' || wanted.has(t.id)))
+    .map(t => ({ id: t.id!, title: t.title, section: t.section, deps: t.deps, isOpen: keyOf(t) === openKey }))
+}
+
+// The deps of `t` not done yet: present in the file and outside Done.
+const unmetDeps = (t: Task, tasks: Task[]) => t.deps.filter(d => tasks.some(o => o.id === d && o.section !== 'done'))
 
 export const register: Register = (on, options) => {
   if (typeof options.autoArchive === 'number') autoArchiveOver = options.autoArchive
@@ -772,6 +1084,45 @@ export const register: Register = (on, options) => {
       </Text>
     )
 
+    // The dependency graph under the lists: only when an open task waits on
+    // another, and only where the surface draws cells (the terminal). `z`
+    // cycles the zoom; `h` / `l` scroll it when wider than the pane.
+    const Raster = 'Raster' in els ? els.Raster : undefined
+    const nodes = Raster ? graphNodes(tasks, chosen ? keyOf(chosen) : null) : null
+    let graph = null
+    if (Raster && nodes) {
+      const zoomSetting = await read($, graphZoomAtom)
+      const zoom: Zoom = zoomSetting === 1 || zoomSetting === 3 ? zoomSetting : 2
+      const drawn = drawGraph(nodes, zoom)
+      const width = Math.max(10, Math.min(512, (e.props as { bodyColumns?: number }).bodyColumns ?? 60))
+      const maxScroll = Math.max(0, drawn.columns - width)
+      const scroll = Math.min(maxScroll, Math.max(0, await read($, graphScrollAtom)))
+      const view = windowOf(drawn, scroll, width)
+      const SCROLL_STEP = 10
+      graph = (
+        <Box flexDirection="column" key="graph">
+          <Text> </Text>
+          <Box flexDirection="row" columnGap={2} key="graph-bar">
+            <Text bold>Dependencies</Text>
+            <Button
+              key={k('graph-zoom')}
+              plain
+              hotkey="z"
+              label={`Zoom ${zoom}/3`}
+              onPress={() => void update($, graphZoomAtom, () => (zoom === 3 ? 1 : zoom + 1))}
+            />
+            {scroll > 0 && (
+              <Button key={k('graph-left')} plain hotkey="h" label="◀" onPress={() => void update($, graphScrollAtom, () => Math.max(0, scroll - SCROLL_STEP))} />
+            )}
+            {scroll < maxScroll && (
+              <Button key={k('graph-right')} plain hotkey="l" label="▶" onPress={() => void update($, graphScrollAtom, () => Math.min(maxScroll, scroll + SCROLL_STEP))} />
+            )}
+          </Box>
+          <Raster key="graph-cells" columns={view.columns} rows={Math.min(256, view.rows)} cells={encodeCells({ ...view, rows: Math.min(256, view.rows), char: view.char.slice(0, view.columns * 256), fg: view.fg.slice(0, view.columns * 256) })} />
+        </Box>
+      )
+    }
+
     const tree = (
       <Box flexDirection="column">
         {!hasRules && <Text color="yellow">Rules not in CLAUDE.md yet: run /todo init.</Text>}
@@ -811,6 +1162,7 @@ export const register: Register = (on, options) => {
         {done.slice(0, DONE_SHOWN).map(row)}
         {done.length > DONE_SHOWN && <Text dimColor>  +{done.length - DONE_SHOWN} more · /todo archive</Text>}
         {!chosen && tasks.length > 0 && <Text dimColor>Enter on a task shows its notes and actions.</Text>}
+        {graph}
       </Box>
     )
     focusOrder = order
