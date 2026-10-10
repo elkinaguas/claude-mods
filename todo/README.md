@@ -27,6 +27,15 @@ Done keeps itself short: when a task starts and Done holds more than 20 tasks, t
 - add dark mode to settings
 ```
 
+## Safety
+
+`TODO.md` may come from someone else's repo, so the mod treats it as data:
+
+- It never reads or writes `TODO.md`, `TODO-archive.md`, `CLAUDE.md` or `AGENTS.md` when one is a symbolic link (even one leading nowhere) or not a regular file; the panel says so instead.
+- A file it can't read is never overwritten as if it were missing.
+- Prompts it sends Claude name tasks by ID. A task without an ID is quoted as a one-line, capped title marked as data, never as an instruction.
+- Text typed into the panel is written as one clean line, and a very large dependency graph is not drawn.
+
 ## Commands
 
 | Command | Does |

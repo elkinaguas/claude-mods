@@ -1,5 +1,5 @@
-/** TODO.md as last read: whether it exists, its text, and its mtime (ms). */
-export type TodoFile = { exists: boolean; text: string; mtime: number }
+/** TODO.md as last read: whether it exists, its text, and why it was refused (a link, not a file). */
+export type TodoFile = { exists: boolean; text: string; refused?: string }
 
 declare module 'claude-code' {
   interface PluginState {

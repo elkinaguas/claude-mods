@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "A TODO.md task board (Todo / Doing / Done) with a side panel: quick capture, Claude enrichment with IDs, and done logs",
   "author": {
     "name": "Elkin Aguas"
