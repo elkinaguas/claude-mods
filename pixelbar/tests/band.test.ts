@@ -58,20 +58,15 @@ test('warns once at 80% and 90% context, and hints /compact', async ($, on) => {
   for (const p of [50, 82, 85, 91, 93]) await $.session.measure(measure(p))
   expect(toasts).toEqual(['Context at 82%. Consider /compact soon.', 'Context at 91%. Consider /compact soon.'])
 
-  const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
-  const bar = await ui.find({ key: 'bar' })
-  const text = rows(String(bar?.props.cells), Number(bar?.props.columns))
+  const text = await bandRows($)
   expect(text[1]).toContain('/compact?')
   expect(text[2]).toContain('ctx ▁▆▇██')
 })
 
 test('a small climb in context still rises in the sparkline', async ($, on) => {
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('ui.toast', () => ({ value: undefined }))
+  quietMeasure(on)
   for (const p of [8, 10, 12, 15]) await $.session.measure(measure(p))
-  const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
-  const bar = await ui.find({ key: 'bar' })
-  expect(rows(String(bar?.props.cells), Number(bar?.props.columns))[2]).toContain('ctx ▁▃▅█')
+  expect((await bandRows($))[2]).toContain('ctx ▁▃▅█')
 })
 
 test('re-arms the warning after a compaction', async ($, on) => {
@@ -86,9 +81,7 @@ test('re-arms the warning after a compaction', async ($, on) => {
 })
 
 async function statusRow($: Engine): Promise<string> {
-  const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
-  const bar = await ui.find({ key: 'bar' })
-  return rows(String(bar?.props.cells), Number(bar?.props.columns))[2]!
+  return (await bandRows($))[2]!
 }
 
 test('the crab celebrates passing tests', async ($, on) => {
@@ -103,6 +96,15 @@ test('a build badge without counts', async ($, on) => {
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: 'done', stderr: '', interrupted: false } }))
   await $.tool.call({ tool: 'Bash', command: 'npm run build' })
   expect(await statusRow($)).toContain('build ✓')
+})
+
+test('a huge run of digits in the output is read quickly, and the summary at the end still counts', async ($, on) => {
+  const output = `${'9'.repeat(200_000)}\n42 passed`
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: output, stderr: '', interrupted: false } }))
+  const began = Date.now()
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  expect(Date.now() - began).toBeLessThan(1000)
+  expect(await statusRow($)).toContain('tests ✓ 42')
 })
 
 test('the crab worries about failing tests', async ($, on) => {
@@ -145,9 +147,7 @@ test('summarizes the last turn', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   await $.turn.complete({ answer: 'done', durationMs: 134_000, isAborted: false, turnId: 't1', reason: 'answer' })
 
-  const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
-  const bar = await ui.find({ key: 'bar' })
-  expect(rows(String(bar?.props.cells), Number(bar?.props.columns))[3]).toContain('last turn ✓ 2m14s · 2 tools · 1 file +2 −1 · turn $0.00')
+  expect((await bandRows($))[3]).toContain('last turn ✓ 2m14s · 2 tools · 1 file +2 −1 · turn $0.00')
 })
 
 const runFocus = ($: Engine, args: string) =>
@@ -167,9 +167,21 @@ test('rejects a bad focus length', async $ => {
   expect(await runFocus($, 'soon')).toMatchObject({ text: 'Usage: /focus-timer [minutes, up to 600] or /focus-timer off' })
 })
 
-async function bandOf($: Engine) {
-  const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: props() })
+async function bandOf($: Engine, columns = 120) {
+  const ui = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: { ...props(), bodyColumns: columns } })
   return ui.find({ key: 'bar' })
+}
+
+// The band's rows as text, at `columns` wide.
+async function bandRows($: Engine, columns = 120): Promise<string[]> {
+  const bar = await bandOf($, columns)
+  return rows(String(bar?.props.cells), Number(bar?.props.columns))
+}
+
+// Context measures pass through, and their warnings are not looked at.
+function quietMeasure(on: On) {
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
 }
 
 test('starts up even when a command name is refused', async ($, on) => {
@@ -292,8 +304,7 @@ function answerSteps(on: On, counts: ReturnType<typeof usage>[]) {
 }
 
 test('splits the context bar by cache use and counts down to the cache lapsing', async ($, on) => {
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('ui.toast', () => ({ value: undefined }))
+  quietMeasure(on)
   answerSteps(on, [usage(60_000, 20_000, 15_000, 5_000)])
   await $.session.measure(measure(50))
   await step($, 't1', 0)
@@ -331,8 +342,7 @@ test('a subagent request leaves the bar alone', async ($, on) => {
 })
 
 test('above 70% context the bar goes back to heat colors', async ($, on) => {
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('ui.toast', () => ({ value: undefined }))
+  quietMeasure(on)
   answerSteps(on, [usage(60_000, 20_000, 15_000, 5_000)])
   await $.session.measure(measure(75))
   await step($, 't1', 0)
@@ -380,8 +390,7 @@ function ctxBar(cells: string, row: string, columns = 120) {
 }
 
 test('the bars stretch to fill the row, the context bar the widest', async ($, on) => {
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('ui.toast', () => ({ value: undefined }))
+  quietMeasure(on)
   const limits = [
     { kind: 'five_hour', percentUsed: 30, resetsAt: new Date(Date.now() + 3_600_000).toISOString() },
     { kind: 'seven_day', percentUsed: 10, resetsAt: new Date(Date.now() + 86_400_000).toISOString() },
@@ -403,7 +412,8 @@ test('the bars stretch to fill the row, the context bar the widest', async ($, o
 
 const ROUND = /ctx \uE0B6[^\uE0B4]*\uE0B4 /
 
-async function startIn($: Engine, on: On, env: Record<string, string>) {
+// `gitStatus`: what `git status --porcelain=v2 --branch` prints; left out, not a repo.
+async function startIn($: Engine, on: On, env: Record<string, string>, gitStatus?: string) {
   on('env.get', (_$, e) => ({ value: env[e.name] }))
   on('settings.read', () => ({ value: {} }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -411,12 +421,20 @@ async function startIn($: Engine, on: On, env: Record<string, string>) {
   on('session.usage', () => ({
     value: { startedAt: 0, context: { window: 200_000, tokens: 20_000, percent: 10 }, rateLimits: [], cost: { usd: 0 } },
   }))
-  on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: '' } }) as never)
+  on('process.run', () => ({ value: { exitCode: gitStatus === undefined ? 128 : 0, stdout: gitStatus ?? '', stderr: '' } }) as never)
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/home/me/code' } as never)
   return rows(String((await bandOf($))?.props.cells), 120)[1]!
 }
+
+test('a branch name the band cannot draw (an emoji) shows as ? instead of blanking the band', async ($, on) => {
+  mock.clock(on)
+  await startIn($, on, {}, '# branch.oid 1234567\n# branch.head feat/\u{1F680}-launch\n')
+  const band = await bandOf($)
+  expect(band).toBeDefined()
+  expect(rows(String(band?.props.cells), 120).join('\n')).toContain('feat/?-launch')
+})
 
 test('rounds the bar ends in Ghostty', async ($, on) => {
   mock.clock(on)
@@ -441,8 +459,7 @@ test('square ends when set, even in Ghostty', { options: { barEnds: 'square' } }
 })
 
 test('the context bar colors add up the whole session, subagents included', async ($, on) => {
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('ui.toast', () => ({ value: undefined }))
+  quietMeasure(on)
   // A cache miss (all written), then a hit (all read), then a subagent's miss.
   answerSteps(on, [usage(0, 40_000, 0), usage(40_000, 0, 0), usage(0, 0, 0, 20_000)])
   await $.session.measure(measure(60))
@@ -460,8 +477,7 @@ test('the context bar colors add up the whole session, subagents included', asyn
 })
 
 test('thin parts show at their size and in order, and the row says how much was cached', async ($, on) => {
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('ui.toast', () => ({ value: undefined }))
+  quietMeasure(on)
   answerSteps(on, [usage(980_000, 14_000, 0, 6_000)])
   await $.session.measure(measure(40))
   await step($, 't1', 0)
@@ -481,8 +497,7 @@ test('thin parts show at their size and in order, and the row says how much was 
 })
 
 test('in a narrow band the labels shorten so the weekly bar still fits', async ($, on) => {
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('ui.toast', () => ({ value: undefined }))
+  quietMeasure(on)
   answerSteps(on, [usage(90_000, 8_000, 0, 2_000)])
   const limits = [
     { kind: 'five_hour', percentUsed: 34, resetsAt: new Date(Date.now() + 7_740_000).toISOString() },
@@ -491,12 +506,10 @@ test('in a narrow band the labels shorten so the weekly bar still fits', async (
   await $.session.measure({ ...measure(20), rateLimits: limits } as never)
   await step($, 't1', 0)
 
-  const wide = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: { ...props(), bodyColumns: 160 } })
-  const wideRow = rows(String((await wide.find({ key: 'bar' }))?.props.cells), 160)[1]!
+  const wideRow = (await bandRows($, 160))[1]!
   expect(wideRow).toMatch(/cached, expires [45]:\d\d   5h .* 34% 2h\d+m   wk .* 12% 5d\d+h/)
 
-  const narrow = await $.ui.mount({ plugin: 'pixelbar', surface: 'terminal', component: 'AbovePrompt', props: { ...props(), bodyColumns: 96 } })
-  const narrowRow = rows(String((await narrow.find({ key: 'bar' }))?.props.cells), 96)[1]!
+  const narrowRow = (await bandRows($, 96))[1]!
   expect(narrowRow).toMatch(/wk .* 12%/)
   expect(narrowRow.trimEnd().length).toBeLessThanOrEqual(95)
 })

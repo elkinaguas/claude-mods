@@ -1,6 +1,6 @@
 {
   "name": "pixelbar",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Status bar++: an animated pixel-art band above the prompt with model, context, rate limits, cost and git",
   "author": { "name": "Elkin Aguas" },
   "types": "./types/index.d.ts",

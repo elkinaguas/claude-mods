@@ -30,7 +30,7 @@ export type PixelbarCache = { read: number; write: number; fresh: number; output
 export type PixelbarTotals = { read: number; write: number; fresh: number; output: number }
 
 /** A file edited this session: lines changed, and its edits as unified-diff hunks. */
-export type PixelbarFile = { path: string; added: number; removed: number; patches: string[]; at: number }
+export type PixelbarFile = { path: string; added: number; removed: number; patches: string[] }
 
 declare module 'claude-code' {
   interface PluginState {

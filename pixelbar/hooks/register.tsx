@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { CoreEngineInterface, ModelUsage, Register, SessionRateLimit, StateDollar } from 'claude-code'
+import type { CoreEngineInterface, ModelUsage, Register, SessionRateLimit, SessionUsage, StateDollar } from 'claude-code'
 
 import type { PixelbarBadge, PixelbarCache, PixelbarFile, PixelbarFocus, PixelbarPace, PixelbarTotals, PixelbarTurn } from '../types'
 
@@ -84,6 +84,20 @@ function nextPace(limits: SessionRateLimit[], now: number): PixelbarPace | null 
   return pace
 }
 
+// Context, limits and cost from the session's usage or a measure event (the
+// same shape), then the pace of the 5-hour limit.
+async function applyUsage(
+  $: StateDollar,
+  u: Pick<SessionUsage, 'context' | 'rateLimits' | 'cost'>,
+) {
+  data.window = u.context.window
+  data.tokens = u.context.tokens
+  data.percent = u.context.percent
+  data.limits = u.rateLimits
+  data.cost = u.cost?.usd
+  await trackPace($)
+}
+
 async function trackPace($: StateDollar) {
   const found = nextPace(data.limits, Date.now())
   if (found === pace) return
@@ -121,12 +135,21 @@ let cache: PixelbarCache | null = null
 const totalsAtom = atom({ plugin: 'pixelbar', key: 'totals' } as const, { read: 0, write: 0, fresh: 0, output: 0 })
 let totals: PixelbarTotals = { read: 0, write: 0, fresh: 0, output: 0 }
 
+// A response's tokens by kind, as the bar and the totals count them.
+const tokensOf = (u: ModelUsage): PixelbarTotals => ({
+  read: u.cache_read_input_tokens,
+  write: u.cache_creation_input_tokens,
+  fresh: u.input_tokens,
+  output: u.output_tokens,
+})
+
 async function addToTotals($: StateDollar, u: ModelUsage) {
+  const add = tokensOf(u)
   const sum: PixelbarTotals = {
-    read: totals.read + u.cache_read_input_tokens,
-    write: totals.write + u.cache_creation_input_tokens,
-    fresh: totals.fresh + u.input_tokens,
-    output: totals.output + u.output_tokens,
+    read: totals.read + add.read,
+    write: totals.write + add.write,
+    fresh: totals.fresh + add.fresh,
+    output: totals.output + add.output,
   }
   totals = sum
   await update($, totalsAtom, () => sum)
@@ -156,13 +179,7 @@ async function noteResponse($: Pick<CoreEngineInterface, 'state' | 'store'>, u: 
       await $.store.set(TTL_STORE_KEY, TTL_1H).catch(() => {})
     }
   }
-  const now: PixelbarCache = {
-    read: u.cache_read_input_tokens,
-    write: u.cache_creation_input_tokens,
-    fresh: u.input_tokens,
-    output: u.output_tokens,
-    at: sentAt,
-  }
+  const now: PixelbarCache = { ...tokensOf(u), at: sentAt }
   cache = now
   await update($, cacheAtom, () => now)
   if (turn) {
@@ -180,6 +197,8 @@ const filesAtom = atom({ plugin: 'pixelbar', key: 'files' } as const, [])
 const selectedAtom = atom({ plugin: 'pixelbar', key: 'selectedFile' } as const, null)
 const FILES_COMMAND = 'session-files'
 const FILES_PANE = 'pixelbar-files'
+const openFiles = ($: CoreEngineInterface) => $.ui.open({ id: FILES_PANE, title: 'Session files', closeOnEscape: true })
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`
 const MAX_FILES = 200
 const MAX_PATCHES = 30
 
@@ -204,7 +223,6 @@ function withEdit(files: PixelbarFile[], path: string, added: number, removed: n
     added: (old?.added ?? 0) + added,
     removed: (old?.removed ?? 0) + removed,
     patches: [...(old?.patches ?? []), ...patches].slice(-MAX_PATCHES),
-    at: Date.now(),
   }
   return [...files.filter(f => f.path !== path), file].slice(-MAX_FILES)
 }
@@ -251,9 +269,6 @@ const LID = 0x3a1f14
 const CACHE_READ = 0x5f87d7
 const CACHE_WRITE = 0xd7af00
 const CACHE_NEW = 0xd75f5f
-const ORANGE_BASE = ORANGE
-const ORANGE_LIGHT_BASE = ORANGE_LIGHT
-const ORANGE_DARK_BASE = ORANGE_DARK
 
 type Git = { branch: string; dirty: number; ahead: number; hasUpstream: boolean }
 
@@ -306,6 +321,17 @@ function step(value: number, cuts: [number, number, number]): number {
 
 // ---------- canvas ----------
 
+// The code point of a printable width-1 BMP character, else '?': a Raster
+// refuses the whole band over one wide or control character (an emoji branch
+// name, a CJK folder).
+function cellCode(ch: string): number {
+  const c = ch.codePointAt(0) ?? 0x20
+  const isWide =
+    (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
+    (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6)
+  return c < 0x20 || (c >= 0x7f && c < 0xa0) || c > 0xffff || isWide ? 0x3f : c
+}
+
 class Canvas {
   readonly words: Uint32Array
   constructor(
@@ -323,7 +349,7 @@ class Canvas {
   put(x: number, y: number, ch: string, fg: number, bg = DEF) {
     if (x < 0 || y < 0 || x >= this.cols || y >= this.rows) return
     const i = (y * this.cols + x) * 3
-    this.words[i] = ch.codePointAt(0) ?? 0x20
+    this.words[i] = cellCode(ch)
     this.words[i + 1] = fg
     this.words[i + 2] = bg
   }
@@ -342,24 +368,10 @@ class Canvas {
   }
 }
 
-const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-
 function base64(bytes: Uint8Array): string {
-  let out = ''
-  let i = 0
-  for (; i + 2 < bytes.length; i += 3) {
-    const n = (bytes[i]! << 16) | (bytes[i + 1]! << 8) | bytes[i + 2]!
-    out += B64[(n >> 18) & 63]! + B64[(n >> 12) & 63]! + B64[(n >> 6) & 63]! + B64[n & 63]!
-  }
-  const left = bytes.length - i
-  if (left === 1) {
-    const n = bytes[i]! << 16
-    out += B64[(n >> 18) & 63]! + B64[(n >> 12) & 63]! + '=='
-  } else if (left === 2) {
-    const n = (bytes[i]! << 16) | (bytes[i + 1]! << 8)
-    out += B64[(n >> 18) & 63]! + B64[(n >> 12) & 63]! + B64[(n >> 6) & 63]! + '='
-  }
-  return out
+  let bin = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(bin)
 }
 
 // ---------- the mascot: an 11x6 pixel grid drawn with half blocks ----------
@@ -377,9 +389,10 @@ function mascot(t: number, mood: Mood, hot: number): Px[][] {
     const row = g[y]
     if (row && x >= 0 && x < W) row[x] = c
   }
-  const ORANGE = mix(ORANGE_BASE, RED, hot)
-  const ORANGE_LIGHT = mix(ORANGE_LIGHT_BASE, RED, hot)
-  const ORANGE_DARK = mix(ORANGE_DARK_BASE, RED, hot * 0.7)
+  // The crab's shell, highlight and legs, reddening as context fills.
+  const shell = mix(ORANGE, RED, hot)
+  const shine = mix(ORANGE_LIGHT, RED, hot)
+  const legShade = mix(ORANGE_DARK, RED, hot * 0.7)
   const phase = Math.floor(t / 2) % 2
 
   let bob = Math.floor(t / 10) % 2
@@ -397,26 +410,26 @@ function mascot(t: number, mood: Mood, hot: number): Px[][] {
   if (mood === 'working' || mood === 'celebrate') look = 0
   else if (mood === 'worried') look = Math.floor(t / 3) % 2 === 0 ? -1 : 1
 
-  for (let x = 2; x <= 8; x++) set(x, bob, x === 2 || x === 8 ? ORANGE : ORANGE_LIGHT)
-  for (let x = 2; x <= 8; x++) set(x, 1 + bob, ORANGE)
+  for (let x = 2; x <= 8; x++) set(x, bob, x === 2 || x === 8 ? shell : shine)
+  for (let x = 2; x <= 8; x++) set(x, 1 + bob, shell)
   if (!isBlinking) {
     set(3 + look, 1 + bob, null)
     set(7 + look, 1 + bob, null)
   }
-  for (let x = 0; x <= 10; x++) set(x, 2 + bob, ORANGE)
-  for (let x = 2; x <= 8; x++) set(x, 3 + bob, ORANGE)
+  for (let x = 0; x <= 10; x++) set(x, 2 + bob, shell)
+  for (let x = 2; x <= 8; x++) set(x, 3 + bob, shell)
 
   if (mood === 'working') {
     // Wave the claws in turn.
     const arm = phase === 0 ? 0 : 10
     set(arm, 2 + bob, null)
-    set(arm, 1 + bob, ORANGE)
+    set(arm, 1 + bob, shell)
   } else if (mood === 'celebrate') {
     // Both claws up.
     for (const arm of [0, 10]) {
       set(arm, 2 + bob, null)
-      set(arm, 1 + bob, ORANGE)
-      set(arm, bob, ORANGE)
+      set(arm, 1 + bob, shell)
+      set(arm, bob, shell)
     }
   } else if (mood === 'sleeping') {
     // Claws tucked in.
@@ -426,12 +439,12 @@ function mascot(t: number, mood: Mood, hot: number): Px[][] {
     // A nervous shuffle of the claws.
     const arm = t % 4 < 2 ? 0 : 10
     set(arm, 2 + bob, null)
-    set(arm, 3 + bob, ORANGE)
+    set(arm, 3 + bob, shell)
   }
 
   const isWalking = mood === 'working' || mood === 'celebrate'
   const legs = isWalking && phase === 1 ? [3, 5, 7] : [2, 4, 6, 8]
-  for (const x of legs) set(x, 4 + bob, ORANGE_DARK)
+  for (const x of legs) set(x, 4 + bob, legShade)
   return g
 }
 
@@ -458,11 +471,11 @@ function drawMascot(c: Canvas, t: number, mood: Mood, hot: number, dx = 0) {
       if (life >= sparks.length) continue
       const y = 2 - Math.floor(life / 2)
       const x = 12 + ((t + s * 3) % 2)
-      c.put(x, y, sparks[life]!, mix(YELLOW, ORANGE_BASE, life / sparks.length))
+      c.put(x, y, sparks[life]!, mix(YELLOW, ORANGE, life / sparks.length))
     }
   } else if (mood === 'celebrate') {
     // Confetti on both sides.
-    const confetti = [GOLD, GREEN, CYAN, WHITE, ORANGE_LIGHT_BASE]
+    const confetti = [GOLD, GREEN, CYAN, WHITE, ORANGE_LIGHT]
     for (let s = 0; s < 4; s++) {
       const y = (t + s * 2) % 3
       const x = s % 2 === 0 ? 12 + (s % 4 === 0 ? 0 : 1) : 0
@@ -691,13 +704,18 @@ function lastCount(output: string, re: RegExp): number | undefined {
   return found
 }
 
-const PASSED = /(\d+)\s+(?:tests?\s+)?pass(?:ed|ing|es)?\b/gi
-const FAILED = /(\d+)\s+(?:tests?\s+)?fail(?:ed|ing|ures?|s)?\b/gi
+// A count is 1 to 9 digits starting a number, so a long run of digits in
+// the output is scanned once, not once per digit (that was quadratic).
+const PASSED = /(?<!\d)(\d{1,9})\s+(?:tests?\s+)?pass(?:ed|ing|es)?\b/gi
+const FAILED = /(?<!\d)(\d{1,9})\s+(?:tests?\s+)?fail(?:ed|ing|ures?|s)?\b/gi
+// Test runners print their summary last: only the tail is read.
+const SUMMARY_TAIL = 20_000
 
 // Tests or a build that passed: celebrate. Anything real that failed: worry.
 // Returns the badge for a test or build run.
-function reactToCommand(command: string, output: string, isError: boolean): PixelbarBadge | undefined {
+function reactToCommand(command: string, fullOutput: string, isError: boolean): PixelbarBadge | undefined {
   if (LOOKING.test(command)) return undefined
+  const output = fullOutput.slice(-SUMMARY_TAIL)
   const failed = lastCount(output, FAILED)
   const isFailure = isError || (failed ?? 0) > 0
   const kind = TESTS.test(command) ? 'tests' : BUILD.test(command) ? 'build' : undefined
@@ -745,7 +763,7 @@ function frame(): string {
     const age = dirtySince !== null ? now - dirtySince : 0
     if (dirty > 0 && (dirty >= NUDGE_FILES || age >= NUDGE_MS)) {
       const pulse = mix(AMBER, DARK, (Math.sin(t * 0.3) + 1) / 2)
-      const files = `${dirty} file${dirty === 1 ? '' : 's'}`
+      const files = plural(dirty, 'file')
       x = c.text(x, 0, ` ⚑ ${files}${age >= 60_000 ? `, ${span(age)}` : ''} uncommitted`, pulse)
     }
   }
@@ -872,9 +890,9 @@ function frame(): string {
   // Row 3: this turn so far while working, else the last turn's summary
   const summary = (s: { ms: number; tools: number; files: number; added: number; removed: number; cacheHit?: number }, dim: boolean) => {
     x = c.text(x, 3, duration(s.ms), dim ? DARK : GRAY)
-    x = c.text(x, 3, ` · ${s.tools} tool${s.tools === 1 ? '' : 's'}`, dim ? DARK : GRAY)
+    x = c.text(x, 3, ` · ${plural(s.tools, 'tool')}`, dim ? DARK : GRAY)
     if (s.files > 0) {
-      x = c.text(x, 3, ` · ${s.files} file${s.files === 1 ? '' : 's'} `, dim ? DARK : GRAY)
+      x = c.text(x, 3, ` · ${plural(s.files, 'file')} `, dim ? DARK : GRAY)
       x = c.text(x, 3, `+${s.added}`, dim ? mix(GREEN, DARK, 0.5) : GREEN)
       x = c.text(x, 3, ` −${s.removed}`, dim ? mix(RED, DARK, 0.5) : RED)
     }
@@ -944,16 +962,16 @@ export const register: Register = (on, options) => {
       const [usage, model, cwd] = await Promise.all([$.session.usage(), $.session.model(), $.session.cwd()])
       data.model = model
       data.cwd = cwd
-      data.window = usage.context.window
-      data.tokens = usage.context.tokens
-      data.percent = usage.context.percent
-      data.limits = usage.rateLimits
-      data.cost = usage.cost?.usd
       data.startedAt = usage.startedAt
-      await trackPace($)
+      await applyUsage($, usage)
     }
     const refreshGit = async () => {
-      const r = await $.process.run(['git', 'status', '--porcelain=v2', '--branch'], { cwd: data.cwd || undefined, timeoutMs: 5000 })
+      // No index lock (it would race Claude's own git add / commit), and no
+      // fsmonitor command a repo's config could name.
+      const r = await $.process.run(
+        ['git', '-c', 'core.fsmonitor=false', '--no-optional-locks', 'status', '--porcelain=v2', '--branch'],
+        { cwd: data.cwd || undefined, timeoutMs: 5000 },
+      )
       if (r.exitCode !== 0) {
         data.git = undefined
         return
@@ -1011,9 +1029,9 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: FILES_COMMAND }, async $ => {
     const files = await read($, filesAtom)
-    await $.ui.open({ id: FILES_PANE, title: 'Session files', closeOnEscape: true })
+    await openFiles($)
     const n = files.length
-    return { text: n === 0 ? 'No files edited yet this session.' : `${n} file${n === 1 ? '' : 's'} edited this session.` }
+    return { text: n === 0 ? 'No files edited yet this session.' : `${plural(n, 'file')} edited this session.` }
   })
 
   on('ui.render', { component: 'Pane', requestId: FILES_PANE }, async ($, e) => {
@@ -1027,7 +1045,7 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column">
         <Box flexDirection="row">
-          <Text bold>{files.length} file{files.length === 1 ? '' : 's'} edited </Text>
+          <Text bold>{plural(files.length, 'file')} edited </Text>
           <Text color="green">+{total.added}</Text>
           <Text color="red"> −{total.removed}</Text>
         </Box>
@@ -1070,7 +1088,7 @@ export const register: Register = (on, options) => {
     const started: PixelbarFocus = { endsAt: Date.now() + minutes * 60_000, minutes }
     focus = started
     await update($, focusAtom, () => started)
-    return { text: `Focus timer started: ${minutes} minute${minutes === 1 ? '' : 's'}.` }
+    return { text: `Focus timer started: ${plural(minutes, 'minute')}.` }
   })
 
   on('prompt.submit', (_$, e, next) => {
@@ -1171,12 +1189,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.measure', async ($, e, next) => {
-    data.window = e.context.window
-    data.tokens = e.context.tokens
-    data.percent = e.context.percent
-    data.limits = e.rateLimits
-    data.cost = e.cost?.usd
-    await trackPace($)
+    await applyUsage($, e)
     const p = e.context.percent
     if (e.changed.includes('context') && p !== undefined) {
       const history = [...data.history, p].slice(-48)
@@ -1184,11 +1197,12 @@ export const register: Register = (on, options) => {
       await update($, historyAtom, () => history)
 
       // Warn once at each level; a compaction below 70% re-arms them.
-      const warnedAt = p < CONTEXT_REARM ? 0 : await read($, warnedAtom)
+      const stored = await read($, warnedAtom)
+      const warnedAt = p < CONTEXT_REARM ? 0 : stored
       const level = [...CONTEXT_WARN].reverse().find(w => p >= w) ?? 0
       if (level > warnedAt) $.ui.toast(`Context at ${p}%. Consider /compact soon.`)
       const nextWarned = Math.max(level, warnedAt)
-      if (nextWarned !== (await read($, warnedAtom))) await update($, warnedAtom, () => nextWarned)
+      if (nextWarned !== stored) await update($, warnedAtom, () => nextWarned)
     }
     return next(e)
   })
@@ -1202,7 +1216,7 @@ export const register: Register = (on, options) => {
     // Reading the files subscribes the band, so the button appears (and its
     // count moves) as edits land. Before the first edit there is no button.
     const edited = (await read($, filesAtom)).length
-    const label = `${edited} file${edited === 1 ? '' : 's'}`
+    const label = plural(edited, 'file')
     const buttonCols = edited > 0 ? label.length + 5 : 0 // "[ label ]" and a gap
     cols = Math.max(MASCOT_COLS + 20, Math.min(512, e.props.bodyColumns - buttonCols))
     const raster = <Raster key={KEY} columns={cols} rows={ROWS} cells={frame()} />
@@ -1216,7 +1230,7 @@ export const register: Register = (on, options) => {
             key="files"
             label={label}
             hotkey="f"
-            onPress={() => $.ui.open({ id: FILES_PANE, title: 'Session files', closeOnEscape: true })}
+            onPress={() => openFiles($)}
           />
         </Box>
       </Box>
