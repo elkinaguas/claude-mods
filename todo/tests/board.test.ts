@@ -15,11 +15,24 @@ function project(on: On, files: Record<string, string>) {
   const name = (path: string) => path.split('/').pop()!
   const missing = (path: string) => Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' })
   const paths: string[] = []
+  // `meanwhile` runs once right after the next read of TODO.md: another
+  // writer (Claude) changing the file while the plugin edits it.
+  let meanwhile: (() => void) | undefined
+  const writeOutside = (f: string, text: string) => {
+    files[f] = text
+    mtimes[f] = clock++
+  }
   on('fs.read', (_$, e) => {
     paths.push(e.path)
     const f = name(e.path)
     if (!(f in files)) throw missing(f)
-    return { value: files[f]! }
+    const value = files[f]!
+    if (f === 'TODO.md' && meanwhile) {
+      const run = meanwhile
+      meanwhile = undefined
+      run()
+    }
+    return { value }
   })
   on('fs.write', (_$, e) => {
     files[name(e.path)] = e.text
@@ -54,7 +67,16 @@ function project(on: On, files: Record<string, string>) {
   })
   on('ui.panes', () => ({ value: [...panes].map(id => ({ id, isPlaced: true })) as never }))
   on('ui.status', () => ({ value: undefined }))
-  return { files, prompts, panes, paths }
+  return {
+    files,
+    prompts,
+    panes,
+    paths,
+    writeOutside,
+    meanwhile: (fn: () => void) => {
+      meanwhile = fn
+    },
+  }
 }
 
 const BOARD = `# TODO
@@ -327,6 +349,9 @@ test('m marks Todo tasks and g starts them as one batch, worked one at a time in
   expect(await ui.find({ key: 'detail' })).toBeUndefined()
   expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('● T-3 Add retry to upload client')
   expect((await ui.find({ key: 'start-marked' }))?.props.label).toBe('Start 2 marked')
+  // Plain buttons draw their key (`g: Start 2 marked`); boxed ones do not.
+  expect((await ui.find({ key: 'start-marked' }))?.props.plain).toBe(true)
+  expect((await ui.find({ key: 'enrich-all' }))?.props.plain).toBe(true)
   await ui.press({ key: 'start-marked' })
   const text = files['TODO.md']!
   const doing = text.slice(text.indexOf('## Doing'), text.indexOf('## Done'))
@@ -345,7 +370,7 @@ test('m again unmarks; a raw task in a batch is enriched first', async ($, on) =
   await ui.press({ key: 'task:T-3' })
   await ui.press({ key: 'mark' })
   await ui.press({ key: 'task:T-3' })
-  expect((await ui.find({ key: 'mark' }))?.props.label).toBe('Unmark')
+  expect((await ui.find({ key: 'mark' }))?.props.label).toBe('Unmark T-3')
   await ui.press({ key: 'mark' })
   expect(await ui.find({ key: 'start-marked' })).toBeUndefined()
   await ui.press({ key: 'task:T-3' })
@@ -364,6 +389,128 @@ test('a batch of one starts like a single task', async ($, on) => {
   await ui.press({ key: 'mark' })
   await ui.press({ key: 'start-marked' })
   expect(prompts[0]).toContain('Start working on T-3 "Add retry to upload client" (now under Doing in TODO.md)')
+})
+
+test('Tab walks task rows: a one-step move onto an action button carries on to the next row', async ($, on) => {
+  project(on, { 'TODO.md': BOARD })
+  const landed: string[] = []
+  on('ui.focus', (_$, e) => {
+    landed.push(e.element ?? '')
+    return {}
+  })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  // The person's Tab: the engine raises ui.focus onto the next element.
+  const tab = (element: string) => $.ui.focus({ component: 'Pane', requestId: 'todo', element, origin: { kind: 'person' } } as never)
+  await tab('task:T-3')
+  await tab('start')
+  expect(landed.at(-1)).toBe('task:raw:add dark mode to settings')
+  // Shift+Tab from that row lands on T-3's Close button: back to T-3's row.
+  await tab('close')
+  expect(landed.at(-1)).toBe('task:T-3')
+})
+
+test('m marks the row the focus is on, without opening it, then moves to the next Todo row', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': BOARD })
+  const landed: string[] = []
+  on('ui.focus', (_$, e) => {
+    landed.push(e.element ?? '')
+    return {}
+  })
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect(await ui.find({ key: 'mark' })).toBeUndefined()
+  await $.ui.focus({ component: 'Pane', requestId: 'todo', element: 'task:T-3', origin: { kind: 'person' } } as never)
+  expect((await ui.find({ key: 'mark' }))?.props.label).toBe('Mark T-3')
+  await ui.press({ key: 'mark' })
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('● T-3 Add retry to upload client')
+  // Focus on a Doing row: nothing to mark there.
+  await $.ui.focus({ component: 'Pane', requestId: 'todo', element: 'task:T-2', origin: { kind: 'person' } } as never)
+  expect(await ui.find({ key: 'mark' })).toBeUndefined()
+  await ui.press({ key: 'start-marked' })
+  expect(prompts[0]).toContain('Start working on T-3')
+  expect(landed).toContain('task:T-3')
+})
+
+test('a panel edit made while Claude writes TODO.md keeps both changes', async ($, on) => {
+  const board = project(on, { 'TODO.md': BOARD })
+  const claudes = BOARD.replace('  > Decision: how many retries.\n', '  > Decision: how many retries.\n  > Q: Three retries?\n')
+  board.meanwhile(() => board.writeOutside('TODO.md', claudes))
+  await run('write the release notes')($)
+  expect(board.files['TODO.md']).toContain('  > Q: Three retries?\n')
+  expect(board.files['TODO.md']).toContain('- write the release notes\n')
+})
+
+test('archive retries on a concurrent write and archives each task once', async ($, on) => {
+  const board = project(on, { 'TODO.md': BOARD })
+  board.meanwhile(() => board.writeOutside('TODO.md', BOARD.replace('## Todo\n', '## Todo\n\n- from Claude')))
+  await run('archive')($)
+  expect(board.files['TODO.md']).toContain('- from Claude')
+  expect(board.files['TODO.md']).not.toContain('T-1')
+  expect(board.files['TODO-archive.md']!.split('T-1 Cache git status').length).toBe(2)
+})
+
+const withDone = (n: number) =>
+  BOARD.replace('- T-1 Cache git status (2026-10-08)\n  > Log: cached for 5s.\n', Array.from({ length: n }, (_, i) => `- T-${100 + n - i} Old task ${n - i} (2026-10-01)\n  > Log ${n - i}.\n`).join(''))
+
+test('starting a task archives Done down to the newest 10 once it holds more than 20', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': withDone(21) })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'start' })
+  const done = files['TODO.md']!.slice(files['TODO.md']!.indexOf('## Done'))
+  expect(done.match(/^- T-/gm)).toHaveLength(10)
+  expect(done).toContain('- T-121 Old task 21')
+  expect(done).not.toContain('- T-111 Old task 11')
+  expect(files['TODO-archive.md']!.match(/^- T-/gm)).toHaveLength(11)
+  expect(files['TODO.md']).toContain('## Doing\n\n- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n- T-3 Add retry')
+})
+
+test('at 20 done tasks nothing is archived', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': withDone(20) })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'start' })
+  expect(files['TODO-archive.md']).toBeUndefined()
+})
+
+test('autoArchive 0 turns it off', { options: { autoArchive: 0 } }, async ($, on) => {
+  const { files } = project(on, { 'TODO.md': withDone(25) })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'start' })
+  expect(files['TODO-archive.md']).toBeUndefined()
+})
+
+test('q moves a task to the top of Done with the date, its notes kept, without asking Claude', async ($, on) => {
+  const { files, prompts } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'quick-done' })
+  const d = new Date()
+  const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  expect(files['TODO.md']).toContain(
+    `## Done\n\n- T-2 Fix flaky auth test (${date})\n  > Q: Mock the clock or raise the timeout?\n  > Done from the panel, no log.\n- T-1 Cache git status (2026-10-08)`,
+  )
+  expect(files['TODO.md']).toContain('## Doing\n\n## Done')
+  expect(prompts).toEqual([])
+})
+
+test('q works on a Todo task too, and done tasks have no quick done', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:raw:add dark mode to settings' })
+  await ui.press({ key: 'quick-done' })
+  expect(files['TODO.md']).toMatch(/## Done\n\n- add dark mode to settings \(\d{4}-\d{2}-\d{2}\)\n  > Done from the panel, no log\.\n- T-1/)
+  await ui.press({ key: 'task:T-1' })
+  expect(await ui.find({ key: 'quick-done' })).toBeUndefined()
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {

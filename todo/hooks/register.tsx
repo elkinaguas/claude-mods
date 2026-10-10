@@ -29,6 +29,7 @@ const rulesAtom = atom({ plugin: 'todo', key: 'hasRules' } as const, false)
 const expandedAtom = atom({ plugin: 'todo', key: 'expanded' } as const, null)
 const renamingAtom = atom({ plugin: 'todo', key: 'renaming' } as const, null)
 const markedAtom = atom({ plugin: 'todo', key: 'marked' } as const, [] as string[])
+const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as string | null)
 
 const TEMPLATE = `# TODO
 
@@ -153,11 +154,17 @@ function removeBlock(lines: string[], t: Task): string[] {
   return block
 }
 
-function moveTask(text: string, key: string, to: Section, atTop = false): string | null {
+function moveTask(
+  text: string,
+  key: string,
+  to: Section,
+  atTop = false,
+  reshape: (block: string[]) => string[] = block => block,
+): string | null {
   const task = parse(text).find(t => keyOf(t) === key)
   if (!task || task.section === to) return null
   const lines = text.split('\n')
-  const block = removeBlock(lines, task)
+  const block = reshape(removeBlock(lines, task))
   const first = atTop ? parse(lines.join('\n')).find(t => t.section === to) : undefined
   if (first) {
     lines.splice(first.start, 0, ...block)
@@ -205,6 +212,12 @@ const inRoot = async ($: EngineInterface, file: string) => `${await $.session.ro
 
 const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`
 
+// The panel's focusable keys as last drawn, the ones Tab stops on, and where
+// the person's focus last landed: Tab walks task rows, not every button.
+let focusOrder: string[] = []
+let focusStops = new Set<string>()
+let lastFocus: string | undefined
+
 // The mtime last read, so a poll redraws only on a change.
 let seen = -1
 
@@ -223,10 +236,32 @@ async function load($: EngineInterface) {
   )
 }
 
-async function save($: EngineInterface, text: string) {
-  await $.fs.write(await inRoot($, FILE), text)
-  seen = -1
-  await load($)
+// Every panel edit to TODO.md: read it, apply `edit`, write it back, unless
+// the file changed while the edit was made (Claude writing it too); then the
+// edit runs again on the fresh text, so neither change is lost. `beforeWrite`
+// runs once the write is sure to happen. Resolves to the text written, or
+// null when the edit changed nothing or the file kept moving.
+async function editBoard(
+  $: EngineInterface,
+  edit: (text: string) => string | null,
+  beforeWrite?: () => Promise<void>,
+): Promise<string | null> {
+  const path = await inRoot($, FILE)
+  const mtimeOf = async () => (await $.fs.stat(path).catch(() => null))?.mtimeMs ?? null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = await mtimeOf()
+    const text = before === null ? TEMPLATE : ((await $.fs.read(path)) as string)
+    const next = edit(text)
+    if (next === null || next === text) return null
+    if ((await mtimeOf()) !== before) continue
+    await beforeWrite?.()
+    await $.fs.write(path, next)
+    seen = -1
+    await load($)
+    return next
+  }
+  $.ui.toast(`todo: ${FILE} kept changing, the edit was not saved; try again`)
+  return null
 }
 
 async function current($: EngineInterface) {
@@ -245,7 +280,7 @@ async function checkRules($: EngineInterface) {
 }
 
 async function capture($: EngineInterface, title: string) {
-  await save($, addTask(await current($), title.trim()))
+  await editBoard($, text => addTask(text, title.trim()))
 }
 
 // Writes the rules block into CLAUDE.md and AGENTS.md where they exist
@@ -287,18 +322,43 @@ async function init($: EngineInterface) {
   return done
 }
 
-async function archive($: EngineInterface) {
-  const text = await current($)
-  const done = parse(text).filter(t => t.section === 'done')
-  if (done.length === 0) return 0
-  const lines = text.split('\n')
-  const moved = done.flatMap(t => lines.slice(t.start, t.end))
-  for (const t of [...done].reverse()) removeBlock(lines, t)
-  const old = await $.fs.read(await inRoot($, ARCHIVE)).catch(() => '# TODO archive\n')
-  const head = typeof old === 'string' ? old.trimEnd() : '# TODO archive'
-  await $.fs.write(await inRoot($, ARCHIVE), `${head}\n\n${moved.join('\n')}\n`)
-  await save($, lines.join('\n'))
-  return done.length
+// Moves the Done tasks to the archive, all of them or all but the newest
+// `keep` (Done runs newest first).
+async function archive($: EngineInterface, keep = 0) {
+  let moved: string[] = []
+  let n = 0
+  const written = await editBoard(
+    $,
+    text => {
+      const done = parse(text).filter(t => t.section === 'done').slice(keep)
+      if (done.length === 0) return null
+      const lines = text.split('\n')
+      moved = done.flatMap(t => lines.slice(t.start, t.end))
+      n = done.length
+      for (const t of [...done].reverse()) removeBlock(lines, t)
+      return lines.join('\n')
+    },
+    // The archive is written first, so a failed write loses no task.
+    async () => {
+      const old = await $.fs.read(await inRoot($, ARCHIVE)).catch(() => '# TODO archive\n')
+      const head = typeof old === 'string' ? old.trimEnd() : '# TODO archive'
+      await $.fs.write(await inRoot($, ARCHIVE), `${head}\n\n${moved.join('\n')}\n`)
+    },
+  )
+  return written === null ? 0 : n
+}
+
+// Set from the `autoArchive` option: archive when Done holds more than this
+// many tasks (0: never), keeping the newest AUTO_ARCHIVE_KEEP.
+let autoArchiveOver = 20
+const AUTO_ARCHIVE_KEEP = 10
+
+async function autoArchive($: EngineInterface) {
+  if (autoArchiveOver <= 0) return
+  const done = parse(await current($)).filter(t => t.section === 'done').length
+  if (done <= autoArchiveOver) return
+  const n = await archive($, Math.min(AUTO_ARCHIVE_KEEP, autoArchiveOver))
+  if (n) $.ui.toast(`todo: moved ${plural(n, 'old done task')} to ${ARCHIVE}`)
 }
 
 async function ask($: EngineInterface, text: string) {
@@ -314,8 +374,8 @@ function enrichAll($: EngineInterface, n: number) {
 }
 
 async function start($: EngineInterface, t: Task) {
-  const moved = moveTask(await current($), keyOf(t), 'doing')
-  if (moved !== null) await save($, moved)
+  await autoArchive($)
+  await editBoard($, text => moveTask(text, keyOf(t), 'doing'))
   await ask(
     $,
     t.id
@@ -329,9 +389,8 @@ async function start($: EngineInterface, t: Task) {
 async function startBatch($: EngineInterface, ts: Task[]) {
   await update($, markedAtom, () => [])
   if (ts.length === 1) return start($, ts[0]!)
-  let text = await current($)
-  for (const t of ts) text = moveTask(text, keyOf(t), 'doing') ?? text
-  await save($, text)
+  await autoArchive($)
+  await editBoard($, text => ts.reduce((acc, t) => moveTask(acc, keyOf(t), 'doing') ?? acc, text))
   const list = ts.map((t, i) => `${i + 1}. ${t.id ? `${t.id} "${t.title}"` : `"${t.title}" (not enriched yet: give it the next free ID and its context lines first)`}`)
   await ask(
     $,
@@ -340,26 +399,45 @@ async function startBatch($: EngineInterface, ts: Task[]) {
   )
 }
 
+const QUICK_DONE_NOTE = '  > Done from the panel, no log.'
+// The local date (toISOString would give UTC's, a day off late in the evening).
+const today = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// Moves a task to the top of Done with today's date, its notes kept and a
+// line saying no log was written: for tasks too small to ask Claude about.
+function quickDoneTask(text: string, key: string, date: string): string | null {
+  return moveTask(text, key, 'done', true, ([line, ...notes]) => [`${line!.trimEnd()} (${date})`, ...notes, QUICK_DONE_NOTE])
+}
+
+async function quickDone($: EngineInterface, t: Task) {
+  await editBoard($, text => quickDoneTask(text, keyOf(t), today()))
+}
+
 async function sendBack($: EngineInterface, t: Task) {
-  const moved = moveTask(await current($), keyOf(t), 'todo', true)
+  const moved = await editBoard($, text => moveTask(text, keyOf(t), 'todo', true))
   if (moved === null) return
-  await save($, moved)
   await ask($, `${ref(t)} is back in Todo in ${FILE}. Stop working on it and leave its notes as they are.`)
 }
 
 async function reorder($: EngineInterface, t: Task, dir: -1 | 1) {
-  const out = reorderTask(await current($), keyOf(t), dir)
-  if (out !== null) await save($, out)
+  await editBoard($, text => reorderTask(text, keyOf(t), dir))
 }
 
 async function rename($: EngineInterface, t: Task, value: string) {
   await update($, renamingAtom, () => null)
   const title = value.trim()
   if (!title || title === t.title) return
-  const out = renameTask(await current($), keyOf(t), title)
-  if (!out) return
-  await save($, out.text)
-  await update($, selectedAtom, () => out.key)
+  let key = keyOf(t)
+  const written = await editBoard($, text => {
+    const out = renameTask(text, keyOf(t), title)
+    if (out) key = out.key
+    return out?.text ?? null
+  })
+  if (written === null) return
+  await update($, selectedAtom, () => key)
   // Notes written for the old title may no longer fit: Claude reviews them.
   if (t.notes.length > 0) {
     await ask(
@@ -386,6 +464,7 @@ async function submitDraft($: EngineInterface, value: string) {
 }
 
 export const register: Register = (on, options) => {
+  if (typeof options.autoArchive === 'number') autoArchiveOver = options.autoArchive
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
@@ -431,6 +510,31 @@ export const register: Register = (on, options) => {
     return { text: opened.isPlaced ? 'Task panel opened.' : `Task panel waiting: ${opened.reason ?? 'no room'}.` }
   })
 
+  // A Tab (or arrow) step onto an action button carries on, the same way, to
+  // the next row; buttons are pressed by their letters. Only one-step moves
+  // are redirected, so a click on a button far from the focus is left alone.
+  on('ui.focus', async ($, e, next) => {
+    if (e.component !== 'Pane' || e.requestId !== PANE || !e.element) return next(e)
+    if (e.origin.kind !== 'person') {
+      lastFocus = e.element
+      await update($, focusedAtom, () => e.element ?? null)
+      return next(e)
+    }
+    const from = lastFocus === undefined ? -1 : focusOrder.indexOf(lastFocus)
+    const to = focusOrder.indexOf(e.element)
+    let element = e.element
+    if (from !== -1 && to !== -1 && Math.abs(to - from) === 1 && !focusStops.has(element)) {
+      const dir = to - from
+      let i = to
+      while (i >= 0 && i < focusOrder.length && !focusStops.has(focusOrder[i]!)) i += dir
+      if (i >= 0 && i < focusOrder.length) element = focusOrder[i]!
+    }
+    lastFocus = element
+    // The top bar's Mark follows the focused row.
+    await update($, focusedAtom, () => element)
+    return element === e.element ? next(e) : next({ ...e, element })
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
@@ -450,6 +554,16 @@ export const register: Register = (on, options) => {
       )
     }
 
+    // Every focusable key in drawing order (keys are evaluated top-down), and
+    // which of them Tab stops on: the add field, task rows, the rename field.
+    const order: string[] = []
+    const stops = new Set<string>()
+    const k = (key: string, stop = false) => {
+      order.push(key)
+      if (stop) stops.add(key)
+      return key
+    }
+
     const tasks = parse(file.text)
     const by = (s: Section) => tasks.filter(t => t.section === s)
     const [todo, doing, done] = [by('todo'), by('doing'), by('done')]
@@ -467,20 +581,25 @@ export const register: Register = (on, options) => {
     const markedKeys = await read($, markedAtom)
     const marked = todo.filter(t => markedKeys.includes(keyOf(t)))
     const isMarked = (t: Task) => marked.includes(t)
-    // Marking folds the task and puts the keyboard on the next Todo row, ready
-    // for Enter then m again.
+    // `m` marks the Todo task the focus is on, else the open one; the focus
+    // then moves to the next Todo row, so m, m, m marks a run of tasks.
+    const focusedKey = await read($, focusedAtom)
+    const focusedTask = tasks.find(t => `task:${keyOf(t)}` === focusedKey)
+    const markTarget = focusedTask?.section === 'todo' ? focusedTask : chosen?.section === 'todo' ? chosen : undefined
     const toggleMark = async (t: Task) => {
       const key = keyOf(t)
       await update($, markedAtom, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key]))
-      await close(todo[todo.indexOf(t) + 1] ?? t)
+      const nextRow = todo[todo.indexOf(t) + 1] ?? t
+      if (chosen === t) return close(nextRow)
+      await $.ui.focus({ requestId: PANE, key: `task:${keyOf(nextRow)}` }).catch(() => {})
     }
 
     const detail = (t: Task) => (
       <Box flexDirection="column" paddingLeft={4} key="detail">
         {renaming === keyOf(t) && Input && (
           <Box flexDirection="row" columnGap={2} key="rename-row">
-            <Input key="rename" value={t.title} submitLabel="save" onSubmit={value => void rename($, t, value)} />
-            <Button key="rename-cancel" plain label="Cancel" onPress={() => void update($, renamingAtom, () => null)} />
+            <Input key={k('rename', true)} value={t.title} submitLabel="save" onSubmit={value => void rename($, t, value)} />
+            <Button key={k('rename-cancel')} plain label="Cancel" onPress={() => void update($, renamingAtom, () => null)} />
           </Box>
         )}
         {t.notes.length === 0 && <Text dimColor>{t.id ? 'No notes.' : 'Not enriched yet.'}</Text>}
@@ -491,21 +610,21 @@ export const register: Register = (on, options) => {
         ))}
         {folded && <Text dimColor>+{t.notes.length - 1} more</Text>}
         <Box flexDirection="row" columnGap={2} key="actions">
-          {t.section === 'todo' && <Button key="start" plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
-          {t.section === 'doing' && <Button key="done" plain hotkey="d" label="Done" onPress={() => void finish($, t)} />}
-          {t.section === 'todo' && (
-            <Button key="mark" plain hotkey="m" label={isMarked(t) ? 'Unmark' : 'Mark'} onPress={() => void toggleMark(t)} />
+          {t.section === 'todo' && <Button key={k('start')} plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
+          {t.section === 'doing' && <Button key={k('done')} plain hotkey="d" label="Done" onPress={() => void finish($, t)} />}
+          {t.section !== 'done' && (
+            <Button key={k('quick-done')} plain hotkey="q" label="Quick done" onPress={() => void quickDone($, t)} />
           )}
-          {t.section === 'doing' && <Button key="back" plain hotkey="b" label="Back to Todo" onPress={() => void sendBack($, t)} />}
+          {t.section === 'doing' && <Button key={k('back')} plain hotkey="b" label="Back to Todo" onPress={() => void sendBack($, t)} />}
           {t.section !== 'done' && peers(t).indexOf(t) > 0 && (
-            <Button key="up" plain hotkey="k" label="Up" onPress={() => void reorder($, t, -1)} />
+            <Button key={k('up')} plain hotkey="k" label="Up" onPress={() => void reorder($, t, -1)} />
           )}
           {t.section !== 'done' && peers(t).indexOf(t) < peers(t).length - 1 && (
-            <Button key="down" plain hotkey="j" label="Down" onPress={() => void reorder($, t, 1)} />
+            <Button key={k('down')} plain hotkey="j" label="Down" onPress={() => void reorder($, t, 1)} />
           )}
           {t.section !== 'done' && Input && renaming !== keyOf(t) && (
             <Button
-              key="rename-open"
+              key={k('rename-open')}
               plain
               hotkey="r"
               label="Rename"
@@ -517,7 +636,7 @@ export const register: Register = (on, options) => {
           )}
           {foldable && (
             <Button
-              key="log"
+              key={k('log')}
               plain
               hotkey="o"
               label={folded ? 'Open log' : 'Fold log'}
@@ -526,14 +645,14 @@ export const register: Register = (on, options) => {
           )}
           {!t.id && t.section !== 'done' && (
             <Button
-              key="enrich"
+              key={k('enrich')}
               plain
               hotkey="e"
               label="Enrich"
               onPress={() => void ask($, `Enrich ${ref(t)} in ${FILE}, following the task board rules.`)}
             />
           )}
-          <Button key="close" plain hotkey="c" label="Close" onPress={() => void close()} />
+          <Button key={k('close')} plain hotkey="c" label="Close" onPress={() => void close()} />
         </Box>
       </Box>
     )
@@ -560,7 +679,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column" key={`row:${keyOf(t)}`}>
           <Box flexDirection="row">
             <Button
-              key={`task:${keyOf(t)}`}
+              key={k(`task:${keyOf(t)}`, true)}
               plain
               dimColor={isDone}
               label={`${marker} ${t.id ?? '·'} ${t.title}`}
@@ -582,24 +701,33 @@ export const register: Register = (on, options) => {
       </Text>
     )
 
-    return (
+    const tree = (
       <Box flexDirection="column">
         {!hasRules && <Text color="yellow">Rules not in CLAUDE.md yet: run /todo init.</Text>}
         {Input && (<Input
-          key="add"
+          key={k('add', true)}
           placeholder="Add a task…"
           submitLabel="add"
           value={draft}
           onInput={value => void update($, draftAtom, () => value)}
           onSubmit={value => void submitDraft($, value)}
         />)}
-        {(raw.length > 0 || marked.length > 0) && (
+        {(raw.length > 0 || marked.length > 0 || markTarget) && (
           <Box flexDirection="row" columnGap={2} key="top-actions">
             {raw.length > 0 && (
-              <Button key="enrich-all" hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
+              <Button key={k('enrich-all')} plain hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
+            )}
+            {markTarget && (
+              <Button
+                key={k('mark')}
+                plain
+                hotkey="m"
+                label={`${isMarked(markTarget) ? 'Unmark' : 'Mark'} ${markTarget.id ?? markTarget.title}`}
+                onPress={() => void toggleMark(markTarget)}
+              />
             )}
             {marked.length > 0 && (
-              <Button key="start-marked" hotkey="g" label={`Start ${marked.length} marked`} onPress={() => void startBatch($, marked)} />
+              <Button key={k('start-marked')} plain hotkey="g" label={`Start ${marked.length} marked`} onPress={() => void startBatch($, marked)} />
             )}
           </Box>
         )}
@@ -614,5 +742,8 @@ export const register: Register = (on, options) => {
         {!chosen && tasks.length > 0 && <Text dimColor>Enter on a task shows its notes and actions.</Text>}
       </Box>
     )
+    focusOrder = order
+    focusStops = stops
+    return tree
   })
 }

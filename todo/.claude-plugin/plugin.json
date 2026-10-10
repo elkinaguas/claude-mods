@@ -1,8 +1,10 @@
 {
   "name": "todo",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A TODO.md task board (Todo / Doing / Done) with a side panel: quick capture, Claude enrichment with IDs, and done logs",
-  "author": { "name": "Elkin Aguas" },
+  "author": {
+    "name": "Elkin Aguas"
+  },
   "types": "./types/index.d.ts",
   "userConfig": {
     "autoOpen": {
@@ -10,6 +12,12 @@
       "title": "Open the panel on start",
       "description": "Open the task panel when a session starts in a project that has a TODO.md (it docks beside the transcript on wide terminals).",
       "default": true
+    },
+    "autoArchive": {
+      "type": "number",
+      "title": "Auto-archive Done after",
+      "description": "When a task starts and Done holds more than this many tasks, the oldest move to TODO-archive.md and the newest 10 stay. 0 turns it off.",
+      "default": 20
     }
   }
 }

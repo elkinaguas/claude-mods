@@ -17,6 +17,8 @@ declare module 'claude-code' {
       renaming: string | null
       /** The Todo tasks marked to start together (their keys), in no order. */
       marked: string[]
+      /** The panel element the person's focus is on (`task:<key>` for a row), if known. */
+      focused: string | null
     }
   }
 }
