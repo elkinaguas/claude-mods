@@ -277,7 +277,8 @@ async function load($: EngineInterface) {
       return null
     })
   const mtime = stat?.mtimeMs ?? (refused ? -2 : 0)
-  if (mtime === seen) return
+  // Unchanged file, unless the session's state lost it (another session's).
+  if (mtime === seen && (await read($, fileAtom)).exists === (stat !== null)) return
   seen = mtime
   const text = stat ? await readBoard($, FILE, '').catch(() => '') : ''
   await update($, fileAtom, () => ({ exists: stat !== null, text, refused }))
@@ -884,6 +885,15 @@ const unmetDeps = (t: Task, tasks: Task[]) => t.deps.filter(d => tasks.some(o =>
 
 export const register: Register = (on, options) => {
   if (typeof options.autoArchive === 'number') autoArchiveOver = options.autoArchive
+  // /resume (and /clear) swaps the session's state, empty or an old snapshot,
+  // without loading the mod again: forget what the module saw, so the next
+  // poll reads the board into the new session.
+  on('session.end', ($, e, next) => {
+    seen = -1
+    lastFocus = undefined
+    return next(e)
+  })
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,

@@ -1,12 +1,13 @@
 import type { On } from 'claude-code'
-import { expect, test, type Engine } from 'claude-code/testing'
+import { expect, mock, test, type Engine } from 'claude-code/testing'
 
 // The test runner has timers; the hooks module's own environment does not.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
 
 // An in-memory project folder beneath the plugin's $.fs calls, and a record
 // of the prompts it hands Claude.
-function project(on: On, files: Record<string, string>) {
+// `realClock`: the test brings mock.clock, so waits are not answered here.
+function project(on: On, files: Record<string, string>, { realClock = false } = {}) {
   const prompts: string[] = []
   let clock = 1
   const mtimes: Record<string, number> = {}
@@ -60,8 +61,10 @@ function project(on: On, files: Record<string, string>) {
     toasts.push(e.text)
     return { value: undefined }
   })
-  on('clock.every', () => ({ value: undefined }))
-  on('clock.after', () => ({ value: undefined }))
+  if (!realClock) {
+    on('clock.every', () => ({ value: undefined }))
+    on('clock.after', () => ({ value: undefined }))
+  }
   on('ui.log', () => ({ value: undefined }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.root', () => ({ value: '/project' }))
@@ -752,6 +755,23 @@ test('an ID longer than 6 digits is no ID', async ($, on) => {
   const { ui, files } = await panel($, on, { 'TODO.md': BOARD.replace('- add dark mode to settings', `- T-${'9'.repeat(7)} Wide`) })
   expect(await ui.find({ key: `task:raw:T-${'9'.repeat(7)} Wide` })).toBeDefined()
   expect(files['TODO.md']).toContain('T-9999999 Wide')
+})
+
+test('after /resume (the session ends, the mod stays loaded) the next poll reads the board again', async ($, on) => {
+  // The resumed session's state is its own (empty, or an old snapshot): the
+  // board must be read into it, not skipped as already seen.
+  on('session.end', () => ({ sessionId: 's1' }) as never)
+  const clock = mock.clock(on)
+  const { paths } = project(on, { 'TODO.md': BOARD }, { realClock: true })
+  await start($)
+  const reads = () => paths.filter(p => p.endsWith('/TODO.md')).length
+  await clock.advance(1600)
+  const unchanged = reads()
+  await clock.advance(1600)
+  expect(reads()).toBe(unchanged)
+  await $.session.end({ reason: 'resume' } as never)
+  await clock.advance(1600)
+  expect(reads()).toBeGreaterThan(unchanged)
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {
