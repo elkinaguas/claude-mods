@@ -282,6 +282,8 @@ async function load($: EngineInterface) {
   seen = mtime
   const text = stat ? await readBoard($, FILE, '').catch(() => '') : ''
   await update($, fileAtom, () => ({ exists: stat !== null, text, refused }))
+  // The rules flag lives in the session's state too: refresh it with the board.
+  await checkRules($).catch(() => {})
   const doing = parse(text).filter(t => t.section === 'doing')
   const first = doing[0]
   $.ui.status(
@@ -387,7 +389,6 @@ async function init($: EngineInterface) {
   }
   seen = -1
   await load($)
-  await checkRules($)
   return done
 }
 
@@ -900,7 +901,6 @@ export const register: Register = (on, options) => {
       description: 'Task board: /todo opens the panel, /todo <task> adds one, /todo init | enrich | archive | close',
     }).catch((err: unknown) => $.ui.log(`todo: /${COMMAND} not registered: ${String(err)}`))
     await load($).catch(() => {})
-    await checkRules($).catch(() => {})
     $.clock.every(POLL_MS, () => void load($).catch(() => {}))
     if (options.autoOpen !== false && (await read($, fileAtom)).exists) void open($).catch(() => {})
     return next(e)

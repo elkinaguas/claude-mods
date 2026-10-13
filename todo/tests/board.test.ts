@@ -186,8 +186,9 @@ test('/todo archive moves Done tasks to TODO-archive.md', async ($, on) => {
 test('reads the board at the project root after a shell cd', async ($, on) => {
   const { paths } = project(on, { 'TODO.md': BOARD })
   await run('add a task')($)
-  expect(paths.length).toBeGreaterThan(0)
-  for (const p of paths) expect(p).toBe('/project/TODO.md')
+  expect(paths).toContain('/project/TODO.md')
+  // Every board file is read at the root, none in the shell's folder.
+  for (const p of paths) expect(p).toMatch(/^\/project\/(TODO|CLAUDE|AGENTS)\.md$/)
 })
 
 test('/todo close closes the panel, and says so when it is not open', async ($, on) => {
@@ -770,8 +771,12 @@ test('after /resume (the session ends, the mod stays loaded) the next poll reads
   await clock.advance(1600)
   expect(reads()).toBe(unchanged)
   await $.session.end({ reason: 'resume' } as never)
+  const rulesReads = paths.filter(p => p.endsWith('/CLAUDE.md')).length
   await clock.advance(1600)
   expect(reads()).toBeGreaterThan(unchanged)
+  // The rules flag is the session's too: checked again, or the panel says
+  // "Rules not in CLAUDE.md yet" after /resume.
+  expect(paths.filter(p => p.endsWith('/CLAUDE.md')).length).toBeGreaterThan(rulesReads)
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {
