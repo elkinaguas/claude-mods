@@ -350,6 +350,8 @@ test('sections and IDs are coloured: Doing yellow, Todo cyan, Done green', async
   expect((await ui.find({ type: 'Text', text: /^Doing/ }))?.props.color).toBe('yellow')
   expect((await ui.find({ type: 'Text', text: /^Todo/ }))?.props.color).toBe('cyan')
   expect((await ui.find({ type: 'Text', text: /^Done/ }))?.props.color).toBe('green')
+  // Review shows only when it holds a task.
+  expect(await ui.find({ type: 'Text', text: /^Review/ })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: 'T-3' }))?.props.color).toBe('cyan')
   expect((await ui.find({ key: 'task:T-1' }))?.props.dimColor).toBe(true)
 })
@@ -398,7 +400,7 @@ test('m marks Todo tasks and g starts them as one batch, worked one at a time in
   expect(text.slice(0, text.indexOf('## Doing'))).toContain('## Todo\n\n- add dark mode to settings\n\n')
   expect(prompts).toHaveLength(1)
   expect(prompts[0]).toContain('Start working on these 2 tasks, now under Doing in TODO.md, one at a time in this order:\n1. T-3\n2. T-4\n')
-  expect(prompts[0]).toContain('move it to Done with its own log before starting the next')
+  expect(prompts[0]).toContain('move it to Review with its own log before starting the next')
   expect(await ui.find({ key: 'start-marked' })).toBeUndefined()
 })
 
@@ -570,9 +572,49 @@ test('Done asks Claude to name the commit, or offer one for uncommitted work, be
   const { ui, prompts } = await panel($, on, { 'TODO.md': BOARD })
   await ui.press({ key: 'task:T-2' })
   await ui.press({ key: 'done' })
-  expect(prompts[0]).toContain('T-2 is done.')
+  expect(prompts[0]).toContain('T-2 is done. Following the task board rules, move it to Review in TODO.md')
   expect(prompts[0]).toContain('ask me whether to commit them now (staging only that task\'s files) before writing the log')
   expect(prompts[0]).toContain('The log names the commit(s) holding the work, or says "Uncommitted".')
+})
+
+const REVIEWED = BOARD.replace('## Done', `## Review
+
+- T-4 Add a cache
+  > Log: added it.
+
+## Done`)
+
+test('Review shows in magenta between Doing and Todo, only when it holds a task', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': REVIEWED })
+  expect((await ui.find({ type: 'Text', text: /^Review/ }))?.props.color).toBe('magenta')
+  expect((await ui.find({ type: 'Text', text: 'T-4' }))?.props.color).toBe('magenta')
+})
+
+test('d on a Review task moves it to the top of Done with the date, log kept, without asking Claude', async ($, on) => {
+  const { ui, files, prompts } = await panel($, on, { 'TODO.md': REVIEWED })
+  await ui.press({ key: 'task:T-4' })
+  expect(await ui.find({ key: 'quick-done' })).toBeUndefined()
+  await ui.press({ key: 'approve' })
+  expect(files['TODO.md']).toMatch(/## Review\n\n## Done\n\n- T-4 Add a cache \(\d{4}-\d{2}-\d{2}\)\n  > Log: added it\.\n- T-1/)
+  expect(prompts).toEqual([])
+})
+
+test('f rejects a Review task: back to Doing with the reason as a note, and Claude is told to fix it', async ($, on) => {
+  const { ui, files, prompts } = await panel($, on, { 'TODO.md': REVIEWED })
+  await ui.press({ key: 'task:T-4' })
+  await ui.press({ key: 'reject-open' })
+  await ui.input({ key: 'reject', text: 'the cache never expires' })
+  expect(files['TODO.md']).toContain('- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n- T-4 Add a cache\n  > Log: added it.\n  > Review: the cache never expires\n\n## Review\n\n## Done')
+  expect(prompts[0]).toBe(
+    'T-4 failed my review and is back under Doing in TODO.md, with my reason in its Review: note: "the cache never expires". Fix it following the task board rules, then move it to Review again with its log updated.',
+  )
+})
+
+test('a missing section heading is added above the next section, not at the end', async ($, on) => {
+  const { ui, files } = await panel($, on, { 'TODO.md': BOARD.replace('## Doing\n\n- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n\n', '') })
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'start' })
+  expect(files['TODO.md']).toContain('- add dark mode to settings\n\n## Doing\n\n- T-3 Add retry to upload client\n  > Uploads fail silently on 5xx: src/upload/client.ts:88.\n  > Decision: how many retries.\n\n## Done')
 })
 
 test('an open question is answered from the panel: > A: under it, and Claude carries on', async ($, on) => {

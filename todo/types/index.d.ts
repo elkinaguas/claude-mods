@@ -15,6 +15,8 @@ declare module 'claude-code' {
       expanded: string | null
       /** The task being renamed in the panel (its key), if any. */
       renaming: string | null
+      /** The Review task whose Reject field is open, asking what to fix (its key), if any. */
+      rejecting: string | null
       /** The Todo tasks marked to start together (their keys), in no order. */
       marked: string[]
       /** The panel element the person's focus is on (`task:<key>` for a row), if known. */

@@ -3,7 +3,7 @@ import type { Register, EngineInterface } from 'claude-code'
 
 import type { TodoFile } from '../types'
 
-// A task board kept in TODO.md (## Todo / ## Doing / ## Done), drawn in a
+// A task board kept in TODO.md (## Todo / ## Doing / ## Review / ## Done), drawn in a
 // pane. The mod does the mechanical edits (capture, moving to Doing,
 // archiving); anything that needs the code's context (enrichment, done logs)
 // it hands to Claude as a prompt, following the rules /todo init writes.
@@ -17,7 +17,9 @@ const COMMAND = 'todo'
 const POLL_MS = 1500
 const DONE_SHOWN = 5
 // Named colours only, so light and dark terminal themes both read.
-const SECTION_COLOR = { doing: 'yellow', todo: 'cyan', done: 'green' } as const
+const SECTION_COLOR = { doing: 'yellow', review: 'magenta', todo: 'cyan', done: 'green' } as const
+// The sections in file order: a missing heading is added before the next one.
+const SECTIONS = ['todo', 'doing', 'review', 'done'] as const
 const MARK_START = '<!-- todo:start -->'
 const MARK_END = '<!-- todo:end -->'
 const RULES_HEADING = '## Task board (TODO.md)'
@@ -28,6 +30,7 @@ const draftAtom = atom({ plugin: 'todo', key: 'draft' } as const, '')
 const rulesAtom = atom({ plugin: 'todo', key: 'hasRules' } as const, false)
 const expandedAtom = atom({ plugin: 'todo', key: 'expanded' } as const, null)
 const renamingAtom = atom({ plugin: 'todo', key: 'renaming' } as const, null)
+const rejectingAtom = atom({ plugin: 'todo', key: 'rejecting' } as const, null as string | null)
 const markedAtom = atom({ plugin: 'todo', key: 'marked' } as const, [] as string[])
 const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as string | null)
 const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as string | null)
@@ -40,22 +43,25 @@ const TEMPLATE = `# TODO
 
 ## Doing
 
+## Review
+
 ## Done
 `
 
 const RULES = `${MARK_START}
 ${RULES_HEADING}
 
-\`TODO.md\` at the project root is the task board, in three sections: \`## Todo\`, \`## Doing\`, \`## Done\`. Older done tasks move to \`TODO-archive.md\`.
+\`TODO.md\` at the project root is the task board, in four sections: \`## Todo\`, \`## Doing\`, \`## Review\`, \`## Done\`. Older done tasks move to \`TODO-archive.md\`.
 
 - **Capture.** The engineer adds tasks as one short line under \`## Todo\` (\`- fix flaky auth test\`), with no ID. Keep their wording.
 - **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID, \`T-<n>\`: one more than the highest ID in TODO.md and TODO-archive.md. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines. When the task can only be done after other open tasks, one of those lines is \`> Depends: T-<n>, T-<m>\`.
 - **Doing.** A task being worked on sits under \`## Doing\`. When a decision is the engineer's, ask them; record each question under the task as \`> Q: ...\` and their answer as \`> A: ...\`. On starting a task, first check its \`file:line\` references against the code and fix any that drifted.
-- **Done.** When a task is finished, move it to the top of \`## Done\`, append the date to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets.
+- **Review.** When a task is finished, move it to the end of \`## Review\` (adding that heading before \`## Done\` if missing) and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets. The engineer reviews it: they move it to Done, or back to Doing with a \`> Review: ...\` note saying what to fix; fix that, then move it to Review again with the log updated.
+- **Done.** A reviewed task sits at the top of \`## Done\` with the date appended to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), its log kept. Move a task to Done yourself only when the engineer asks.
 - **Format.** A task is a line \`- T-<n> <title>\` (or \`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
 ${MARK_END}`
 
-type Section = 'todo' | 'doing' | 'done'
+type Section = (typeof SECTIONS)[number]
 
 type Task = {
   section: Section
@@ -74,7 +80,7 @@ type Task = {
 }
 
 
-const SECTION_RE = /^##\s+(todo|doing|done)\s*$/i
+const SECTION_RE = /^##\s+(todo|doing|review|done)\s*$/i
 const TASK_RE = /^[-*]\s+(?:\[[ xX]\]\s+)?(.+)$/
 // IDs up to 6 digits: a longer run is no ID, so a hostile file can't make
 // one node absurdly wide.
@@ -133,9 +139,16 @@ function parse(text: string): Task[] {
 }
 
 // Where a section's last task ends (blank lines before the next heading left
-// alone), adding the heading at the end of the file when it is missing.
+// alone), adding the heading when it is missing: before the next section's
+// heading (an older board's Review goes above Done), else at the end.
 function sectionEnd(lines: string[], section: Section): number {
-  let at = lines.findIndex(l => SECTION_RE.exec(l)?.[1]!.toLowerCase() === section)
+  const headingOf = (s: Section) => lines.findIndex(l => SECTION_RE.exec(l)?.[1]!.toLowerCase() === s)
+  let at = headingOf(section)
+  const later = SECTIONS.slice(SECTIONS.indexOf(section) + 1).map(headingOf).find(i => i !== -1)
+  if (at === -1 && later !== undefined) {
+    lines.splice(later, 0, `## ${capitalized(section)}`, '')
+    return later + 1
+  }
   if (at === -1) {
     while (lines.length && !lines[lines.length - 1]!.trim()) lines.pop()
     lines.push('', `## ${capitalized(section)}`, '')
@@ -502,7 +515,7 @@ async function startBatch($: EngineInterface, marked: Task[]) {
     $,
     ts,
     `Start working on these ${ts.length} tasks, now under Doing in ${FILE}, one at a time in this order:\n${list.join('\n')}\n` +
-      `For each: ${CHECK_REFS}, follow the task board rules (ask me when a decision is mine and record the Q/A under that task), and when it is finished move it to Done with its own log before starting the next. ${COMMIT_STEP}`,
+      `For each: ${CHECK_REFS}, follow the task board rules (ask me when a decision is mine and record the Q/A under that task), and when it is finished move it to Review with its own log before starting the next. ${COMMIT_STEP}`,
   )
 }
 
@@ -593,7 +606,30 @@ const COMMIT_STEP =
 function finish($: EngineInterface, t: Task) {
   return ask(
     $,
-    `${ref(t)} is done. Following the task board rules, move it to Done in ${FILE} with today's date and replace its notes with the done log: what was done, the decisions and why, the result, the files touched. ${COMMIT_STEP}`,
+    `${ref(t)} is done. Following the task board rules, move it to Review in ${FILE} and replace its notes with the done log: what was done, the decisions and why, the result, the files touched. ${COMMIT_STEP}`,
+  )
+}
+
+// A reviewed task goes to the top of Done with today's date, its log as it
+// is: the log was written on entering Review, so Claude is not asked.
+function approve($: EngineInterface, t: Task) {
+  return editBoard($, text => moveTask(text, t.key, 'done', true, ([line, ...notes]) => [`${line!.trimEnd()} (${today()})`, ...notes]))
+}
+
+// A task that failed review goes back to the end of Doing with a
+// `> Review: <reason>` note, and Claude is told to fix it.
+async function reject($: EngineInterface, t: Task, value: string) {
+  await update($, rejectingAtom, () => null)
+  const reason = typed(value)
+  const moved = await editBoard($, text =>
+    moveTask(text, t.key, 'doing', false, block => (reason ? [...block, `  > Review: ${reason}`] : block)),
+  )
+  if (moved === null) return
+  await ask(
+    $,
+    `${ref(t)} failed my review and is back under Doing in ${FILE}` +
+      (reason ? `, with my reason in its Review: note: ${quoted(reason)}. ` : '. Ask me what to fix. ') +
+      'Fix it following the task board rules, then move it to Review again with its log updated.',
   )
 }
 
@@ -700,7 +736,7 @@ function layoutGraph(input: GraphNode[], shape: Shape): { nodes: Placed[]; edges
 const CELL_DEFAULT = 0x01000000
 const EDGE_COLOR = 0x8a8a8a
 const OPEN_COLOR = 0xffffff
-const NODE_COLOR: Record<Section, number> = { doing: 0xe8c547, todo: 0x5fc4d4, done: 0x6f9a6f }
+const NODE_COLOR: Record<Section, number> = { doing: 0xe8c547, review: 0xc678dd, todo: 0x5fc4d4, done: 0x6f9a6f }
 
 // Line pieces by the directions they join: up 1, right 2, down 4, left 8.
 const PIECE: Record<number, string> = {
@@ -997,7 +1033,7 @@ export const register: Register = (on, options) => {
 
     const tasks = parse(file.text)
     const by = (s: Section) => tasks.filter(t => t.section === s)
-    const [todo, doing, done] = [by('todo'), by('doing'), by('done')]
+    const [todo, doing, review, done] = [by('todo'), by('doing'), by('review'), by('done')]
     const raw = tasks.filter(t => !t.id && t.section !== 'done')
     const peers = (t: Task) => by(t.section)
     // The open task: its detail shows under its row until Enter or Close folds it.
@@ -1008,6 +1044,7 @@ export const register: Register = (on, options) => {
     const folded = foldable && (await read($, expandedAtom)) !== chosen.key
     const notes = chosen ? (folded ? chosen.notes.slice(0, 1) : chosen.notes) : []
     const renaming = await read($, renamingAtom)
+    const rejecting = await read($, rejectingAtom)
     const dropping = await read($, droppingAtom)
     // The keyboard goes to a row that stays: the task's own once in Done, or
     // a neighbour when a raw task is deleted.
@@ -1043,6 +1080,12 @@ export const register: Register = (on, options) => {
             <Button key={k('rename-cancel')} plain label="Cancel" onPress={() => void update($, renamingAtom, () => null)} />
           </Box>
         )}
+        {rejecting === t.key && Input && (
+          <Box flexDirection="row" columnGap={2} key="reject-row">
+            <Input key={k('reject', true)} label="What to fix:" submitLabel="send back" onSubmit={value => void reject($, t, value)} />
+            <Button key={k('reject-cancel')} plain label="Cancel" onPress={() => void update($, rejectingAtom, () => null)} />
+          </Box>
+        )}
         {t.notes.length === 0 && <Text dimColor>{t.id ? 'No notes.' : 'Not enriched yet.'}</Text>}
         {notes.map(n => (
           <Text dimColor={!/^[QA]:/i.test(n)} color={/^Q:/i.test(n) ? 'yellow' : undefined} wrap={folded ? 'truncate-end' : undefined}>
@@ -1055,8 +1098,22 @@ export const register: Register = (on, options) => {
         )}
         <Box flexDirection="row" columnGap={2} key="actions">
           {t.section === 'todo' && <Button key={k('start')} plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
-          {t.section === 'doing' && <Button key={k('done')} plain hotkey="d" label="Done" onPress={() => void finish($, t)} />}
-          {t.section !== 'done' && (
+          {t.section === 'doing' && <Button key={k('done')} plain hotkey="d" label="To review" onPress={() => void finish($, t)} />}
+          {t.section === 'review' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={() => void approve($, t)} />}
+          {t.section === 'review' && rejecting !== t.key && (
+            <Button
+              key={k('reject-open')}
+              plain
+              hotkey="f"
+              label="Reject"
+              onPress={async () => {
+                if (!Input) return reject($, t, '')
+                await update($, rejectingAtom, () => t.key)
+                await $.ui.focus({ requestId: PANE, key: 'reject' }).catch(() => {})
+              }}
+            />
+          )}
+          {t.section !== 'done' && t.section !== 'review' && (
             <Button key={k('quick-done')} plain hotkey="q" label="Quick done" onPress={() => void quickDone($, t)} />
           )}
           {t.section !== 'done' && (
@@ -1116,6 +1173,7 @@ export const register: Register = (on, options) => {
     const select = async (key: string | null) => {
       await update($, droppingAtom, () => null)
       await update($, renamingAtom, () => null)
+      await update($, rejectingAtom, () => null)
       await update($, selectedAtom, () => key)
     }
     const close = async (focusOn = chosen) => {
@@ -1230,6 +1288,8 @@ export const register: Register = (on, options) => {
         <Text> </Text>
         {heading('doing', doing.length)}
         {doing.map(row)}
+        {review.length > 0 && heading('review', review.length)}
+        {review.map(row)}
         {heading('todo', todo.length)}
         {todo.map(row)}
         {heading('done', done.length)}
