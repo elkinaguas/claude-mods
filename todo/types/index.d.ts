@@ -27,6 +27,8 @@ declare module 'claude-code' {
       graphZoom: number
       /** How many columns the dependency graph is scrolled to the right. */
       graphScroll: number
+      /** Whether Done is unfolded; null until read from the plugin's store. */
+      doneOpen: boolean | null
     }
   }
 }

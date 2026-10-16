@@ -12,7 +12,7 @@ A task board in one `TODO.md` at the project root, with `## Todo`, `## Doing`, `
 - **Drop it.** *Drop* (`x`, pressed twice) gives up on a Todo or Doing task: one with an ID goes to the top of Done marked `(dropped <date>)` with its notes, so its ID stays taken; one without an ID is deleted.
 - **Log it.** *To review* (`d`) on a Doing task asks Claude to move it to Review and replace its notes with a log: what was done, the decisions and why, the result, the files touched. Claude moves a task it finishes to Review the same way.
 - **Review it.** On a Review task, *Done* (`d`) moves it to the top of Done with today's date, log kept, without asking Claude. *Reject* (`f`) asks what to fix, moves it back to Doing with a `> Review: …` note and tells Claude to fix it and bring it back to Review.
-  In Done, a task's log shows folded to its first line; *Open log* (`o`) unfolds it.
+  Done starts folded to its heading so the lists stay short and the graph has room: Enter on the heading or `t` unfolds it, and the panel remembers your choice per project. In Done, a task's log shows folded to its first line; *Open log* (`o`) unfolds it.
 
 **Dependencies.** At enrichment Claude adds `> Depends: T-3, T-5` to a task that waits on others. Once an open task has one, a graph appears under the lists, flowing left to right: each task a thin oval with its ID in its section's colour (the open task in white), arrows to what it unblocks. *Zoom* (`z`) cycles pills, ovals, and ovals with titles; `h` / `l` scroll it when it is wider than the panel. Starting a task whose dependencies aren't done shows a warning (it still starts), and a batch runs each task after the ones it waits on.
 

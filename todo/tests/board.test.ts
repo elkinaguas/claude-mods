@@ -270,6 +270,7 @@ test('two raw tasks with the same title are told apart', async ($, on) => {
 test('a done task shows its log folded, and o opens and folds it', async ($, on) => {
   const board = BOARD.replace('  > Log: cached for 5s.\n', '  > Log: cached for 5s.\n  > Files: src/git.ts.\n')
   const { ui } = await panel($, on, { 'TODO.md': board })
+  await ui.press({ key: 'done-heading' })
   await ui.press({ key: 'task:T-1' })
   expect(await ui.find({ text: 'Log: cached for 5s.' })).toBeDefined()
   expect(await ui.find({ text: 'Files: src/git.ts.' })).toBeUndefined()
@@ -324,6 +325,7 @@ test('an empty or unchanged title leaves the task alone; done tasks cannot be re
   await ui.press({ key: 'rename-open' })
   await ui.input({ key: 'rename', text: '   ' })
   expect(files['TODO.md']).toBe(BOARD)
+  await ui.press({ key: 'done-heading' })
   await ui.press({ key: 'task:T-1' })
   expect(await ui.find({ key: 'rename-open' })).toBeUndefined()
 })
@@ -353,6 +355,7 @@ test('sections and IDs are coloured: Doing yellow, Todo cyan, Done green', async
   // Review shows only when it holds a task.
   expect(await ui.find({ type: 'Text', text: /^Review/ })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: 'T-3' }))?.props.color).toBe('cyan')
+  await ui.press({ key: 'done-heading' })
   expect((await ui.find({ key: 'task:T-1' }))?.props.dimColor).toBe(true)
 })
 
@@ -374,6 +377,7 @@ test('k and j move a task up and down within its section, notes and all', async 
   expect(await ui.find({ key: 'down' })).toBeUndefined()
   await ui.press({ key: 'up' })
   expect(files['TODO.md']).toBe(BOARD)
+  await ui.press({ key: 'done-heading' })
   await ui.press({ key: 'task:T-1' })
   expect(await ui.find({ key: 'up' })).toBeUndefined()
   expect(await ui.find({ key: 'down' })).toBeUndefined()
@@ -538,6 +542,7 @@ test('q works on a Todo task too, and done tasks have no quick done', async ($, 
   await ui.press({ key: 'task:raw:add dark mode to settings' })
   await ui.press({ key: 'quick-done' })
   expect(files['TODO.md']).toMatch(/## Done\n\n- add dark mode to settings \(\d{4}-\d{2}-\d{2}\)\n  > Done from the panel, no log\.\n- T-1/)
+  await ui.press({ key: 'done-heading' })
   await ui.press({ key: 'task:T-1' })
   expect(await ui.find({ key: 'quick-done' })).toBeUndefined()
 })
@@ -615,6 +620,35 @@ test('a missing section heading is added above the next section, not at the end'
   await ui.press({ key: 'task:T-3' })
   await ui.press({ key: 'start' })
   expect(files['TODO.md']).toContain('- add dark mode to settings\n\n## Doing\n\n- T-3 Add retry to upload client\n  > Uploads fail silently on 5xx: src/upload/client.ts:88.\n  > Decision: how many retries.\n\n## Done')
+})
+
+test('Done starts folded to its heading; Enter or t unfolds it, and the choice is kept per project', async ($, on) => {
+  const saved: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: saved[e.key] }))
+  on('store.set', (_$, e) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await ui.find({ key: 'task:T-1' })).toBeUndefined()
+  expect((await ui.find({ key: 'done-heading' }))?.props.label).toBe('Done 1 ▸')
+  expect((await ui.find({ key: 'done-heading' }))?.props.hotkey).toBe('t')
+  await ui.press({ key: 'done-heading' })
+  expect(await ui.find({ key: 'task:T-1' })).toBeDefined()
+  expect((await ui.find({ key: 'done-heading' }))?.props.label).toBe('Done 1 ▾')
+  expect(saved['doneOpen:/project']).toBe(true)
+  // Folding with a done task open closes it and keeps the keyboard on the heading.
+  await ui.press({ key: 'task:T-1' })
+  await ui.press({ key: 'done-heading' })
+  expect(await ui.find({ key: 'task:T-1' })).toBeUndefined()
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  expect(saved['doneOpen:/project']).toBe(false)
+})
+
+test('an unfolded Done comes back unfolded in a new session', async ($, on) => {
+  mock.store(on, { 'doneOpen:/project': true })
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await ui.find({ key: 'task:T-1' })).toBeDefined()
 })
 
 test('an open question is answered from the panel: > A: under it, and Claude carries on', async ($, on) => {

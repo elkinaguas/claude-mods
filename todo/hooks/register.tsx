@@ -36,6 +36,7 @@ const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as st
 const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as string | null)
 const graphZoomAtom = atom({ plugin: 'todo', key: 'graphZoom' } as const, 2)
 const graphScrollAtom = atom({ plugin: 'todo', key: 'graphScroll' } as const, 0)
+const doneOpenAtom = atom({ plugin: 'todo', key: 'doneOpen' } as const, null as boolean | null)
 
 const TEMPLATE = `# TODO
 
@@ -281,7 +282,24 @@ let lastFocus: string | undefined
 // The mtime last read, so a poll redraws only on a change.
 let seen = -1
 
+// Whether Done is unfolded: folded by default, remembered per project in
+// the plugin's store. The session's atom caches it (a render can't write
+// state), filled by load while still unset, after a start or a /resume.
+const doneOpenKey = async ($: EngineInterface) => `doneOpen:${await $.session.root()}`
+
+async function loadDoneOpen($: EngineInterface) {
+  if ((await read($, doneOpenAtom)) !== null) return
+  const stored = (await $.store.get(await doneOpenKey($)).catch(() => undefined)) === true
+  await update($, doneOpenAtom, () => stored)
+}
+
+async function setDoneOpen($: EngineInterface, value: boolean) {
+  await update($, doneOpenAtom, () => value)
+  await $.store.set(await doneOpenKey($), value).catch((err: unknown) => $.ui.log(`todo: fold state not saved: ${String(err)}`))
+}
+
 async function load($: EngineInterface) {
+  await loadDoneOpen($).catch(() => {})
   let refused: string | undefined
   const stat = await boardPath($, FILE)
     .then(path => $.fs.stat(path))
@@ -1212,6 +1230,14 @@ export const register: Register = (on, options) => {
         {capitalized(section)} <Text dimColor>{n}</Text>
       </Text>
     )
+    // Done folds to its heading (Enter on it, or `t`), so the graph below
+    // gets the room. Folding moves the focus off a done row onto the heading.
+    const doneOpen = (await read($, doneOpenAtom)) === true
+    const toggleDone = async () => {
+      if (doneOpen && chosen?.section === 'done') await select(null)
+      if (doneOpen) await $.ui.focus({ requestId: PANE, key: 'done-heading' }).catch(() => {})
+      await setDoneOpen($, !doneOpen)
+    }
 
     // The dependency graph under the lists: only when an open task waits on
     // another, and only where the surface draws cells (the terminal). `z`
@@ -1292,9 +1318,19 @@ export const register: Register = (on, options) => {
         {review.map(row)}
         {heading('todo', todo.length)}
         {todo.map(row)}
-        {heading('done', done.length)}
-        {done.slice(0, DONE_SHOWN).map(row)}
-        {done.length > DONE_SHOWN && <Text dimColor>  +{done.length - DONE_SHOWN} more · /todo archive</Text>}
+        <Button
+          key={k('done-heading', true)}
+          plain
+          hotkey="t"
+          label={`Done ${done.length} ${doneOpen ? '▾' : '▸'}`}
+          onPress={() => void toggleDone()}
+        >
+          <Text bold color={SECTION_COLOR.done}>
+            Done <Text dimColor>{done.length}</Text> {doneOpen ? '▾' : '▸'}
+          </Text>
+        </Button>
+        {doneOpen && done.slice(0, DONE_SHOWN).map(row)}
+        {doneOpen && done.length > DONE_SHOWN && <Text dimColor>  +{done.length - DONE_SHOWN} more · /todo archive</Text>}
         {!chosen && tasks.length > 0 && <Text dimColor>Enter on a task shows its notes and actions.</Text>}
         {graph}
       </Box>
