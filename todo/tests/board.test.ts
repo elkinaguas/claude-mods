@@ -188,7 +188,7 @@ test('reads the board at the project root after a shell cd', async ($, on) => {
   await run('add a task')($)
   expect(paths).toContain('/project/TODO.md')
   // Every board file is read at the root, none in the shell's folder.
-  for (const p of paths) expect(p).toMatch(/^\/project\/(TODO|CLAUDE|AGENTS)\.md$/)
+  for (const p of paths) expect(p).toMatch(/^\/project\/(TODO|TODO-archive|CLAUDE|AGENTS)\.md$/)
 })
 
 test('/todo close closes the panel, and says so when it is not open', async ($, on) => {
@@ -649,6 +649,35 @@ test('an unfolded Done comes back unfolded in a new session', async ($, on) => {
   mock.store(on, { 'doneOpen:/project': true })
   const { ui } = await panel($, on, { 'TODO.md': BOARD })
   expect(await ui.find({ key: 'task:T-1' })).toBeDefined()
+})
+
+// Dates relative to today, as the panel counts weeks back from it.
+const daysAgo = (n: number) => {
+  const d = new Date()
+  d.setDate(d.getDate() - n)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+test('n shows stats: open work per section split T/H, and a sparkline of tasks done per week, archive included', async ($, on) => {
+  const saved: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: saved[e.key] }))
+  on('store.set', (_$, e) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  const board = MIXED_BOARD.replace('- T-1 Cache git status (2026-10-08)', `- T-1 Cache git status (${daysAgo(0)})\n- T-7 Old idea (dropped ${daysAgo(1)})\n- T-8 Undated`)
+  const archive = `# TODO archive\n\n- T-0 Set up (${daysAgo(2)})\n- T-9 Lint (${daysAgo(8)})\n- T-10 Ancient (${daysAgo(80)})\n`
+  const { ui } = await panel($, on, { 'TODO.md': board, 'TODO-archive.md': archive })
+  expect(await ui.find({ key: 'stats-block' })).toBeUndefined()
+  expect((await ui.find({ key: 'stats' }))?.props.label).toBe('Stats ▸')
+  await ui.press({ key: 'stats' })
+  expect(saved['statsOpen:/project']).toBe(true)
+  expect(await ui.find({ text: 'Open: Doing 1 (0 T · 1 H) · Review 0 · Todo 4 (2 T · 1 H)' })).toBeDefined()
+  // This week: T-1 and T-0; last week: T-9; T-10 is too old, T-7 is dropped, T-8 undated.
+  expect(await ui.find({ text: '······▄█' })).toBeDefined()
+  expect(await ui.find({ text: '3 in 8 weeks · 1 dropped · oldest → this week' })).toBeDefined()
+  await ui.press({ key: 'stats' })
+  expect(await ui.find({ text: /^Open:/ })).toBeUndefined()
 })
 
 test('an open question is answered from the panel: > A: under it, and Claude carries on', async ($, on) => {

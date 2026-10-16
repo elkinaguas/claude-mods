@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, EngineInterface } from 'claude-code'
 
-import type { TodoFile, TypeFilter } from '../types'
+import type { PanelFlags, TodoFile, TypeFilter } from '../types'
 
 // A task board kept in TODO.md (## Todo / ## Doing / ## Review / ## Done), drawn in a
 // pane. The mod does the mechanical edits (capture, moving to Doing,
@@ -37,7 +37,7 @@ const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as 
 const graphZoomAtom = atom({ plugin: 'todo', key: 'graphZoom' } as const, 2)
 const graphScrollAtom = atom({ plugin: 'todo', key: 'graphScroll' } as const, 0)
 const typeFilterAtom = atom({ plugin: 'todo', key: 'typeFilter' } as const, 'all' as TypeFilter)
-const doneOpenAtom = atom({ plugin: 'todo', key: 'doneOpen' } as const, null as boolean | null)
+const flagsAtom = atom({ plugin: 'todo', key: 'flags' } as const, null as PanelFlags | null)
 
 const TEMPLATE = `# TODO
 
@@ -286,24 +286,27 @@ let lastFocus: string | undefined
 // The mtime last read, so a poll redraws only on a change.
 let seen = -1
 
-// Whether Done is unfolded: folded by default, remembered per project in
-// the plugin's store. The session's atom caches it (a render can't write
-// state), filled by load while still unset, after a start or a /resume.
-const doneOpenKey = async ($: EngineInterface) => `doneOpen:${await $.session.root()}`
+// The panel's folds: Done unfolded, the stats shown. Off by default and
+// remembered per project in the plugin's store, one key each. The session's
+// atom caches them (a render can't write state), filled by load while unset,
+// after a start or a /resume.
+const FLAGS = ['doneOpen', 'statsOpen'] as const
+const flagKey = async ($: EngineInterface, name: keyof PanelFlags) => `${name}:${await $.session.root()}`
 
-async function loadDoneOpen($: EngineInterface) {
-  if ((await read($, doneOpenAtom)) !== null) return
-  const stored = (await $.store.get(await doneOpenKey($)).catch(() => undefined)) === true
-  await update($, doneOpenAtom, () => stored)
+async function loadFlags($: EngineInterface) {
+  if ((await read($, flagsAtom)) !== null) return
+  const flags = { doneOpen: false, statsOpen: false }
+  for (const name of FLAGS) flags[name] = (await $.store.get(await flagKey($, name)).catch(() => undefined)) === true
+  await update($, flagsAtom, () => flags)
 }
 
-async function setDoneOpen($: EngineInterface, value: boolean) {
-  await update($, doneOpenAtom, () => value)
-  await $.store.set(await doneOpenKey($), value).catch((err: unknown) => $.ui.log(`todo: fold state not saved: ${String(err)}`))
+async function setFlag($: EngineInterface, name: keyof PanelFlags, value: boolean) {
+  await update($, flagsAtom, f => ({ doneOpen: false, statsOpen: false, ...f, [name]: value }))
+  await $.store.set(await flagKey($, name), value).catch((err: unknown) => $.ui.log(`todo: ${name} not saved: ${String(err)}`))
 }
 
 async function load($: EngineInterface) {
-  await loadDoneOpen($).catch(() => {})
+  await loadFlags($).catch(() => {})
   let refused: string | undefined
   const stat = await boardPath($, FILE)
     .then(path => $.fs.stat(path))
@@ -316,7 +319,9 @@ async function load($: EngineInterface) {
   if (mtime === seen && (await read($, fileAtom)).exists === (stat !== null)) return
   seen = mtime
   const text = stat ? await readBoard($, FILE, '').catch(() => '') : ''
-  await update($, fileAtom, () => ({ exists: stat !== null, text, refused }))
+  // The archive only changes with the board (archiving writes both).
+  const archive = stat ? await readBoard($, ARCHIVE, '').catch(() => '') : ''
+  await update($, fileAtom, () => ({ exists: stat !== null, text, archive, refused }))
   // The rules flag lives in the session's state too: refresh it with the board.
   await checkRules($).catch(() => {})
   const doing = parse(text).filter(t => t.section === 'doing')
@@ -704,6 +709,38 @@ async function submitDraft($: EngineInterface, value: string) {
   await update($, draftAtom, () => '')
   if (value.trim()) await capture($, value)
 }
+
+// ---- Stats ------------------------------------------------------------------
+// Open work per section, and tasks done in each of the last weeks (rolling
+// 7-day windows ending today) from the dates on Done and archived lines.
+
+const STATS_WEEKS = 8
+const SPARK = '▁▂▃▄▅▆▇█'
+const DATE_RE = /\((dropped )?(\d{4})-(\d{2})-(\d{2})\)\s*$/
+
+function doneByWeek(titles: string[], now: Date): { weeks: number[]; dropped: number } {
+  const weeks = new Array<number>(STATS_WEEKS).fill(0)
+  let dropped = 0
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())
+  for (const title of titles) {
+    const m = DATE_RE.exec(title)
+    if (!m) continue
+    const age = Math.floor((today - Date.UTC(Number(m[2]), Number(m[3]) - 1, Number(m[4]))) / (7 * 86_400_000))
+    if (age < 0 || age >= STATS_WEEKS) continue
+    if (m[1]) dropped++
+    else weeks[STATS_WEEKS - 1 - age]!++
+  }
+  return { weeks, dropped }
+}
+
+// One character a week, oldest first: `·` for none, else a bar scaled to the busiest.
+function sparkline(counts: number[]): string {
+  const max = Math.max(1, ...counts)
+  return counts.map(n => (n === 0 ? '·' : SPARK[Math.max(0, Math.ceil((n / max) * SPARK.length) - 1)])).join('')
+}
+
+// The archive has no section headings: read its task lines as Done.
+const archivedTasks = (text: string) => parse(`## Done\n${text.replace(/^#.*$/gm, '')}`)
 
 // ---- The dependency graph -------------------------------------------------
 // Drawn left to right under the lists as a grid of terminal cells (a
@@ -1293,11 +1330,13 @@ export const register: Register = (on, options) => {
     )
     // Done folds to its heading (Enter on it, or `t`), so the graph below
     // gets the room. Folding moves the focus off a done row onto the heading.
-    const doneOpen = (await read($, doneOpenAtom)) === true
+    const flags = await read($, flagsAtom)
+    const doneOpen = flags?.doneOpen === true
+    const statsOpen = flags?.statsOpen === true
     const toggleDone = async () => {
       if (doneOpen && chosen?.section === 'done') await select(null)
       if (doneOpen) await $.ui.focus({ requestId: PANE, key: 'done-heading' }).catch(() => {})
-      await setDoneOpen($, !doneOpen)
+      await setFlag($, 'doneOpen', !doneOpen)
     }
 
     // The dependency graph under the lists: only when an open task waits on
@@ -1342,6 +1381,32 @@ export const register: Register = (on, options) => {
       )
     }
 
+    // `n` shows the stats: open work per section (split T/H once an H- task
+    // exists) and a sparkline of tasks done per week, archive included.
+    let stats = null
+    if (statsOpen) {
+      const split = (list: Task[]) => {
+        const h = list.filter(isHuman).length
+        return hasHuman && list.length ? ` (${list.filter(t => t.id && !isHuman(t)).length} T · ${h} H)` : ''
+      }
+      const open = (['doing', 'review', 'todo'] as const).map(sec => `${capitalized(sec)} ${by(sec).length}${split(by(sec))}`)
+      const { weeks, dropped } = doneByWeek([...done, ...archivedTasks(file.archive ?? '')].map(t => t.title), new Date())
+      const total = weeks.reduce((a, b) => a + b, 0)
+      stats = (
+        <Box flexDirection="column" key="stats-block">
+          <Text> </Text>
+          <Text bold>Stats</Text>
+          <Text>Open: {open.join(' · ')}</Text>
+          <Text>
+            Done per week: <Text color={SECTION_COLOR.done}>{sparkline(weeks)}</Text>{' '}
+            <Text dimColor>
+              {total} in {STATS_WEEKS} weeks{dropped ? ` · ${dropped} dropped` : ''} · oldest → this week
+            </Text>
+          </Text>
+        </Box>
+      )
+    }
+
     const tree = (
       <Box flexDirection="column">
         {!hasRules && <Text color="yellow">Rules not in CLAUDE.md yet: run /todo init.</Text>}
@@ -1353,34 +1418,33 @@ export const register: Register = (on, options) => {
           onInput={value => void update($, draftAtom, () => value)}
           onSubmit={value => void submitDraft($, value)}
         />)}
-        {(raw.length > 0 || marked.length > 0 || markTarget || hasHuman || typeFilter !== 'all') && (
-          <Box flexDirection="row" columnGap={2} key="top-actions">
-            {raw.length > 0 && (
-              <Button key={k('enrich-all')} plain hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
-            )}
-            {markTarget && (
-              <Button
-                key={k('mark')}
-                plain
-                hotkey="m"
-                label={`${isMarked(markTarget) ? 'Unmark' : 'Mark'} ${markTarget.id ?? markTarget.title}`}
-                onPress={() => void toggleMark(markTarget)}
-              />
-            )}
-            {(hasHuman || typeFilter !== 'all') && (
-              <Button
-                key={k('type-filter')}
-                plain
-                hotkey="v"
-                label={`View: ${typeFilter === 'all' ? 'all' : typeFilter === 'T' ? "Claude's (T)" : 'mine (H)'}`}
-                onPress={() => void update($, typeFilterAtom, f => (f === 'all' ? 'T' : f === 'T' ? 'H' : 'all'))}
-              />
-            )}
-            {marked.length > 0 && (
-              <Button key={k('start-marked')} plain hotkey="g" label={`Start ${marked.length} marked`} onPress={() => void startBatch($, marked)} />
-            )}
-          </Box>
-        )}
+        <Box flexDirection="row" columnGap={2} key="top-actions">
+          {raw.length > 0 && (
+            <Button key={k('enrich-all')} plain hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
+          )}
+          {markTarget && (
+            <Button
+              key={k('mark')}
+              plain
+              hotkey="m"
+              label={`${isMarked(markTarget) ? 'Unmark' : 'Mark'} ${markTarget.id ?? markTarget.title}`}
+              onPress={() => void toggleMark(markTarget)}
+            />
+          )}
+          {(hasHuman || typeFilter !== 'all') && (
+            <Button
+              key={k('type-filter')}
+              plain
+              hotkey="v"
+              label={`View: ${typeFilter === 'all' ? 'all' : typeFilter === 'T' ? "Claude's (T)" : 'mine (H)'}`}
+              onPress={() => void update($, typeFilterAtom, f => (f === 'all' ? 'T' : f === 'T' ? 'H' : 'all'))}
+            />
+          )}
+          <Button key={k('stats')} plain hotkey="n" label={`Stats ${statsOpen ? '▾' : '▸'}`} onPress={() => void setFlag($, 'statsOpen', !statsOpen)} />
+          {marked.length > 0 && (
+            <Button key={k('start-marked')} plain hotkey="g" label={`Start ${marked.length} marked`} onPress={() => void startBatch($, marked)} />
+          )}
+        </Box>
         <Text> </Text>
         {heading('doing', shown(doing).length)}
         {shown(doing).map(row)}
@@ -1402,6 +1466,7 @@ export const register: Register = (on, options) => {
         {doneOpen && shown(done).slice(0, DONE_SHOWN).map(row)}
         {doneOpen && shown(done).length > DONE_SHOWN && <Text dimColor>  +{shown(done).length - DONE_SHOWN} more · /todo archive</Text>}
         {!chosen && tasks.length > 0 && <Text dimColor>Enter on a task shows its notes and actions.</Text>}
+        {stats}
         {graph}
       </Box>
     )

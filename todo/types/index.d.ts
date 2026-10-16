@@ -1,5 +1,8 @@
-/** TODO.md as last read: whether it exists, its text, and why it was refused (a link, not a file). */
-export type TodoFile = { exists: boolean; text: string; refused?: string }
+/** TODO.md as last read: whether it exists, its text (and TODO-archive.md's), and why it was refused (a link, not a file). */
+export type TodoFile = { exists: boolean; text: string; archive?: string; refused?: string }
+
+/** The panel's folds, remembered per project: Done unfolded, stats shown. */
+export type PanelFlags = { doneOpen: boolean; statsOpen: boolean }
 
 /** Which tasks the panel lists: all, Claude's (T-) or the engineer's (H-). */
 export type TypeFilter = 'all' | 'T' | 'H'
@@ -30,8 +33,8 @@ declare module 'claude-code' {
       graphZoom: number
       /** How many columns the dependency graph is scrolled to the right. */
       graphScroll: number
-      /** Whether Done is unfolded; null until read from the plugin's store. */
-      doneOpen: boolean | null
+      /** The panel's folds; null until read from the plugin's store. */
+      flags: PanelFlags | null
       /** Which tasks the lists show (`v` cycles it). */
       typeFilter: TypeFilter
     }
