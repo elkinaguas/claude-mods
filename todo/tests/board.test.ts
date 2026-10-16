@@ -711,12 +711,94 @@ test('Depends lines draw a left-to-right graph of thin ovals and arrows under th
       ' ╰───╯',
     ].join('\n'),
   )
-  // Ovals take their section's colour: T-3 is in Todo (cyan), T-2 in Doing (yellow).
+  // Ovals take their type's colour: T- tasks cyan, whatever their section.
   const { cells, columns } = (await ui.find({ key: 'graph-cells' }))!.props as { cells: string; columns: number }
   const words = new Uint32Array(Uint8Array.from(atob(cells), ch => ch.charCodeAt(0)).buffer)
   const fgAt = (x: number, y: number) => words[(y * columns + x) * 3 + 1]
   expect(fgAt(2, 1)).toBe(0x5fc4d4)
-  expect(fgAt(2, 5)).toBe(0xe8c547)
+  expect(fgAt(2, 5)).toBe(0x5fc4d4)
+})
+
+// T-3 and H-4 in Todo, H-2 in Doing; T-6 waits on H-2, H-4 on T-1 (done).
+const MIXED_BOARD = BOARD.replace('- T-2 Fix flaky auth test', '- H-2 Call the vendor').replace(
+  '- add dark mode to settings\n',
+  '- add dark mode to settings\n- H-4 Buy the certificate\n  > Depends: T-1\n- T-6 Ship retries\n  > Depends: H-2, T-3\n',
+)
+
+const fgOf = (found: { props: Record<string, unknown> } | undefined, text: string, id: string) => {
+  const { cells, columns } = found!.props as { cells: string; columns: number }
+  const words = new Uint32Array(Uint8Array.from(atob(cells), ch => ch.charCodeAt(0)).buffer)
+  const lines = text.split('\n')
+  const y = lines.findIndex(l => l.includes(id))
+  return words[(y * columns + lines[y]!.indexOf(id)) * 3 + 1]
+}
+
+test('H- tasks are parsed and drawn orange in the graph; done nodes are dimmed', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': MIXED_BOARD })
+  const found = await ui.find({ key: 'graph-cells' })
+  const text = rasterText(found)
+  expect(text).toContain('H-2')
+  expect(fgOf(found, text, 'H-2')).toBe(0xe8964a)
+  expect(fgOf(found, text, 'H-4')).toBe(0xe8964a)
+  expect(fgOf(found, text, 'T-6')).toBe(0x5fc4d4)
+  expect(fgOf(found, text, 'T-1')).toBe(0x3d7680)
+})
+
+test('an H- task moves through the panel without Claude: start, then done straight to Done', async ($, on) => {
+  const { ui, files, prompts } = await panel($, on, { 'TODO.md': MIXED_BOARD })
+  await ui.press({ key: 'task:H-4' })
+  expect(await ui.find({ key: 'quick-done' })).toBeUndefined()
+  // Batches are Claude's work: an H- task can't be marked.
+  expect(await ui.find({ key: 'mark' })).toBeUndefined()
+  await ui.press({ key: 'start' })
+  expect(files['TODO.md']).toContain('- H-2 Call the vendor\n  > Q: Mock the clock or raise the timeout?\n- H-4 Buy the certificate')
+  // Still open after starting.
+  await ui.press({ key: 'approve' })
+  expect(files['TODO.md']).toMatch(/## Done\n\n- H-4 Buy the certificate \(\d{4}-\d{2}-\d{2}\)\n  > Depends: T-1\n- T-1/)
+  await ui.press({ key: 'task:H-2' })
+  await ui.press({ key: 'back' })
+  expect(prompts).toEqual([])
+})
+
+test('y flips a task between T- and H-, keeping its number and fixing the Depends lines that name it', async ($, on) => {
+  const { ui, files, prompts } = await panel($, on, { 'TODO.md': MIXED_BOARD })
+  await ui.press({ key: 'task:T-3' })
+  expect((await ui.find({ key: 'flip' }))?.props.label).toBe('Make it H-3')
+  await ui.press({ key: 'flip' })
+  expect(files['TODO.md']).toContain('- H-3 Add retry to upload client\n')
+  expect(files['TODO.md']).toContain('  > Depends: H-2, H-3\n')
+  expect(files['TODO.md']).toContain('src/upload/client.ts:88')
+  // Still open, under its new ID; a Todo task tells Claude nothing.
+  expect((await ui.find({ key: 'flip' }))?.props.label).toBe('Make it T-3')
+  expect(prompts).toEqual([])
+  // In Doing it changes hands: Claude starts on a task that became its own.
+  await ui.press({ key: 'task:H-2' })
+  await ui.press({ key: 'flip' })
+  expect(files['TODO.md']).toContain('- T-2 Call the vendor\n')
+  expect(prompts[0]).toContain('H-2 is now T-2 in TODO.md, under Doing. Start working on it')
+})
+
+test('v cycles the lists between all tasks, Claude\'s and mine; raw tasks show in every view', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': MIXED_BOARD })
+  expect((await ui.find({ key: 'type-filter' }))?.props.label).toBe('View: all')
+  await ui.press({ key: 'type-filter' })
+  expect((await ui.find({ key: 'type-filter' }))?.props.label).toBe("View: Claude's (T)")
+  expect(await ui.find({ key: 'task:H-4' })).toBeUndefined()
+  expect(await ui.find({ key: 'task:T-3' })).toBeDefined()
+  expect(await ui.find({ key: 'task:raw:add dark mode to settings' })).toBeDefined()
+  await ui.press({ key: 'type-filter' })
+  expect(await ui.find({ key: 'task:H-4' })).toBeDefined()
+  expect(await ui.find({ key: 'task:T-3' })).toBeUndefined()
+  expect(await ui.find({ key: 'task:raw:add dark mode to settings' })).toBeDefined()
+  // The graph still shows every task.
+  expect(rasterText(await ui.find({ key: 'graph-cells' }))).toContain('T-6')
+  await ui.press({ key: 'type-filter' })
+  expect((await ui.find({ key: 'type-filter' }))?.props.label).toBe('View: all')
+})
+
+test('no View button on a board without H- tasks', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await ui.find({ key: 'type-filter' })).toBeUndefined()
 })
 
 test('an arrow skipping columns runs through free slots, never into another task', async ($, on) => {

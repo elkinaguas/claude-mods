@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, EngineInterface } from 'claude-code'
 
-import type { TodoFile } from '../types'
+import type { TodoFile, TypeFilter } from '../types'
 
 // A task board kept in TODO.md (## Todo / ## Doing / ## Review / ## Done), drawn in a
 // pane. The mod does the mechanical edits (capture, moving to Doing,
@@ -36,6 +36,7 @@ const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as st
 const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as string | null)
 const graphZoomAtom = atom({ plugin: 'todo', key: 'graphZoom' } as const, 2)
 const graphScrollAtom = atom({ plugin: 'todo', key: 'graphScroll' } as const, 0)
+const typeFilterAtom = atom({ plugin: 'todo', key: 'typeFilter' } as const, 'all' as TypeFilter)
 const doneOpenAtom = atom({ plugin: 'todo', key: 'doneOpen' } as const, null as boolean | null)
 
 const TEMPLATE = `# TODO
@@ -55,11 +56,12 @@ ${RULES_HEADING}
 \`TODO.md\` at the project root is the task board, in four sections: \`## Todo\`, \`## Doing\`, \`## Review\`, \`## Done\`. Older done tasks move to \`TODO-archive.md\`.
 
 - **Capture.** The engineer adds tasks as one short line under \`## Todo\` (\`- fix flaky auth test\`), with no ID. Keep their wording.
-- **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID, \`T-<n>\`: one more than the highest ID in TODO.md and TODO-archive.md. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines. When the task can only be done after other open tasks, one of those lines is \`> Depends: T-<n>, T-<m>\`.
+- **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID: \`T-<n>\` for a task Claude can do, \`H-<n>\` for one only the engineer can do (a call, a purchase, a decision outside the code). Both share one sequence: \`<n>\` is one more than the highest number in TODO.md and TODO-archive.md, whichever its letter. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines. When the task can only be done after other open tasks, one of those lines is \`> Depends: T-<n>, H-<m>\`. When a task would be better as several (of either type), show the engineer the split (titles, types, IDs, Depends) and ask before writing it; the first piece keeps the original ID.
 - **Doing.** A task being worked on sits under \`## Doing\`. When a decision is the engineer's, ask them; record each question under the task as \`> Q: ...\` and their answer as \`> A: ...\`. On starting a task, first check its \`file:line\` references against the code and fix any that drifted.
+- **The engineer's tasks.** An \`H-\` task is the engineer's: never start, work on or log it; they move it through the board themselves, and it skips Review.
 - **Review.** When a task is finished, move it to the end of \`## Review\` (adding that heading before \`## Done\` if missing) and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets. The engineer reviews it: they move it to Done, or back to Doing with a \`> Review: ...\` note saying what to fix; fix that, then move it to Review again with the log updated.
 - **Done.** A reviewed task sits at the top of \`## Done\` with the date appended to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), its log kept. Move a task to Done yourself only when the engineer asks.
-- **Format.** A task is a line \`- T-<n> <title>\` (or \`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
+- **Format.** A task is a line \`- T-<n> <title>\` or \`- H-<n> <title>\` (\`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
 ${MARK_END}`
 
 type Section = (typeof SECTIONS)[number]
@@ -73,7 +75,7 @@ type Task = {
   notes: string[]
   // The open question's text and its line in the file, while one is open.
   question?: { text: string; line: number }
-  // IDs from a `> Depends: T-3, T-5` note: the tasks this one waits on.
+  // IDs from a `> Depends: T-3, H-5` note: the tasks this one waits on.
   deps: string[]
   // Lines [start, end) of the file, the task line and its notes.
   start: number
@@ -85,7 +87,9 @@ const SECTION_RE = /^##\s+(todo|doing|review|done)\s*$/i
 const TASK_RE = /^[-*]\s+(?:\[[ xX]\]\s+)?(.+)$/
 // IDs up to 6 digits: a longer run is no ID, so a hostile file can't make
 // one node absurdly wide.
-const ID_RE = /^(T-\d{1,6})\b[:.]?\s*(.*)$/
+// T- tasks are Claude's, H- tasks the engineer's; one number sequence for both.
+const ID_RE = /^([TH]-\d{1,6})\b[:.]?\s*(.*)$/
+const isHuman = (t: { id?: string }) => t.id?.startsWith('H-') === true
 
 function parse(text: string): Task[] {
   const lines = text.split('\n')
@@ -130,7 +134,7 @@ function parse(text: string): Task[] {
       } else if (/^A:/i.test(note)) {
         task.question = undefined
       } else if (/^Depends:/i.test(note)) {
-        task.deps.push(...(note.match(/T-\d{1,6}\b/g) ?? []))
+        task.deps.push(...(note.match(/\b[TH]-\d{1,6}\b/g) ?? []))
       }
     } else if (line.trim()) {
       task = null
@@ -216,7 +220,7 @@ function reorderTask(text: string, key: string, dir: -1 | 1): string | null {
 }
 
 // The task line's bullet, checkbox and ID kept, its title replaced.
-const LINE_HEAD_RE = /^([-*]\s+(?:\[[ xX]\]\s+)?(?:T-\d+\b[:.]?\s*)?)/
+const LINE_HEAD_RE = /^([-*]\s+(?:\[[ xX]\]\s+)?(?:[TH]-\d+\b[:.]?\s*)?)/
 
 function renameTask(text: string, key: string, title: string): { text: string; key: string } | null {
   const task = parse(text).find(t => t.key === key)
@@ -504,14 +508,16 @@ const ENRICH_FIRST = 'not enriched yet: give it the next free ID and its context
 
 // Moves tasks to Doing, archiving old Done tasks first and warning about
 // deps not done (deps inside the group count as met), then asks Claude.
-async function startTasks($: EngineInterface, ts: Task[], prompt: string) {
+async function startTasks($: EngineInterface, ts: Task[], prompt?: string) {
   warnUnmet($, ts, parse(await current($)), ts)
   await autoArchive($)
   await editBoard($, text => ts.reduce((acc, t) => moveTask(acc, t.key, 'doing') ?? acc, text))
-  await ask($, prompt)
+  if (prompt) await ask($, prompt)
 }
 
+// An H- task is the engineer's: it moves to Doing and Claude is not asked.
 function start($: EngineInterface, t: Task) {
+  if (isHuman(t)) return startTasks($, [t])
   return startTasks(
     $,
     [t],
@@ -568,7 +574,7 @@ async function answer($: EngineInterface, t: Task, value: string) {
   await ask(
     $,
     `${ref(t)}: I answered its open question in ${FILE} (the A: line under it): ${quoted(text)}. ` +
-      (t.section === 'doing' ? 'Carry on with it, following the task board rules.' : 'It is not started; no need to work on it now.'),
+      (isHuman(t) ? 'It is one of mine (an H- task); no need to work on it.' : t.section === 'doing' ? 'Carry on with it, following the task board rules.' : 'It is not started; no need to work on it now.'),
   )
 }
 
@@ -585,8 +591,47 @@ function dropTask(text: string, key: string, date: string): string | null {
 
 async function sendBack($: EngineInterface, t: Task) {
   const moved = await editBoard($, text => moveTask(text, t.key, 'todo', true))
-  if (moved === null) return
+  if (moved === null || isHuman(t)) return
   await ask($, `${ref(t)} is back in Todo in ${FILE}. Stop working on it and leave its notes as they are.`)
+}
+
+// Turns T-<n> into H-<n> or back, in its line and in every Depends note that
+// names it (other mentions are history and stay). Null when the other ID is
+// taken (it can't be with one sequence, but a hand-edited file might).
+function flipTask(text: string, id: string): { text: string; id: string } | null {
+  const other = `${id.startsWith('H-') ? 'T' : 'H'}${id.slice(1)}`
+  const tasks = parse(text)
+  const task = tasks.find(t => t.id === id)
+  if (!task || tasks.some(t => t.id === other)) return null
+  const word = new RegExp(`\\b${id}\\b`, 'g')
+  const lines = text.split('\n')
+  lines[task.start] = lines[task.start]!.replace(new RegExp(`\\b${id}\\b`), other)
+  for (const t of tasks) {
+    for (let i = t.start + 1; i < t.end; i++) {
+      if (/^\s+>\s?Depends:/i.test(lines[i]!)) lines[i] = lines[i]!.replace(word, other)
+    }
+  }
+  return { text: lines.join('\n'), id: other }
+}
+
+// Flips a task's type. One in Doing changes hands: Claude stops on a task
+// that became the engineer's, and starts on one that became Claude's.
+async function flip($: EngineInterface, t: Task) {
+  let id = ''
+  const written = await editBoard($, text => {
+    const out = flipTask(text, t.id!)
+    if (out) id = out.id
+    return out?.text ?? null
+  })
+  if (written === null) return
+  await update($, selectedAtom, () => id)
+  if (t.section !== 'doing') return
+  await ask(
+    $,
+    isHuman(t)
+      ? `${t.id} is now ${id} in ${FILE}, under Doing. Start working on it: ${CHECK_REFS}, then follow the task board rules.`
+      : `${t.id} is now ${id} in ${FILE}, a task of mine. Stop working on it and leave its notes as they are.`,
+  )
 }
 
 async function reorder($: EngineInterface, t: Task, dir: -1 | 1) {
@@ -666,7 +711,7 @@ async function submitDraft($: EngineInterface, value: string) {
 // colour, and arrows from each task to the tasks it unblocks. Pure: tasks
 // in, cells out.
 
-type GraphNode = { id: string; title: string; section: Section; deps: string[]; isOpen: boolean }
+type GraphNode = { id: string; title: string; section: Section; deps: string[]; isOpen: boolean; human?: boolean }
 // A waypoint is the free slot an arrow takes in each column it crosses.
 type Placed = GraphNode & { layer: number; x: number; y: number; waypoint?: true }
 // One arrow segment between neighbouring columns; `src` / `dst` are the tasks
@@ -754,7 +799,10 @@ function layoutGraph(input: GraphNode[], shape: Shape): { nodes: Placed[]; edges
 const CELL_DEFAULT = 0x01000000
 const EDGE_COLOR = 0x8a8a8a
 const OPEN_COLOR = 0xffffff
-const NODE_COLOR: Record<Section, number> = { doing: 0xe8c547, review: 0xc678dd, todo: 0x5fc4d4, done: 0x6f9a6f }
+// Nodes are coloured by type (Claude's T- cyan, the engineer's H- orange),
+// dimmer once done.
+const NODE_COLOR = { agent: 0x5fc4d4, human: 0xe8964a } as const
+const DONE_NODE_COLOR = { agent: 0x3d7680, human: 0x8c5a2c } as const
 
 // Line pieces by the directions they join: up 1, right 2, down 4, left 8.
 const PIECE: Record<number, string> = {
@@ -867,9 +915,10 @@ function drawGraph(input: GraphNode[], zoom: Zoom): Cells | null {
   for (const [x, y] of heads) put(x, y, '▶', EDGE_COLOR)
 
   // Nodes: a pill `(T-12)` at zoom 1; a thin oval at 2 and 3, the title
-  // under it at 3. The open task is drawn in white.
+  // under it at 3, coloured by type. The open task is drawn in white.
   for (const p of g.nodes.filter(n => !n.waypoint)) {
-    const color = p.isOpen ? OPEN_COLOR : NODE_COLOR[p.section]
+    const kind = p.human ? 'human' : 'agent'
+    const color = p.isOpen ? OPEN_COLOR : (p.section === 'done' ? DONE_NODE_COLOR : NODE_COLOR)[kind]
     const w = shape.nodeW
     const id = [...p.id]
     const pad = Math.floor((w - 2 - id.length) / 2)
@@ -932,7 +981,7 @@ function graphNodes(tasks: Task[], openKey: string | null): GraphNode[] | null {
   const wanted = new Set(open.flatMap(t => t.deps))
   return tasks
     .filter(t => t.id && (t.section !== 'done' || wanted.has(t.id)))
-    .map(t => ({ id: t.id!, title: t.title, section: t.section, deps: t.deps, isOpen: t.key === openKey }))
+    .map(t => ({ id: t.id!, title: t.title, section: t.section, deps: t.deps, isOpen: t.key === openKey, human: isHuman(t) }))
 }
 
 // The deps of `t` not done yet: present in the file and outside Done.
@@ -1054,6 +1103,12 @@ export const register: Register = (on, options) => {
     const [todo, doing, review, done] = [by('todo'), by('doing'), by('review'), by('done')]
     const raw = tasks.filter(t => !t.id && t.section !== 'done')
     const peers = (t: Task) => by(t.section)
+    // `v` shows all tasks, only Claude's (T-) or only the engineer's (H-);
+    // tasks without an ID yet show in every view. The graph shows them all.
+    const typeFilter = await read($, typeFilterAtom)
+    const hasHuman = tasks.some(isHuman)
+    const shown = (list: Task[]) =>
+      typeFilter === 'all' ? list : list.filter(t => !t.id || isHuman(t) === (typeFilter === 'H'))
     // The open task: its detail shows under its row until Enter or Close folds it.
     const selectedKey = await read($, selectedAtom)
     const chosen = tasks.find(t => t.key === selectedKey)
@@ -1081,7 +1136,9 @@ export const register: Register = (on, options) => {
     // then moves to the next Todo row, so m, m, m marks a run of tasks.
     const focusedKey = await read($, focusedAtom)
     const focusedTask = tasks.find(t => `task:${t.key}` === focusedKey)
-    const markTarget = focusedTask?.section === 'todo' ? focusedTask : chosen?.section === 'todo' ? chosen : undefined
+    // An H- task is never in a batch: batches are Claude's work.
+    const markable = (t?: Task) => (t?.section === 'todo' && !isHuman(t) ? t : undefined)
+    const markTarget = markable(focusedTask) ?? markable(chosen)
     const toggleMark = async (t: Task) => {
       const key = t.key
       await update($, markedAtom, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key]))
@@ -1116,7 +1173,8 @@ export const register: Register = (on, options) => {
         )}
         <Box flexDirection="row" columnGap={2} key="actions">
           {t.section === 'todo' && <Button key={k('start')} plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
-          {t.section === 'doing' && <Button key={k('done')} plain hotkey="d" label="To review" onPress={() => void finish($, t)} />}
+          {t.section === 'doing' && !isHuman(t) && <Button key={k('done')} plain hotkey="d" label="To review" onPress={() => void finish($, t)} />}
+          {isHuman(t) && t.section !== 'done' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={() => void approve($, t)} />}
           {t.section === 'review' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={() => void approve($, t)} />}
           {t.section === 'review' && rejecting !== t.key && (
             <Button
@@ -1131,7 +1189,7 @@ export const register: Register = (on, options) => {
               }}
             />
           )}
-          {t.section !== 'done' && t.section !== 'review' && (
+          {t.section !== 'done' && t.section !== 'review' && !isHuman(t) && (
             <Button key={k('quick-done')} plain hotkey="q" label="Quick done" onPress={() => void quickDone($, t)} />
           )}
           {t.section !== 'done' && (
@@ -1161,6 +1219,9 @@ export const register: Register = (on, options) => {
                 await $.ui.focus({ requestId: PANE, key: 'rename' }).catch(() => {})
               }}
             />
+          )}
+          {t.id && t.section !== 'done' && (
+            <Button key={k('flip')} plain hotkey="y" label={`Make it ${isHuman(t) ? 'T' : 'H'}${t.id.slice(1)}`} onPress={() => void flip($, t)} />
           )}
           {foldable && (
             <Button
@@ -1292,7 +1353,7 @@ export const register: Register = (on, options) => {
           onInput={value => void update($, draftAtom, () => value)}
           onSubmit={value => void submitDraft($, value)}
         />)}
-        {(raw.length > 0 || marked.length > 0 || markTarget) && (
+        {(raw.length > 0 || marked.length > 0 || markTarget || hasHuman || typeFilter !== 'all') && (
           <Box flexDirection="row" columnGap={2} key="top-actions">
             {raw.length > 0 && (
               <Button key={k('enrich-all')} plain hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
@@ -1306,31 +1367,40 @@ export const register: Register = (on, options) => {
                 onPress={() => void toggleMark(markTarget)}
               />
             )}
+            {(hasHuman || typeFilter !== 'all') && (
+              <Button
+                key={k('type-filter')}
+                plain
+                hotkey="v"
+                label={`View: ${typeFilter === 'all' ? 'all' : typeFilter === 'T' ? "Claude's (T)" : 'mine (H)'}`}
+                onPress={() => void update($, typeFilterAtom, f => (f === 'all' ? 'T' : f === 'T' ? 'H' : 'all'))}
+              />
+            )}
             {marked.length > 0 && (
               <Button key={k('start-marked')} plain hotkey="g" label={`Start ${marked.length} marked`} onPress={() => void startBatch($, marked)} />
             )}
           </Box>
         )}
         <Text> </Text>
-        {heading('doing', doing.length)}
-        {doing.map(row)}
-        {review.length > 0 && heading('review', review.length)}
-        {review.map(row)}
-        {heading('todo', todo.length)}
-        {todo.map(row)}
+        {heading('doing', shown(doing).length)}
+        {shown(doing).map(row)}
+        {shown(review).length > 0 && heading('review', shown(review).length)}
+        {shown(review).map(row)}
+        {heading('todo', shown(todo).length)}
+        {shown(todo).map(row)}
         <Button
           key={k('done-heading', true)}
           plain
           hotkey="t"
-          label={`Done ${done.length} ${doneOpen ? '▾' : '▸'}`}
+          label={`Done ${shown(done).length} ${doneOpen ? '▾' : '▸'}`}
           onPress={() => void toggleDone()}
         >
           <Text bold color={SECTION_COLOR.done}>
-            Done <Text dimColor>{done.length}</Text> {doneOpen ? '▾' : '▸'}
+            Done <Text dimColor>{shown(done).length}</Text> {doneOpen ? '▾' : '▸'}
           </Text>
         </Button>
-        {doneOpen && done.slice(0, DONE_SHOWN).map(row)}
-        {doneOpen && done.length > DONE_SHOWN && <Text dimColor>  +{done.length - DONE_SHOWN} more · /todo archive</Text>}
+        {doneOpen && shown(done).slice(0, DONE_SHOWN).map(row)}
+        {doneOpen && shown(done).length > DONE_SHOWN && <Text dimColor>  +{shown(done).length - DONE_SHOWN} more · /todo archive</Text>}
         {!chosen && tasks.length > 0 && <Text dimColor>Enter on a task shows its notes and actions.</Text>}
         {graph}
       </Box>

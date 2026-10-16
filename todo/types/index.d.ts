@@ -1,6 +1,9 @@
 /** TODO.md as last read: whether it exists, its text, and why it was refused (a link, not a file). */
 export type TodoFile = { exists: boolean; text: string; refused?: string }
 
+/** Which tasks the panel lists: all, Claude's (T-) or the engineer's (H-). */
+export type TypeFilter = 'all' | 'T' | 'H'
+
 declare module 'claude-code' {
   interface PluginState {
     todo: {
@@ -29,6 +32,8 @@ declare module 'claude-code' {
       graphScroll: number
       /** Whether Done is unfolded; null until read from the plugin's store. */
       doneOpen: boolean | null
+      /** Which tasks the lists show (`v` cycles it). */
+      typeFilter: TypeFilter
     }
   }
 }
