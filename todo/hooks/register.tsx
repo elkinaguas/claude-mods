@@ -34,7 +34,6 @@ const rejectingAtom = atom({ plugin: 'todo', key: 'rejecting' } as const, null a
 const markedAtom = atom({ plugin: 'todo', key: 'marked' } as const, [] as string[])
 const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as string | null)
 const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as string | null)
-const graphZoomAtom = atom({ plugin: 'todo', key: 'graphZoom' } as const, 2)
 const graphScrollAtom = atom({ plugin: 'todo', key: 'graphScroll' } as const, 0)
 const typeFilterAtom = atom({ plugin: 'todo', key: 'typeFilter' } as const, 'all' as TypeFilter)
 const flagsAtom = atom({ plugin: 'todo', key: 'flags' } as const, null as PanelFlags | null)
@@ -286,22 +285,27 @@ let lastFocus: string | undefined
 // The mtime last read, so a poll redraws only on a change.
 let seen = -1
 
-// The panel's folds: Done unfolded, the stats shown. Off by default and
-// remembered per project in the plugin's store, one key each. The session's
-// atom caches them (a render can't write state), filled by load while unset,
-// after a start or a /resume.
-const FLAGS = ['doneOpen', 'statsOpen'] as const
+// The panel's settings: Done unfolded, the stats shown, the graph's zoom.
+// Folded, hidden and the smallest zoom by default; remembered per project in
+// the plugin's store, one key each. The session's atom caches them (a render
+// can't write state), filled by load while unset, after a start or a /resume.
+const DEFAULT_FLAGS: PanelFlags = { doneOpen: false, statsOpen: false, graphZoom: 1 }
 const flagKey = async ($: EngineInterface, name: keyof PanelFlags) => `${name}:${await $.session.root()}`
 
 async function loadFlags($: EngineInterface) {
   if ((await read($, flagsAtom)) !== null) return
-  const flags = { doneOpen: false, statsOpen: false }
-  for (const name of FLAGS) flags[name] = (await $.store.get(await flagKey($, name)).catch(() => undefined)) === true
+  const stored = async (name: keyof PanelFlags) => $.store.get(await flagKey($, name)).catch(() => undefined)
+  const zoom = await stored('graphZoom')
+  const flags: PanelFlags = {
+    doneOpen: (await stored('doneOpen')) === true,
+    statsOpen: (await stored('statsOpen')) === true,
+    graphZoom: zoom === 2 || zoom === 3 ? zoom : 1,
+  }
   await update($, flagsAtom, () => flags)
 }
 
-async function setFlag($: EngineInterface, name: keyof PanelFlags, value: boolean) {
-  await update($, flagsAtom, f => ({ doneOpen: false, statsOpen: false, ...f, [name]: value }))
+async function setFlag<K extends keyof PanelFlags>($: EngineInterface, name: K, value: PanelFlags[K]) {
+  await update($, flagsAtom, f => ({ ...DEFAULT_FLAGS, ...f, [name]: value }))
   await $.store.set(await flagKey($, name), value).catch((err: unknown) => $.ui.log(`todo: ${name} not saved: ${String(err)}`))
 }
 
@@ -1345,8 +1349,7 @@ export const register: Register = (on, options) => {
     const Raster = 'Raster' in els ? els.Raster : undefined
     const nodes = Raster ? graphNodes(tasks, chosen ? chosen.key : null) : null
     let graph = null
-    const zoomSetting = await read($, graphZoomAtom)
-    const zoom: Zoom = zoomSetting === 1 || zoomSetting === 3 ? zoomSetting : 2
+    const zoom: Zoom = flags?.graphZoom ?? DEFAULT_FLAGS.graphZoom
     const drawn = nodes && nodes.length <= MAX_GRAPH_NODES ? drawGraph(nodes, zoom) : null
     if (nodes && !drawn) {
       graph = <Text dimColor key="graph">Dependency graph hidden: too large to draw ({plural(nodes.length, 'task')}).</Text>
@@ -1367,7 +1370,7 @@ export const register: Register = (on, options) => {
               plain
               hotkey="z"
               label={`Zoom ${zoom}/3`}
-              onPress={() => void update($, graphZoomAtom, () => (zoom === 3 ? 1 : zoom + 1))}
+              onPress={() => void setFlag($, 'graphZoom', zoom === 3 ? 1 : ((zoom + 1) as Zoom))}
             />
             {scroll > 0 && (
               <Button key={k('graph-left')} plain hotkey="h" label="◀" onPress={() => void update($, graphScrollAtom, () => Math.max(0, scroll - SCROLL_STEP))} />

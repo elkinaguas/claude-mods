@@ -726,6 +726,8 @@ function rasterText(found: { props: Record<string, unknown> } | undefined): stri
 }
 
 test('Depends lines draw a left-to-right graph of thin ovals and arrows under the lists', async ($, on) => {
+  // Drawn at zoom 2 (ovals), as saved for this project.
+  mock.store(on, { 'graphZoom:/project': 2 })
   const { ui } = await panel($, on, { 'TODO.md': DEPS_BOARD })
   const text = rasterText(await ui.find({ key: 'graph-cells' }))
   // T-3 → T-5 → T-6, and T-2 (Doing) → T-6, joining T-5's arrow on T-6's lane.
@@ -831,6 +833,8 @@ test('no View button on a board without H- tasks', async ($, on) => {
 })
 
 test('an arrow skipping columns runs through free slots, never into another task', async ($, on) => {
+  // Drawn at zoom 2 (ovals), as saved for this project.
+  mock.store(on, { 'graphZoom:/project': 2 })
   // T-20, T-21 wait on T-19; T-22 on T-20 and T-18 (two columns away); T-23 on T-21, T-22.
   const board = [
     '# TODO', '', '## Todo', '',
@@ -866,22 +870,45 @@ test('no graph when no open task has a dependency', async ($, on) => {
   expect(await plain.find({ key: 'graph-cells' })).toBeUndefined()
 })
 
-test('zoom 1 draws pills, zoom 3 adds titles; opening a task whitens its node', async ($, on) => {
+test('the graph starts at zoom 1 (pills); z cycles 2 (ovals), 3 (titles), and saves it; opening a task whitens its node', async ($, on) => {
+  const saved: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: saved[e.key] }))
+  on('store.set', (_$, e) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
   const { ui } = await panel($, on, { 'TODO.md': DEPS_BOARD })
-  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 2/3')
+  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 1/3')
+  expect(rasterText(await ui.find({ key: 'graph-cells' })).split('\n')[0]).toBe('(T-3)────▶(T-5)─┬──▶(T-6)')
+  await ui.press({ key: 'graph-zoom' })
+  expect(saved['graphZoom:/project']).toBe(2)
   await ui.press({ key: 'graph-zoom' })
   expect(rasterText(await ui.find({ key: 'graph-cells' }))).toContain('Add retry to up…       Retry metrics')
   await ui.press({ key: 'graph-zoom' })
-  expect(rasterText(await ui.find({ key: 'graph-cells' })).split('\n')[0]).toBe('(T-3)────▶(T-5)─┬──▶(T-6)')
+  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 1/3')
+  expect(saved['graphZoom:/project']).toBe(1)
   await ui.press({ key: 'graph-zoom' })
-  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 2/3')
   await ui.press({ key: 'task:T-5' })
   const { cells, columns } = (await ui.find({ key: 'graph-cells' }))!.props as { cells: string; columns: number }
   const words = new Uint32Array(Uint8Array.from(atob(cells), ch => ch.charCodeAt(0)).buffer)
   expect(words[(1 * columns + 16) * 3 + 1]).toBe(0xffffff)
 })
 
+test('a saved zoom comes back in a new session', async ($, on) => {
+  mock.store(on, { 'graphZoom:/project': 3 })
+  const { ui } = await panel($, on, { 'TODO.md': DEPS_BOARD })
+  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 3/3')
+})
+
+test('a bad stored zoom falls back to 1', async ($, on) => {
+  mock.store(on, { 'graphZoom:/project': 7 })
+  const { ui } = await panel($, on, { 'TODO.md': DEPS_BOARD })
+  expect((await ui.find({ key: 'graph-zoom' }))?.props.label).toBe('Zoom 1/3')
+})
+
 test('a graph wider than the pane scrolls with l and h', async ($, on) => {
+  // Drawn at zoom 2 (ovals), as saved for this project.
+  mock.store(on, { 'graphZoom:/project': 2 })
   project(on, { 'TODO.md': DEPS_BOARD })
   await start($)
   const ui = await mount($, 'terminal', 20)
