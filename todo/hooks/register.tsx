@@ -547,19 +547,24 @@ async function moveBoard($: EngineInterface): Promise<string> {
   return said.join(' ')
 }
 
-// Deletes the project's TODO.md and TODO-archive.md once moved, but only a
-// copy whose text matches the moved one: a copy edited since is left for
-// the person to merge. The engine's file system can't delete, so `rm` does.
+// Deletes the project's TODO.md and TODO-archive.md once moved: a copy that
+// matches the moved one, or one untouched since the move (no newer than the
+// CLAUDE.local.md the move wrote). A copy edited since is left for the
+// person to merge. The engine's file system can't delete, so `rm` does.
 async function removeLeftovers($: EngineInterface): Promise<string[]> {
   const said: string[] = []
   const gone: string[] = []
   const root = await $.session.root()
   const moved = boardDir
   if (!moved || moved === root) return said
+  const mtimeOf = async (f: string) => (await $.fs.stat(await boardPath($, f, root)).catch(() => null))?.mtimeMs
+  const movedAt = await mtimeOf(LOCAL_FILE)
   for (const f of [FILE, ARCHIVE]) {
     const local = await readBoard($, f, null, root)
     if (local === null) continue
-    if (local !== (await readBoard($, f, null, moved))) {
+    const since = await mtimeOf(f)
+    const untouched = movedAt !== undefined && since !== undefined && since <= movedAt
+    if (!untouched && local !== (await readBoard($, f, null, moved))) {
       said.push(`The project's ${f} differs from the moved one, so it stays: merge it by hand, then delete it.`)
       continue
     }

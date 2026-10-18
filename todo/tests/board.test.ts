@@ -760,16 +760,19 @@ test('/todo move puts the board in the boards folder under the git remote\'s own
   expect('TODO.md' in files).toBe(false)
 })
 
-test('/todo move again tidies up: deletes a leftover copy that matches, keeps one edited since; .gitignore left alone when it has the line', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+test('/todo move again tidies up: deletes a leftover copy untouched since the move, keeps one edited since; .gitignore left alone when it has the line', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
   const dir = '/home/me/todos/project'
   const box: { files?: Record<string, string> } = {}
   const runs = shell(on, () => box.files!)
+  // In mtime order: the archive (older than the move, though the moved one
+  // grew since), the moved board, CLAUDE.local.md (the move), then an edit
+  // to the project's TODO.md after the move.
   const { files } = project(on, {
-    'TODO.md': `${BOARD}- an edit made after the move\n`,
     'TODO-archive.md': '# TODO archive\n',
     [`${dir}/TODO.md`]: BOARD,
-    [`${dir}/TODO-archive.md`]: '# TODO archive\n',
+    [`${dir}/TODO-archive.md`]: '# TODO archive\n\n- T-0 Archived since\n',
     'CLAUDE.local.md': LOCAL_NOTE(dir),
+    'TODO.md': `${BOARD}- an edit made after the move\n`,
     '.gitignore': 'CLAUDE.local.md\n',
   })
   box.files = files
