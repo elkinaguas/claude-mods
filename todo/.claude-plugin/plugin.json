@@ -1,7 +1,7 @@
 {
   "name": "todo",
-  "version": "0.1.14",
-  "description": "A TODO.md task board (Todo / Doing / Done) with a side panel: quick capture, Claude enrichment with IDs, and done logs",
+  "version": "0.1.15",
+  "description": "A TODO.md task board (Todo / Doing / Review / Done) with a side panel: quick capture, Claude enrichment with IDs, reviews and done logs",
   "author": {
     "name": "Elkin Aguas"
   },
@@ -18,6 +18,12 @@
       "title": "Auto-archive Done after",
       "description": "When a task starts and Done holds more than this many tasks, the oldest move to TODO-archive.md and the newest 10 stay. 0 turns it off.",
       "default": 20
+    },
+    "boardsDir": {
+      "type": "string",
+      "title": "Boards folder",
+      "description": "A folder (e.g. ~/todos) to keep boards outside their projects, one subfolder per project (its git remote's owner/repo). /todo move moves a project's board there. Empty: boards stay in their projects.",
+      "default": ""
     }
   }
 }

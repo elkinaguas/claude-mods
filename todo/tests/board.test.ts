@@ -12,8 +12,9 @@ function project(on: On, files: Record<string, string>, { realClock = false } = 
   let clock = 1
   const mtimes: Record<string, number> = {}
   for (const f of Object.keys(files)) mtimes[f] = clock++
-  // The plugin's paths arrive resolved against the session's folder.
-  const name = (path: string) => path.split('/').pop()!
+  // The plugin's paths arrive resolved against the session's folder; files
+  // in it go by their name, files elsewhere (a boards folder) by full path.
+  const name = (path: string) => (path.startsWith('/project/') ? path.split('/').pop()! : path)
   // Board files that are symbolic links: `links` lead to a file, `dangling`
   // to nothing; `unreadable` ones refuse to be read (not ENOENT).
   const links = new Set<string>()
@@ -188,7 +189,7 @@ test('reads the board at the project root after a shell cd', async ($, on) => {
   await run('add a task')($)
   expect(paths).toContain('/project/TODO.md')
   // Every board file is read at the root, none in the shell's folder.
-  for (const p of paths) expect(p).toMatch(/^\/project\/(TODO|TODO-archive|CLAUDE|AGENTS)\.md$/)
+  for (const p of paths) expect(p).toMatch(/^\/project\/(TODO|TODO-archive|CLAUDE|CLAUDE\.local|AGENTS)\.md$/)
 })
 
 test('/todo close closes the panel, and says so when it is not open', async ($, on) => {
@@ -678,6 +679,51 @@ test('n shows stats: open work per section split T/H, and a sparkline of tasks d
   expect(await ui.find({ text: '3 in 8 weeks · 1 dropped · oldest → this week' })).toBeDefined()
   await ui.press({ key: 'stats' })
   expect(await ui.find({ text: /^Open:/ })).toBeUndefined()
+})
+
+const LOCAL_NOTE = (dir: string) =>
+  `<!-- todo:board -->\nThe task board for this project is \`${dir}/TODO.md\` (its archive \`TODO-archive.md\` beside it), not \`TODO.md\` at the project root. Apply the task board rules to that file.\n<!-- todo:board-end -->`
+
+test('/todo move puts the board in the boards folder under the git remote\'s owner/repo and points CLAUDE.local.md at it', { options: { boardsDir: '~/todos' } }, async ($, on) => {
+  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: 'git@github.com:elkinaguas/claude-mods.git\n', stderr: '' } }) as never)
+  const { files } = project(on, { 'TODO.md': BOARD, 'TODO-archive.md': '# TODO archive\n', 'CLAUDE.local.md': '# Mine\n' })
+  await start($)
+  const said = await run('move')($)
+  const dir = '/home/me/todos/elkinaguas/claude-mods'
+  expect(files[`${dir}/TODO.md`]).toBe(BOARD)
+  expect(files[`${dir}/TODO-archive.md`]).toBe('# TODO archive\n')
+  expect(files['CLAUDE.local.md']).toBe(`# Mine\n\n${LOCAL_NOTE(dir)}\n`)
+  expect(String((said as { text?: string })?.text)).toContain(`Board moved to ${dir}/TODO.md`)
+  // The panel now edits the moved board, not the project's old one.
+  const ui = await mount($, 'terminal')
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'start' })
+  expect(files[`${dir}/TODO.md`]).toContain('## Doing\n\n- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n- T-3 Add retry')
+  expect(files['TODO.md']).toBe(BOARD)
+})
+
+test('/todo move without the boardsDir option says to set it', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': BOARD })
+  await start($)
+  const said = await run('move')($)
+  expect(String((said as { text?: string })?.text)).toContain('Set the boardsDir option first')
+  expect(Object.keys(files)).toEqual(['TODO.md'])
+})
+
+test('a CLAUDE.local.md pointing outside the boards folder is refused, nothing read or written there', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+  const { ui, paths } = await panel($, on, { 'TODO.md': BOARD, 'CLAUDE.local.md': LOCAL_NOTE('/home/me/todos/../.ssh') })
+  expect(await ui.find({ text: /outside the boardsDir option's folder/ })).toBeDefined()
+  expect(paths.some(p => p.includes('.ssh'))).toBe(false)
+})
+
+test('without a remote the subfolder is the project folder\'s name', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+  on('process.run', () => ({ value: { exitCode: 2, stdout: '', stderr: 'no such remote' } }) as never)
+  const { files } = project(on, {})
+  await start($)
+  await run('move')($)
+  expect(files['/home/me/todos/project/TODO.md']).toContain('## Todo')
+  expect(files['CLAUDE.local.md']).toContain('`/home/me/todos/project/TODO.md`')
 })
 
 test('an open question is answered from the panel: > A: under it, and Claude carries on', async ($, on) => {

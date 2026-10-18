@@ -31,10 +31,15 @@ Done keeps itself short: when a task starts and Done holds more than 20 tasks, t
 - add dark mode to settings
 ```
 
+## Boards outside the project
+
+To keep every board in one folder you can back up (a git repo of its own, say), set the `boardsDir` option (`/config`, todo), e.g. `~/todos`, and run `/todo move` in a project: its `TODO.md` and `TODO-archive.md` go to `~/todos/<owner>/<repo>/` (from the git remote; the folder's name without one), and `CLAUDE.local.md` gets a note pointing Claude and the panel there. Projects you don't move keep their local board. The old files stay in the project for you to delete, and `CLAUDE.local.md` should stay out of git. The mod does no git in the boards folder.
+
 ## Safety
 
 `TODO.md` may come from someone else's repo, so the mod treats it as data:
 
+- A board recorded in `CLAUDE.local.md` is used only inside the `boardsDir` folder, so a repo shipping its own `CLAUDE.local.md` can't send the board's writes elsewhere.
 - It never reads or writes `TODO.md`, `TODO-archive.md`, `CLAUDE.md` or `AGENTS.md` when one is a symbolic link (even one leading nowhere) or not a regular file; the panel says so instead.
 - A file it can't read is never overwritten as if it were missing.
 - Prompts it sends Claude name tasks by ID. A task without an ID is quoted as a one-line, capped title marked as data, never as an instruction.
@@ -49,6 +54,7 @@ Done keeps itself short: when a task starts and Done holds more than 20 tasks, t
 | `/todo init` | Creates `TODO.md` and writes the rules into `CLAUDE.md` (and `AGENTS.md` if it exists) |
 | `/todo enrich` | Asks Claude to enrich the tasks without an ID |
 | `/todo archive` | Moves the Done tasks to `TODO-archive.md` |
+| `/todo move` | Moves this project's board to the `boardsDir` folder |
 | `/todo close` | Closes the panel (or press Esc in it) |
 
 Run `/todo init` once per project. The rules it writes sit between `<!-- todo:start -->` and `<!-- todo:end -->`, and a rerun replaces them; any agent that reads `CLAUDE.md` or `AGENTS.md` follows the same board without the mod.

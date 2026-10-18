@@ -11,6 +11,11 @@ import type { PanelFlags, TodoFile, TypeFilter } from '../types'
 const FILE = 'TODO.md'
 const ARCHIVE = 'TODO-archive.md'
 const RULE_FILES = ['CLAUDE.md', 'AGENTS.md']
+// Where `/todo move` records a board kept outside the project: personal, so
+// a machine's path never reaches the shared CLAUDE.md.
+const LOCAL_FILE = 'CLAUDE.local.md'
+const BOARD_START = '<!-- todo:board -->'
+const BOARD_END = '<!-- todo:board-end -->'
 const PANE = 'todo'
 const TITLE = 'Tasks'
 const COMMAND = 'todo'
@@ -52,7 +57,7 @@ const TEMPLATE = `# TODO
 const RULES = `${MARK_START}
 ${RULES_HEADING}
 
-\`TODO.md\` at the project root is the task board, in four sections: \`## Todo\`, \`## Doing\`, \`## Review\`, \`## Done\`. Older done tasks move to \`TODO-archive.md\`.
+\`TODO.md\` at the project root (or the file \`CLAUDE.local.md\` names instead, when it names one) is the task board, in four sections: \`## Todo\`, \`## Doing\`, \`## Review\`, \`## Done\`. Older done tasks move to \`TODO-archive.md\`.
 
 - **Capture.** The engineer adds tasks as one short line under \`## Todo\` (\`- fix flaky auth test\`), with no ID. Keep their wording.
 - **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID: \`T-<n>\` for a task Claude can do, \`H-<n>\` for one only the engineer can do (a call, a purchase, a decision outside the code). Both share one sequence: \`<n>\` is one more than the highest number in TODO.md and TODO-archive.md, whichever its letter. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines. When the task can only be done after other open tasks, one of those lines is \`> Depends: T-<n>, H-<m>\`. When a task would be better as several (of either type), show the engineer the split (titles, types, IDs, Depends) and ask before writing it; the first piece keeps the original ID.
@@ -233,27 +238,68 @@ function renameTask(text: string, key: string, title: string): { text: string; k
   return { text: next, key: renamed ? renamed.key : key }
 }
 
-// The board sits at the project root, not wherever a shell cd left the session.
-// Board files live at the project root. A symbolic link (dangling or not) or
-// anything but a regular file is refused: a cloned repo could point
-// TODO-archive.md at ~/.bashrc and have the archive append to it.
+// Board files live at the project root, or in the folder CLAUDE.local.md
+// names (`/todo move`); rule files always at the root, never where a shell cd
+// left the session. A symbolic link (dangling or not) or anything but a
+// regular file is refused: a cloned repo could point TODO-archive.md at
+// ~/.bashrc and have the archive append to it.
 const isMissing = (err: unknown) => {
   const e = err as { code?: string; message?: string } | null
   return e?.code === 'ENOENT' || /\bENOENT\b/.test(e?.message ?? String(err))
 }
 
+// The board's folder when it lives outside the project, as load last read
+// it from CLAUDE.local.md; null at the root. `boardRefused` says why a
+// recorded folder was not used.
+let boardDir: string | null = null
+let boardRefused: string | undefined
+// Set from the `boardsDir` option: the folder holding every moved board.
+let boardsDirOption = ''
+
 async function boardPath($: EngineInterface, file: string): Promise<string> {
   const root = await $.session.root()
-  const path = `${root}/${file}`
+  const dir = (file === FILE || file === ARCHIVE) && boardDir ? boardDir : root
+  const path = `${dir}/${file}`
   const stat = await $.fs.stat(path).catch((err: unknown) => {
     if (isMissing(err)) return null
     throw err
   })
-  const isLink = stat ? stat.isLink : (await $.fs.list(root).catch(() => [])).some(e => e.name === file && e.isLink)
+  const isLink = stat ? stat.isLink : (await $.fs.list(dir).catch(() => [])).some(e => e.name === file && e.isLink)
   if (isLink || (stat && stat.kind !== 'file')) {
     throw new Error(`todo: ${file} is ${isLink ? 'a symbolic link' : 'not a regular file'}; leaving it alone`)
   }
   return path
+}
+
+// The boards folder from the option, `~` expanded, no trailing slash; '' unset.
+async function boardsRoot($: EngineInterface): Promise<string> {
+  let dir = boardsDirOption.trim()
+  if (!dir) return ''
+  if (dir === '~' || dir.startsWith('~/')) dir = `${(await $.env.get('HOME')) ?? ''}${dir.slice(1)}`
+  return dir.replace(/\/+$/, '')
+}
+
+// An absolute path with no `.` or `..` segment, inside `root`.
+const isInside = (path: string, root: string) =>
+  path.startsWith(`${root}/`) && !path.split('/').some(seg => seg === '.' || seg === '..')
+
+// Reads the board's folder from CLAUDE.local.md's todo:board block. It is
+// used only inside the boardsDir option's folder: a repo shipping its own
+// CLAUDE.local.md can't send the board's writes anywhere else.
+async function findBoardDir($: EngineInterface) {
+  const before = boardDir
+  boardDir = null
+  boardRefused = undefined
+  const text = await readBoard($, LOCAL_FILE, '').catch(() => '')
+  const start = text.indexOf(BOARD_START)
+  const end = text.indexOf(BOARD_END, start)
+  const path = start === -1 || end === -1 ? undefined : /`(\/[^`]*)\/TODO\.md`/.exec(text.slice(start, end))?.[1]
+  if (path) {
+    const root = await boardsRoot($)
+    if (root && isInside(path, root)) boardDir = path
+    else boardRefused = `todo: ${LOCAL_FILE} puts the board in ${path}, outside the boardsDir option's folder${root ? ` (${root})` : ' (unset)'}; set the option to use it`
+  }
+  if (boardDir !== before) seen = -1
 }
 
 // A board file's text, or `fallback` when it does not exist. Any other failure
@@ -311,7 +357,8 @@ async function setFlag<K extends keyof PanelFlags>($: EngineInterface, name: K, 
 
 async function load($: EngineInterface) {
   await loadFlags($).catch(() => {})
-  let refused: string | undefined
+  await findBoardDir($).catch(() => {})
+  let refused: string | undefined = boardRefused
   const stat = await boardPath($, FILE)
     .then(path => $.fs.stat(path))
     .catch((err: unknown) => {
@@ -319,6 +366,10 @@ async function load($: EngineInterface) {
       return null
     })
   const mtime = stat?.mtimeMs ?? (refused ? -2 : 0)
+  if (boardRefused) {
+    if ((await read($, fileAtom)).refused !== refused) await update($, fileAtom, () => ({ exists: false, text: '', refused }))
+    return
+  }
   // Unchanged file, unless the session's state lost it (another session's).
   if (mtime === seen && (await read($, fileAtom)).exists === (stat !== null)) return
   seen = mtime
@@ -434,6 +485,60 @@ async function init($: EngineInterface) {
   seen = -1
   await load($)
   return done
+}
+
+// This project's subfolder in the boards folder: the git remote's
+// owner/repo, else the project folder's name; plain path segments only.
+async function boardSlug($: EngineInterface): Promise<string> {
+  const root = await $.session.root()
+  const r = await $.process
+    .run(['git', '-c', 'core.fsmonitor=false', 'remote', 'get-url', 'origin'], { cwd: root, timeoutMs: 5000 })
+    .catch(() => null)
+  const url = r?.exitCode === 0 ? r.stdout.trim() : ''
+  const m = /[:/]([^/:]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url)
+  const parts = m ? [m[1]!, m[2]!] : [root.split('/').pop() ?? 'project']
+  const safe = parts.map(p => p.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^\.+/, '')).filter(Boolean)
+  return safe.length ? safe.join('/') : 'project'
+}
+
+// Moves this project's board (and archive) into the boards folder and
+// records where in CLAUDE.local.md. The old files stay: the engine can't
+// delete, so the person removes them. Returns what to tell the person.
+async function moveBoard($: EngineInterface): Promise<string> {
+  const root = await boardsRoot($)
+  if (!root) return 'Set the boardsDir option first (/config, todo), e.g. ~/todos.'
+  if (boardDir) return `The board already lives in ${boardDir}.`
+  const local = await readBoard($, FILE, null)
+  const localArchive = await readBoard($, ARCHIVE, null)
+  const dir = `${root}/${await boardSlug($)}`
+  boardDir = dir
+  try {
+    const there = await readBoard($, FILE, null)
+    if (there !== null && local !== null) {
+      boardDir = null
+      return `${dir}/${FILE} already exists: merge the two boards by hand, then run /todo move again with one of them.`
+    }
+    if (there === null) await $.fs.write(await boardPath($, FILE), local ?? TEMPLATE)
+    if (localArchive !== null && (await readBoard($, ARCHIVE, null)) === null) await $.fs.write(await boardPath($, ARCHIVE), localArchive)
+  } catch (err) {
+    boardDir = null
+    throw err
+  }
+  const note =
+    `${BOARD_START}\nThe task board for this project is \`${dir}/${FILE}\` (its archive \`${ARCHIVE}\` beside it), ` +
+    `not \`${FILE}\` at the project root. Apply the task board rules to that file.\n${BOARD_END}`
+  const text = (await readBoard($, LOCAL_FILE, null)) ?? ''
+  const start = text.indexOf(BOARD_START)
+  const end = text.indexOf(BOARD_END, start)
+  const next =
+    start !== -1 && end !== -1
+      ? text.slice(0, start) + note + text.slice(end + BOARD_END.length)
+      : `${text.trimEnd()}${text.trim() ? '\n\n' : ''}${note}\n`
+  await $.fs.write(await boardPath($, LOCAL_FILE), next)
+  seen = -1
+  await load($)
+  const old = [local !== null && FILE, localArchive !== null && ARCHIVE].filter(Boolean).join(' and ')
+  return `Board moved to ${dir}/${FILE}; ${LOCAL_FILE} points there.${old ? ` The project's ${old} are no longer used: delete them.` : ''} Keep ${LOCAL_FILE} out of git.`
 }
 
 // Moves the Done tasks to the archive, all of them or all but the newest
@@ -1030,6 +1135,7 @@ const unmetDeps = (t: Task, tasks: Task[]) => t.deps.filter(d => tasks.some(o =>
 
 export const register: Register = (on, options) => {
   if (typeof options.autoArchive === 'number') autoArchiveOver = options.autoArchive
+  if (typeof options.boardsDir === 'string') boardsDirOption = options.boardsDir
   // /resume (and /clear) swaps the session's state, empty or an old snapshot,
   // without loading the mod again: forget what the module saw, so the next
   // poll reads the board into the new session.
@@ -1042,7 +1148,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: 'Task board: /todo opens the panel, /todo <task> adds one, /todo init | enrich | archive | close',
+      description: 'Task board: /todo opens the panel, /todo <task> adds one, /todo init | enrich | archive | move | close',
     }).catch((err: unknown) => $.ui.log(`todo: /${COMMAND} not registered: ${String(err)}`))
     await load($).catch(() => {})
     $.clock.every(POLL_MS, () => void load($).catch(() => {}))
@@ -1071,6 +1177,10 @@ export const register: Register = (on, options) => {
       if (!isOpen) return { text: 'Task panel is not open.' }
       await $.ui.close({ id: PANE })
       return { text: 'Task panel closed.' }
+    }
+    if (word === 'move') {
+      const said = await moveBoard($).catch((err: unknown) => (err instanceof Error ? err.message : String(err)))
+      return { text: said }
     }
     if (word === 'archive') {
       const n = await archive($)

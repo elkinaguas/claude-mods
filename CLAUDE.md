@@ -1,7 +1,7 @@
 <!-- todo:start -->
 ## Task board (TODO.md)
 
-`TODO.md` at the project root is the task board, in four sections: `## Todo`, `## Doing`, `## Review`, `## Done`. Older done tasks move to `TODO-archive.md`.
+`TODO.md` at the project root (or the file `CLAUDE.local.md` names instead, when it names one) is the task board, in four sections: `## Todo`, `## Doing`, `## Review`, `## Done`. Older done tasks move to `TODO-archive.md`.
 
 - **Capture.** The engineer adds tasks as one short line under `## Todo` (`- fix flaky auth test`), with no ID. Keep their wording.
 - **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID: `T-<n>` for a task Claude can do, `H-<n>` for one only the engineer can do (a call, a purchase, a decision outside the code). Both share one sequence: `<n>` is one more than the highest number in TODO.md and TODO-archive.md, whichever its letter. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (`file:line`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines. When the task can only be done after other open tasks, one of those lines is `> Depends: T-<n>, H-<m>`. When a task would be better as several (of either type), show the engineer the split (titles, types, IDs, Depends) and ask before writing it; the first piece keeps the original ID.

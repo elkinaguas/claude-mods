@@ -13,7 +13,7 @@
     {
       "name": "todo",
       "source": "./todo",
-      "description": "A TODO.md task board (Todo / Doing / Done) with a side panel: quick capture, Claude enrichment with IDs, and done logs"
+      "description": "A TODO.md task board (Todo / Doing / Review / Done) with a side panel: quick capture, Claude enrichment with IDs, reviews and done logs"
     }
   ]
 }
