@@ -208,6 +208,12 @@ test('u realigns the open task and w the whole board; neither shows on done task
   expect(await ui.find({ key: 'realign' })).toBeUndefined()
 })
 
+test('button rows wrap in a narrow panel instead of cutting the last buttons off', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  await ui.press({ key: 'task:T-3' })
+  for (const key of ['actions', 'top-actions']) expect((await ui.find({ key }))?.props.flexWrap).toBe('wrap')
+})
+
 test('the rules forbid realign from touching IDs, titles, Q/A and Review or Done tasks', async ($, on) => {
   const { files } = project(on, {})
   await run('init')($)

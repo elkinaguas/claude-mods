@@ -1403,7 +1403,7 @@ export const register: Register = (on, options) => {
         {t.question && Input && (
           <Input key={k('answer', true)} label="Answer:" submitLabel="answer" onSubmit={value => void answer($, t, value)} />
         )}
-        <Box flexDirection="row" columnGap={2} key="actions">
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2} key="actions">
           {t.section === 'todo' && <Button key={k('start')} plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
           {t.section === 'doing' && !isHuman(t) && <Button key={k('done')} plain hotkey="d" label="To review" onPress={() => void finish($, t)} />}
           {isHuman(t) && t.section !== 'done' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={() => void approve($, t)} />}
@@ -1557,7 +1557,7 @@ export const register: Register = (on, options) => {
       graph = (
         <Box flexDirection="column" key="graph">
           <Text> </Text>
-          <Box flexDirection="row" columnGap={2} key="graph-bar">
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2} key="graph-bar">
             <Text bold>Dependencies</Text>
             <Button
               key={k('graph-zoom')}
@@ -1615,7 +1615,7 @@ export const register: Register = (on, options) => {
           onInput={value => void update($, draftAtom, () => value)}
           onSubmit={value => void submitDraft($, value)}
         />)}
-        <Box flexDirection="row" columnGap={2} key="top-actions">
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2} key="top-actions">
           {raw.length > 0 && (
             <Button key={k('enrich-all')} plain hotkey="a" label={`Enrich ${plural(raw.length, 'new task')}`} onPress={() => void enrichAll($, raw.length)} />
           )}
