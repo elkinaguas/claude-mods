@@ -517,6 +517,16 @@ async function moveBoard($: EngineInterface): Promise<string> {
   const said: string[] = []
   if (boardDir) {
     said.push(`The board lives in ${boardDir}.`)
+    // A moved board deleted since is put back from the project's copies.
+    for (const f of [FILE, ARCHIVE]) {
+      const local = await readBoard($, f, null, await $.session.root())
+      if (local !== null && (await readBoard($, f, null, boardDir)) === null) {
+        await $.fs.write(await boardPath($, f, boardDir), local)
+        said.push(`Restored the missing ${boardDir}/${f} from the project's copy.`)
+      }
+    }
+    seen = -1
+    await load($)
   } else {
     const local = await readBoard($, FILE, null)
     const localArchive = await readBoard($, ARCHIVE, null)
@@ -547,7 +557,8 @@ async function moveBoard($: EngineInterface): Promise<string> {
   return said.join(' ')
 }
 
-// Deletes the project's TODO.md and TODO-archive.md once moved: a copy that
+// Deletes the project's TODO.md and TODO-archive.md once moved, never while
+// the moved copy is missing (it would be the only one left): a copy that
 // matches the moved one, or one untouched since the move (no newer than the
 // CLAUDE.local.md the move wrote). A copy edited since is left for the
 // person to merge. The engine's file system can't delete, so `rm` does.
@@ -562,9 +573,14 @@ async function removeLeftovers($: EngineInterface): Promise<string[]> {
   for (const f of [FILE, ARCHIVE]) {
     const local = await readBoard($, f, null, root)
     if (local === null) continue
+    const there = await readBoard($, f, null, moved)
+    if (there === null) {
+      said.push(`${moved}/${f} is missing, so the project's ${f} stays.`)
+      continue
+    }
     const since = await mtimeOf(f)
     const untouched = movedAt !== undefined && since !== undefined && since <= movedAt
-    if (!untouched && local !== (await readBoard($, f, null, moved))) {
+    if (!untouched && local !== there) {
       said.push(`The project's ${f} differs from the moved one, so it stays: merge it by hand, then delete it.`)
       continue
     }

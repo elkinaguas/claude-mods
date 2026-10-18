@@ -20,6 +20,7 @@ function project(on: On, files: Record<string, string>, { realClock = false } = 
   const links = new Set<string>()
   const dangling = new Set<string>()
   const unreadable = new Set<string>()
+  const lost = new Set<string>()
   const toasts: string[] = []
   // A missing file rejects the call with ENOENT, as the engine's file system does.
   const missing = (path: string) => ({ deny: `ENOENT: no such file, ${path}` })
@@ -45,6 +46,8 @@ function project(on: On, files: Record<string, string>, { realClock = false } = 
     return { value }
   })
   on('fs.write', (_$, e) => {
+    // A write to a `lost` path seems to succeed but keeps nothing.
+    if (lost.has(name(e.path))) return { value: undefined }
     files[name(e.path)] = e.text
     mtimes[name(e.path)] = clock++
     return { value: undefined }
@@ -95,6 +98,7 @@ function project(on: On, files: Record<string, string>, { realClock = false } = 
     links,
     dangling,
     unreadable,
+    lost,
     toasts,
     meanwhile: (fn: () => void) => {
       meanwhile = fn
@@ -785,6 +789,38 @@ test('/todo move again tidies up: deletes a leftover copy untouched since the mo
   expect(runs.filter(a => a[0] === 'rm')).toEqual([['rm', '-f', '--', '/project/TODO-archive.md']])
   expect(files['.gitignore']).toBe('CLAUDE.local.md\n')
   expect(said).toContain('CLAUDE.local.md is already in .gitignore.')
+})
+
+test('/todo move after the moved board was deleted puts it back from the project\'s copy, and never deletes the last copy', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+  const dir = '/home/me/todos/project'
+  const box: { files?: Record<string, string> } = {}
+  const runs = shell(on, () => box.files!)
+  // The project's copies predate the move; the moved ones were deleted since.
+  const { files } = project(on, { 'TODO.md': BOARD, 'TODO-archive.md': '# TODO archive\n', 'CLAUDE.local.md': LOCAL_NOTE(dir) })
+  box.files = files
+  await start($)
+  const said = String(((await run('move')($)) as { text?: string })?.text)
+  expect(said).toContain(`Restored the missing ${dir}/TODO.md from the project's copy.`)
+  expect(files[`${dir}/TODO.md`]).toBe(BOARD)
+  expect(files[`${dir}/TODO-archive.md`]).toBe('# TODO archive\n')
+  // Deleted only now that the moved copies exist again.
+  expect('TODO.md' in files).toBe(false)
+  expect(runs.filter(a => a[0] === 'rm').length).toBe(2)
+})
+
+test('cleanup never deletes a project copy whose moved copy is missing', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+  const dir = '/home/me/todos/project'
+  const box: { files?: Record<string, string> } = {}
+  const runs = shell(on, () => box.files!)
+  const { files, lost } = project(on, { 'TODO.md': BOARD, 'CLAUDE.local.md': LOCAL_NOTE(dir) })
+  box.files = files
+  // Putting the moved board back keeps nothing: it stays missing.
+  lost.add(`${dir}/TODO.md`)
+  await start($)
+  const said = String(((await run('move')($)) as { text?: string })?.text)
+  expect(files['TODO.md']).toBe(BOARD)
+  expect(runs.filter(a => a[0] === 'rm')).toEqual([])
+  expect(said).toContain(`${dir}/TODO.md is missing, so the project's TODO.md stays.`)
 })
 
 test('/todo move without the boardsDir option says to set it', async ($, on) => {

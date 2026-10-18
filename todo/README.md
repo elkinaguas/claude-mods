@@ -34,7 +34,7 @@ Done keeps itself short: when a task starts and Done holds more than 20 tasks, t
 
 ## Boards outside the project
 
-To keep every board in one folder you can back up (a git repo of its own, say), set the `boardsDir` option (`/config`, todo), e.g. `~/todos`, and run `/todo move` in a project: its `TODO.md` and `TODO-archive.md` go to `~/todos/<owner>/<repo>/` (from the git remote; the folder's name without one), and `CLAUDE.local.md` gets a note pointing Claude and the panel there. Projects you don't move keep their local board. The project's own copies are then deleted (a copy edited after the move is kept for you to merge; `/todo move` run again tidies up), and `CLAUDE.local.md` is added to the project's `.gitignore` when it has one. The mod does no git in the boards folder.
+To keep every board in one folder you can back up (a git repo of its own, say), set the `boardsDir` option (`/config`, todo), e.g. `~/todos`, and run `/todo move` in a project: its `TODO.md` and `TODO-archive.md` go to `~/todos/<owner>/<repo>/` (from the git remote; the folder's name without one), and `CLAUDE.local.md` gets a note pointing Claude and the panel there. Projects you don't move keep their local board. The project's own copies are then deleted (a copy edited after the move is kept for you to merge; `/todo move` run again tidies up, and puts back a moved board that went missing; a project copy is never deleted while its moved copy is missing), and `CLAUDE.local.md` is added to the project's `.gitignore` when it has one. The mod does no git in the boards folder.
 
 ## Safety
 
