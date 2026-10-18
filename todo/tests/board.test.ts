@@ -176,6 +176,40 @@ test('/todo enrich asks Claude to enrich only the tasks without an ID', async ($
   expect(prompts[0]).toContain('Enrich the 1 unenriched task in TODO.md')
 })
 
+test('/todo realign asks Claude to propose changes to every open task, or one, and ask first', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': BOARD })
+  expect(await run('realign')($)).toMatchObject({ text: 'Asked Claude to realign 3 open tasks.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toBe(
+    'Realign the Todo and Doing tasks in TODO.md, following the task board rules: propose the changes task by task, and ask me before writing them.',
+  )
+  expect(await run('realign t-3')($)).toMatchObject({ text: 'Asked Claude to realign T-3.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[1]).toBe('Realign T-3 in TODO.md, following the task board rules: propose the changes to its notes and ask me before writing them.')
+  // Done tasks are history: not realigned.
+  expect(await run('realign T-1')($)).toMatchObject({ text: 'No open task "T-1" in TODO.md.' })
+})
+
+test('u realigns the open task and w the whole board; neither shows on done tasks or raw ones', async ($, on) => {
+  const { ui, prompts } = await panel($, on, { 'TODO.md': BOARD })
+  await ui.press({ key: 'realign-all' })
+  expect(prompts[0]).toContain('Realign the Todo and Doing tasks')
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'realign' })
+  expect(prompts[1]).toContain('Realign T-2 in TODO.md')
+  await ui.press({ key: 'task:raw:add dark mode to settings' })
+  expect(await ui.find({ key: 'realign' })).toBeUndefined()
+  await ui.press({ key: 'done-heading' })
+  await ui.press({ key: 'task:T-1' })
+  expect(await ui.find({ key: 'realign' })).toBeUndefined()
+})
+
+test('the rules forbid realign from touching IDs, titles, Q/A and Review or Done tasks', async ($, on) => {
+  const { files } = project(on, {})
+  await run('init')($)
+  expect(files['CLAUDE.md']).toContain("Never change an ID, the engineer's title wording or a recorded Q/A, and leave Review and Done tasks alone.")
+})
+
 test('/todo archive moves Done tasks to TODO-archive.md', async ($, on) => {
   const { files } = project(on, { 'TODO.md': BOARD })
   await run('archive')($)
