@@ -257,9 +257,11 @@ let boardRefused: string | undefined
 // Set from the `boardsDir` option: the folder holding every moved board.
 let boardsDirOption = ''
 
-async function boardPath($: EngineInterface, file: string): Promise<string> {
+// `at` names the folder outright: the project's own copy of a moved board
+// file, or the boards folder while a move writes there.
+async function boardPath($: EngineInterface, file: string, at?: string): Promise<string> {
   const root = await $.session.root()
-  const dir = (file === FILE || file === ARCHIVE) && boardDir ? boardDir : root
+  const dir = at ?? ((file === FILE || file === ARCHIVE) && boardDir ? boardDir : root)
   const path = `${dir}/${file}`
   const stat = await $.fs.stat(path).catch((err: unknown) => {
     if (isMissing(err)) return null
@@ -288,25 +290,28 @@ const isInside = (path: string, root: string) =>
 // used only inside the boardsDir option's folder: a repo shipping its own
 // CLAUDE.local.md can't send the board's writes anywhere else.
 async function findBoardDir($: EngineInterface) {
-  const before = boardDir
-  boardDir = null
-  boardRefused = undefined
+  // Worked out aside and set once: a poll and a panel edit can overlap, and
+  // neither may see the project root while the folder is being re-read.
+  let dir: string | null = null
+  let refused: string | undefined
   const text = await readBoard($, LOCAL_FILE, '').catch(() => '')
   const start = text.indexOf(BOARD_START)
   const end = text.indexOf(BOARD_END, start)
   const path = start === -1 || end === -1 ? undefined : /`(\/[^`]*)\/TODO\.md`/.exec(text.slice(start, end))?.[1]
   if (path) {
     const root = await boardsRoot($)
-    if (root && isInside(path, root)) boardDir = path
-    else boardRefused = `todo: ${LOCAL_FILE} puts the board in ${path}, outside the boardsDir option's folder${root ? ` (${root})` : ' (unset)'}; set the option to use it`
+    if (root && isInside(path, root)) dir = path
+    else refused = `todo: ${LOCAL_FILE} puts the board in ${path}, outside the boardsDir option's folder${root ? ` (${root})` : ' (unset)'}; set the option to use it`
   }
-  if (boardDir !== before) seen = -1
+  if (dir !== boardDir) seen = -1
+  boardDir = dir
+  boardRefused = refused
 }
 
 // A board file's text, or `fallback` when it does not exist. Any other failure
 // throws, so a file that can't be read is never overwritten as if empty.
-async function readBoard<T>($: EngineInterface, file: string, fallback: T): Promise<string | T> {
-  const path = await boardPath($, file)
+async function readBoard<T>($: EngineInterface, file: string, fallback: T, at?: string): Promise<string | T> {
+  const path = await boardPath($, file, at)
   return $.fs.read(path).catch((err: unknown): T => {
     if (isMissing(err)) return fallback
     throw err
@@ -502,44 +507,78 @@ async function boardSlug($: EngineInterface): Promise<string> {
   return safe.length ? safe.join('/') : 'project'
 }
 
-// Moves this project's board (and archive) into the boards folder and
-// records where in CLAUDE.local.md. The old files stay: the engine can't
-// delete, so the person removes them. Returns what to tell the person.
+// Moves this project's board (and archive) into the boards folder, records
+// where in CLAUDE.local.md, then deletes the project's copies and keeps
+// CLAUDE.local.md out of git. Run again after a move, it only tidies up.
+// Returns what to tell the person.
 async function moveBoard($: EngineInterface): Promise<string> {
   const root = await boardsRoot($)
   if (!root) return 'Set the boardsDir option first (/config, todo), e.g. ~/todos.'
-  if (boardDir) return `The board already lives in ${boardDir}.`
-  const local = await readBoard($, FILE, null)
-  const localArchive = await readBoard($, ARCHIVE, null)
-  const dir = `${root}/${await boardSlug($)}`
-  boardDir = dir
-  try {
-    const there = await readBoard($, FILE, null)
+  const said: string[] = []
+  if (boardDir) {
+    said.push(`The board lives in ${boardDir}.`)
+  } else {
+    const local = await readBoard($, FILE, null)
+    const localArchive = await readBoard($, ARCHIVE, null)
+    const dir = `${root}/${await boardSlug($)}`
+    const there = await readBoard($, FILE, null, dir)
     if (there !== null && local !== null) {
-      boardDir = null
       return `${dir}/${FILE} already exists: merge the two boards by hand, then run /todo move again with one of them.`
     }
-    if (there === null) await $.fs.write(await boardPath($, FILE), local ?? TEMPLATE)
-    if (localArchive !== null && (await readBoard($, ARCHIVE, null)) === null) await $.fs.write(await boardPath($, ARCHIVE), localArchive)
-  } catch (err) {
-    boardDir = null
-    throw err
+    if (there === null) await $.fs.write(await boardPath($, FILE, dir), local ?? TEMPLATE)
+    if (localArchive !== null && (await readBoard($, ARCHIVE, null, dir)) === null) await $.fs.write(await boardPath($, ARCHIVE, dir), localArchive)
+    const note =
+      `${BOARD_START}\nThe task board for this project is \`${dir}/${FILE}\` (its archive \`${ARCHIVE}\` beside it), ` +
+      `not \`${FILE}\` at the project root. Apply the task board rules to that file.\n${BOARD_END}`
+    const text = (await readBoard($, LOCAL_FILE, null)) ?? ''
+    const start = text.indexOf(BOARD_START)
+    const end = text.indexOf(BOARD_END, start)
+    const next =
+      start !== -1 && end !== -1
+        ? text.slice(0, start) + note + text.slice(end + BOARD_END.length)
+        : `${text.trimEnd()}${text.trim() ? '\n\n' : ''}${note}\n`
+    await $.fs.write(await boardPath($, LOCAL_FILE), next)
+    seen = -1
+    await load($)
+    said.push(`Board moved to ${dir}/${FILE}; ${LOCAL_FILE} points there.`)
   }
-  const note =
-    `${BOARD_START}\nThe task board for this project is \`${dir}/${FILE}\` (its archive \`${ARCHIVE}\` beside it), ` +
-    `not \`${FILE}\` at the project root. Apply the task board rules to that file.\n${BOARD_END}`
-  const text = (await readBoard($, LOCAL_FILE, null)) ?? ''
-  const start = text.indexOf(BOARD_START)
-  const end = text.indexOf(BOARD_END, start)
-  const next =
-    start !== -1 && end !== -1
-      ? text.slice(0, start) + note + text.slice(end + BOARD_END.length)
-      : `${text.trimEnd()}${text.trim() ? '\n\n' : ''}${note}\n`
-  await $.fs.write(await boardPath($, LOCAL_FILE), next)
-  seen = -1
-  await load($)
-  const old = [local !== null && FILE, localArchive !== null && ARCHIVE].filter(Boolean).join(' and ')
-  return `Board moved to ${dir}/${FILE}; ${LOCAL_FILE} points there.${old ? ` The project's ${old} are no longer used: delete them.` : ''} Keep ${LOCAL_FILE} out of git.`
+  said.push(...(await removeLeftovers($)))
+  said.push(await ignoreLocalFile($))
+  return said.join(' ')
+}
+
+// Deletes the project's TODO.md and TODO-archive.md once moved, but only a
+// copy whose text matches the moved one: a copy edited since is left for
+// the person to merge. The engine's file system can't delete, so `rm` does.
+async function removeLeftovers($: EngineInterface): Promise<string[]> {
+  const said: string[] = []
+  const gone: string[] = []
+  const root = await $.session.root()
+  const moved = boardDir
+  if (!moved || moved === root) return said
+  for (const f of [FILE, ARCHIVE]) {
+    const local = await readBoard($, f, null, root)
+    if (local === null) continue
+    if (local !== (await readBoard($, f, null, moved))) {
+      said.push(`The project's ${f} differs from the moved one, so it stays: merge it by hand, then delete it.`)
+      continue
+    }
+    const path = await boardPath($, f, root)
+    const r = await $.process.run(['rm', '-f', '--', path], { cwd: root, timeoutMs: 5000 }).catch(() => null)
+    if (r?.exitCode === 0 && (await readBoard($, f, null, root)) === null) gone.push(f)
+    else said.push(`Could not delete the project's ${f}: delete it by hand.`)
+  }
+  return gone.length ? [`Deleted the project's ${gone.join(' and ')}.`, ...said] : said
+}
+
+// Adds CLAUDE.local.md to the project's .gitignore, when there is one: the
+// board's path is personal, never to be committed.
+async function ignoreLocalFile($: EngineInterface): Promise<string> {
+  const text = await readBoard($, '.gitignore', null).catch(() => null)
+  if (text === null) return `No .gitignore here: keep ${LOCAL_FILE} out of git.`
+  if (/^\/?CLAUDE\.local\.md\s*$/m.test(text)) return `${LOCAL_FILE} is already in .gitignore.`
+  await $.fs.write(await boardPath($, '.gitignore'), `${text.trimEnd()}${text.trim() ? '\n\n' : ''}# Personal notes: where this project's task board lives.\n${LOCAL_FILE}\n`)
+  return `Added ${LOCAL_FILE} to .gitignore.`
 }
 
 // Moves the Done tasks to the archive, all of them or all but the newest

@@ -715,26 +715,73 @@ test('n shows stats: open work per section split T/H, and a sparkline of tasks d
   expect(await ui.find({ text: /^Open:/ })).toBeUndefined()
 })
 
+// Answers `git remote get-url origin` with `remote` (no remote when
+// undefined) and `rm -f -- <path>` by deleting that file from `files`.
+function shell(on: On, files: () => Record<string, string>, remote?: string) {
+  const runs: string[][] = []
+  on('process.run', (_$, e) => {
+    runs.push([...e.argv])
+    if (e.argv[0] === 'rm') {
+      const path = e.argv[e.argv.length - 1]!
+      delete files()[path.startsWith('/project/') ? path.split('/').pop()! : path]
+      return { value: { exitCode: 0, stdout: '', stderr: '' } } as never
+    }
+    return { value: remote ? { exitCode: 0, stdout: `${remote}\n`, stderr: '' } : { exitCode: 2, stdout: '', stderr: 'no such remote' } } as never
+  })
+  return runs
+}
+
 const LOCAL_NOTE = (dir: string) =>
   `<!-- todo:board -->\nThe task board for this project is \`${dir}/TODO.md\` (its archive \`TODO-archive.md\` beside it), not \`TODO.md\` at the project root. Apply the task board rules to that file.\n<!-- todo:board-end -->`
 
 test('/todo move puts the board in the boards folder under the git remote\'s owner/repo and points CLAUDE.local.md at it', { options: { boardsDir: '~/todos' } }, async ($, on) => {
   on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: 'git@github.com:elkinaguas/claude-mods.git\n', stderr: '' } }) as never)
-  const { files } = project(on, { 'TODO.md': BOARD, 'TODO-archive.md': '# TODO archive\n', 'CLAUDE.local.md': '# Mine\n' })
+  const box: { files?: Record<string, string> } = {}
+  shell(on, () => box.files!, 'git@github.com:elkinaguas/claude-mods.git')
+  const { files } = project(on, { 'TODO.md': BOARD, 'TODO-archive.md': '# TODO archive\n', 'CLAUDE.local.md': '# Mine\n', '.gitignore': 'node_modules/\n' })
+  box.files = files
   await start($)
-  const said = await run('move')($)
+  const said = String(((await run('move')($)) as { text?: string })?.text)
   const dir = '/home/me/todos/elkinaguas/claude-mods'
-  expect(files[`${dir}/TODO.md`]).toBe(BOARD)
   expect(files[`${dir}/TODO-archive.md`]).toBe('# TODO archive\n')
   expect(files['CLAUDE.local.md']).toBe(`# Mine\n\n${LOCAL_NOTE(dir)}\n`)
-  expect(String((said as { text?: string })?.text)).toContain(`Board moved to ${dir}/TODO.md`)
+  expect(said).toContain(`Board moved to ${dir}/TODO.md`)
+  // The project's copies are gone, and CLAUDE.local.md stays out of git.
+  expect('TODO.md' in files).toBe(false)
+  expect('TODO-archive.md' in files).toBe(false)
+  expect(said).toContain("Deleted the project's TODO.md and TODO-archive.md.")
+  expect(files['.gitignore']).toBe("node_modules/\n\n# Personal notes: where this project's task board lives.\nCLAUDE.local.md\n")
+  expect(said).toContain('Added CLAUDE.local.md to .gitignore.')
   // The panel now edits the moved board, not the project's old one.
   const ui = await mount($, 'terminal')
   await ui.press({ key: 'task:T-3' })
   await ui.press({ key: 'start' })
   expect(files[`${dir}/TODO.md`]).toContain('## Doing\n\n- T-2 Fix flaky auth test\n  > Q: Mock the clock or raise the timeout?\n- T-3 Add retry')
-  expect(files['TODO.md']).toBe(BOARD)
+  expect('TODO.md' in files).toBe(false)
+})
+
+test('/todo move again tidies up: deletes a leftover copy that matches, keeps one edited since; .gitignore left alone when it has the line', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+  const dir = '/home/me/todos/project'
+  const box: { files?: Record<string, string> } = {}
+  const runs = shell(on, () => box.files!)
+  const { files } = project(on, {
+    'TODO.md': `${BOARD}- an edit made after the move\n`,
+    'TODO-archive.md': '# TODO archive\n',
+    [`${dir}/TODO.md`]: BOARD,
+    [`${dir}/TODO-archive.md`]: '# TODO archive\n',
+    'CLAUDE.local.md': LOCAL_NOTE(dir),
+    '.gitignore': 'CLAUDE.local.md\n',
+  })
+  box.files = files
+  await start($)
+  const said = String(((await run('move')($)) as { text?: string })?.text)
+  expect(said).toContain(`The board lives in ${dir}.`)
+  expect('TODO-archive.md' in files).toBe(false)
+  expect(files['TODO.md']).toContain('an edit made after the move')
+  expect(said).toContain("The project's TODO.md differs from the moved one, so it stays")
+  expect(runs.filter(a => a[0] === 'rm')).toEqual([['rm', '-f', '--', '/project/TODO-archive.md']])
+  expect(files['.gitignore']).toBe('CLAUDE.local.md\n')
+  expect(said).toContain('CLAUDE.local.md is already in .gitignore.')
 })
 
 test('/todo move without the boardsDir option says to set it', async ($, on) => {
@@ -752,10 +799,13 @@ test('a CLAUDE.local.md pointing outside the boards folder is refused, nothing r
 })
 
 test('without a remote the subfolder is the project folder\'s name', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
-  on('process.run', () => ({ value: { exitCode: 2, stdout: '', stderr: 'no such remote' } }) as never)
+  const box: { files?: Record<string, string> } = {}
+  shell(on, () => box.files!)
   const { files } = project(on, {})
+  box.files = files
   await start($)
-  await run('move')($)
+  const said = String(((await run('move')($)) as { text?: string })?.text)
+  expect(said).toContain('No .gitignore here: keep CLAUDE.local.md out of git.')
   expect(files['/home/me/todos/project/TODO.md']).toContain('## Todo')
   expect(files['CLAUDE.local.md']).toContain('`/home/me/todos/project/TODO.md`')
 })
