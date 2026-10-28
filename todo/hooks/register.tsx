@@ -67,7 +67,7 @@ ${RULES_HEADING}
 - **The engineer's tasks.** An \`H-\` task is the engineer's: never start, work on or log it; they move it through the board themselves, and it skips Review.
 - **Review.** When a task is finished, move it to the end of \`## Review\` (adding that heading before \`## Done\` if missing) and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets. The engineer reviews it: they move it to Done, or back to Doing with a \`> Review: ...\` note saying what to fix; fix that, then move it to Review again with the log updated.
 - **Done.** A reviewed task sits at the top of \`## Done\` with the date appended to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), its log kept. Move a task to Done yourself only when the engineer asks.
-- **Long run.** When asked to run the board, orchestrate it: work the ready tasks one at a time, without waiting for the engineer between them, until none is ready. A task is ready when it is a \`T-\` task in \`## Todo\` with no open question and nothing in its Depends still in Todo or Doing; take them in board order. Only you, the orchestrator, edit the board: move each task to Doing, hand it to a worker subagent in its own git worktree on the branch \`todo/T-<n>\` (branched from the branch of a Review task it depends on), and write its Review log from the worker's report, naming the branch and commits. Commit on that branch; never push or merge. Fix drifted \`file:line\` references and Depends yourself and say so in the log; a change of scope, a task that looks obsolete or a split goes to the engineer as a \`> Q:\`. When a decision is the engineer's, or a task runs past its time cap (the task panel then refuses its worker's tool calls, so the worker reports back), park it: write the \`> Q:\` under it (for the cap, where it got stuck), move it back to the top of \`## Todo\`, tell the engineer, and go on with the next ready task; it is ready again once a \`> A:\` answers it. When a Review task comes back with a \`> Review:\` note, add \`> Recheck: built on T-<n>, sent back from review\` to each open or Review task that depends on it. When none is ready, stop and list what waits on the engineer; the task panel wakes you once one is.
+- **Long run.** When asked to run the board, orchestrate it: keep up to the given number of workers busy on ready tasks, without waiting for the engineer between them, until none is ready. A task is ready when it is a \`T-\` task in \`## Todo\` with no open question and nothing in its Depends still in Todo or Doing; take them in board order, and run two side by side only when their notes point at different files. Only you, the orchestrator, edit the board. All of a run's work goes on its run branch (the name the prompt gives), made from main, or from the newest run branch whose tasks are still in Review; never check it out in the engineer's folder, never push it or merge it. For each task: move it to Doing, add a git worktree on a branch \`todo/T-<n>\` from the run branch's tip, set it up so the tests run (install dependencies, copy the untracked files the project needs, such as \`.env\`), and hand the task to a worker subagent in that folder, with a description starting with the task's ID. The worker leaves one commit, \`T-<n> <title>\`. When it reports back, rebase that commit onto the run branch, run the tests, and fast-forward the run branch to it (\`git push . HEAD:<run branch>\` from the worktree); resolve a mechanical conflict yourself, otherwise hand the task to a worker again on the new tip. Then remove the worktree and the \`todo/T-<n>\` branch, and write the task's Review log from the worker's report, naming the run branch and the commit. Fix drifted \`file:line\` references and Depends yourself and say so in the log; a change of scope, a task that looks obsolete or a split goes to the engineer as a \`> Q:\`. When a decision is the engineer's, or a task runs past its time cap (the task panel then refuses its worker's tool calls, so the worker reports back), park it: write the \`> Q:\` under it (for the cap, where it got stuck), remove its worktree, move it back to the top of \`## Todo\`, tell the engineer, and go on; it is ready again once a \`> A:\` answers it. When a Review task comes back with a \`> Review:\` note, fix it with a new commit on the run branch, and add \`> Recheck: built on T-<n>, sent back from review\` to each open or Review task that depends on it. When none is ready and no worker is busy, stop and list what waits on the engineer; the task panel wakes you once a task is ready.
 - **Format.** A task is a line \`- T-<n> <title>\` or \`- H-<n> <title>\` (\`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
 ${MARK_END}`
 
@@ -390,9 +390,8 @@ async function load($: EngineInterface) {
   await showStatus($)
 }
 
-// The status line: the task in Doing, and during a long run its minutes
-// against the cap and how many tasks wait on the engineer. Set only when it
-// changes (the run's minutes tick from the poll).
+// The status line: the task in Doing, and during a long run how many workers
+// are busy and how many tasks wait on the engineer. Set only when it changes.
 let lastStatus: string | undefined
 async function showStatus($: EngineInterface) {
   const tasks = parse((await read($, fileAtom)).text)
@@ -401,9 +400,8 @@ async function showStatus($: EngineInterface) {
   const first = doing[0]
   let text = first ? `▸ ${first.id ? `${first.id} ` : ''}${first.title}${doing.length > 1 ? ` (+${doing.length - 1})` : ''}` : undefined
   if (run) {
-    const waiting = tasks.filter(t => t.section === 'todo' && t.id && !isHuman(t) && t.question).length
-    const minutes = run.task ? Math.floor(((await $.clock.now()) - run.task.since) / 60_000) : null
-    const parts = [minutes === null ? 'idle' : `${minutes}/${runTaskMinutes} min`, ...(waiting ? [`${waiting} wait on you`] : [])]
+    const waiting = parked(tasks).length
+    const parts = [run.tasks.length ? `${run.tasks.length}/${runWorkers} workers` : 'idle', ...(waiting ? [`${waiting} wait on you`] : [])]
     text = `${text ? `${text} · ` : ''}run: ${parts.join(' · ')}`
   }
   if (text === lastStatus) return
@@ -679,29 +677,55 @@ function realign($: EngineInterface, t?: Task) {
   )
 }
 
-// Set from the `runTaskMinutes` option: the time cap per task in a long run.
+// Set from the `runTaskMinutes` and `runWorkers` options: the time cap per
+// task in a long run, and how many workers it keeps busy at once.
 let runTaskMinutes = 60
+let runWorkers = 2
 
 // T- tasks in Todo with no open question and no dep still in Todo or Doing
-// (a dep in Review counts as met: the run branches from it).
+// (a dep in Review counts as met: it is on the run branch already).
 const readyTasks = (tasks: Task[]) =>
   tasks.filter(
     t => t.section === 'todo' && t.id && !isHuman(t) && !t.question && !t.deps.some(d => tasks.some(o => o.id === d && (o.section === 'todo' || o.section === 'doing'))),
   )
+// T- tasks in Todo waiting on an answer: parked.
+const parked = (tasks: Task[]) => tasks.filter(t => t.section === 'todo' && t.id && !isHuman(t) && t.question)
+// The T- tasks a run has in Doing: each one a worker's.
+const running = (tasks: Task[]) => tasks.filter(t => t.section === 'doing' && t.id && !isHuman(t))
 
-const NO_RUN: RunState = { task: null, overCap: null, review: [], asked: [], prompted: false, idleNotified: false }
+// What the board looked like when the run last woke Claude: it wakes again
+// only once this changes, so a wake that started nothing isn't repeated. A
+// ready task counts its answers: one parked again and answered again is new.
+const answers = (t: Task) => t.notes.filter(n => /^A:/i.test(n)).length
+const boardShape = (tasks: Task[]) =>
+  [running(tasks).map(t => t.id), readyTasks(tasks).map(t => `${t.id}:${answers(t)}`), tasks.filter(t => t.section === 'review').map(t => t.id)]
+    .map(ids => ids.join(','))
+    .join('|')
 
-// Asks Claude to orchestrate the board: the ready tasks one after another,
-// following the Long run rule, until none is ready. The run stays on until
-// stopped; runTick wakes Claude again whenever it is idle and a task is ready.
+// A new run's branch: run/<local date>-<hhmm>.
+const runBranch = () => {
+  const d = new Date()
+  return `run/${today()}-${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+// Asks Claude to orchestrate the board: up to runWorkers workers on the ready
+// tasks, following the Long run rule, all on one run branch. The run stays on
+// until stopped; runTick wakes Claude again when it is idle and a worker is free.
 async function runBoard($: EngineInterface, ready: Task[]) {
-  const tasks = parse((await read($, fileAtom)).text)
-  await update($, runAtom, run => ({ ...(run ?? { ...NO_RUN, ...seenNow(tasks) }), prompted: true, idleNotified: false }))
+  const tasks = parse(await current($))
+  const run = await update($, runAtom, r => ({
+    ...(r ?? { branch: runBranch(), tasks: [], workers: [], overCap: [], prompted: false, idleNotified: false, wokeAt: null, ...seenNow(tasks) }),
+    prompted: true,
+    idleNotified: false,
+    wokeAt: boardShape(tasks),
+  }))
   await autoArchive($)
+  const busy = running(tasks).map(t => t.id)
   await ask(
     $,
-    `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): work the ready tasks one at a time without waiting for me between them, ` +
-      `with a time cap of ${plural(runTaskMinutes, 'minute')} per task. Ready now, in board order: ${ready.map(t => t.id).join(', ')}.`,
+    `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): run branch ${run!.branch}, up to ${plural(runWorkers, 'worker')} at a time, ` +
+      `a time cap of ${plural(runTaskMinutes, 'minute')} per task; don't wait for me between tasks. Ready now, in board order: ${ready.map(t => t.id).join(', ')}.` +
+      (busy.length ? ` Already running: ${busy.join(', ')}.` : ''),
   )
 }
 
@@ -710,11 +734,10 @@ async function stopRun($: EngineInterface) {
   await showStatus($)
 }
 
-// What the run compares against to notify: the IDs in Review, and the T- tasks
-// in Todo with an open question (parked).
+// What the run compares against to notify: the IDs in Review, and the parked tasks.
 const seenNow = (tasks: Task[]) => ({
   review: tasks.filter(t => t.section === 'review' && t.id).map(t => t.id!),
-  asked: tasks.filter(t => t.section === 'todo' && t.id && !isHuman(t) && t.question).map(t => t.id!),
+  asked: parked(tasks).map(t => t.id!),
 })
 
 // Whether the main loop is in a turn: set by turn.start / turn.complete.
@@ -723,29 +746,32 @@ let mainBusy = false
 const notify = ($: EngineInterface, text: string) =>
   $.ui.notify(text, { title: 'todo: long run' }).catch((err: unknown) => $.ui.log(`todo: notification not sent: ${String(err)}`))
 
-// Each poll during a run: times the task in Doing (past the cap, workers'
+// Each poll during a run: times each task in Doing (past the cap, its worker's
 // tool calls are refused), notifies on a task reaching Review, a task parked
-// with a question and the run going idle, and wakes Claude when it is idle,
-// nothing is in Doing and a task is ready.
+// with a question and the run going idle, and wakes Claude when it is idle, a
+// worker is free, a task is ready and the board changed since the last wake.
 async function runTick($: EngineInterface) {
   const run = await read($, runAtom)
   if (!run) return
   const tasks = parse((await read($, fileAtom)).text)
   const now = await $.clock.now()
-  const cur = tasks.find(t => t.section === 'doing' && t.id && !isHuman(t))
-  const task = cur ? (run.task?.id === cur.id ? run.task : { id: cur.id!, since: now }) : null
-  const overCap = task && now - task.since >= runTaskMinutes * 60_000 ? task.id : null
+  const busy = running(tasks)
+  const timed = busy.map(t => run.tasks.find(o => o.id === t.id) ?? { id: t.id!, since: now })
+  const overCap = timed.filter(t => now - t.since >= runTaskMinutes * 60_000).map(t => t.id)
+  // A worker whose task left Doing is done.
+  const workers = run.workers.filter(w => busy.some(t => t.id === w.id))
   const seen = seenNow(tasks)
   for (const id of seen.review.filter(id => !run.review.includes(id))) void notify($, `${id} is ready for your review.`)
   for (const id of seen.asked.filter(id => !run.asked.includes(id))) void notify($, `${id} is parked: it has a question for you.`)
   const ready = readyTasks(tasks)
-  const wake = !mainBusy && !run.prompted && !cur && ready.length > 0
-  const idle = !mainBusy && !run.prompted && !cur && ready.length === 0
+  const quiet = !mainBusy && !run.prompted
+  const wake = quiet && busy.length < runWorkers && ready.length > 0 && boardShape(tasks) !== run.wokeAt
+  const idle = quiet && busy.length === 0 && ready.length === 0
   if (idle && !run.idleNotified) {
     void notify($, seen.asked.length ? `Run idle: nothing ready. Waiting on you: ${seen.asked.join(', ')}.` : 'Run idle: nothing ready.')
   }
   // A run stopped meanwhile stays stopped.
-  const left = await update($, runAtom, r => r && { ...r, ...seen, task, overCap, idleNotified: idle ? true : wake ? false : r.idleNotified })
+  const left = await update($, runAtom, r => r && { ...r, ...seen, tasks: timed, workers, overCap, idleNotified: idle ? true : wake ? false : r.idleNotified })
   if (wake && left) await runBoard($, ready)
   await showStatus($)
 }
@@ -1301,6 +1327,7 @@ export const register: Register = (on, options) => {
   if (typeof options.autoArchive === 'number') autoArchiveOver = options.autoArchive
   if (typeof options.boardsDir === 'string') boardsDirOption = options.boardsDir
   runTaskMinutes = typeof options.runTaskMinutes === 'number' && options.runTaskMinutes > 0 ? options.runTaskMinutes : 60
+  runWorkers = typeof options.runWorkers === 'number' && options.runWorkers >= 1 ? Math.floor(options.runWorkers) : 2
   // /resume (and /clear) swaps the session's state, empty or an old snapshot,
   // without loading the mod again: forget what the module saw, so the next
   // poll reads the board into the new session.
@@ -1324,10 +1351,24 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // Past the time cap, a worker (any subagent) is stopped: its tool calls are
-  // refused so it reports back, and the orchestrator parks the task.
+  // A worker is a subagent whose description starts with its task's ID: the
+  // run notes which agent works which task, to time it and stop it.
+  on('agent.spawn', async ($, e, next) => {
+    const result = await next(e)
+    const id = /^(T-\d{1,6})\b/.exec(e.description)?.[1]
+    if (id && result.agentId && (await read($, runAtom))) {
+      const agentId = result.agentId
+      await update($, runAtom, r => r && { ...r, workers: [...r.workers.filter(w => w.agentId !== agentId), { agentId, id }] })
+    }
+    return result
+  })
+
+  // Past the time cap, that task's worker is stopped: its tool calls are
+  // refused so it reports back, and the orchestrator parks the task. Other
+  // subagents, and the orchestrator itself, are never refused.
   on('tool.call', async ($, e, next) => {
-    const id = e.agentId ? (await read($, runAtom))?.overCap : null
+    const run = e.agentId ? await read($, runAtom) : null
+    const id = run?.workers.find(w => w.agentId === e.agentId && run.overCap.includes(w.id))?.id
     if (!id) return next(e)
     return { deny: `todo: ${id} is past its ${plural(runTaskMinutes, 'minute')} cap in the long run. Stop, and report back where you got stuck.` }
   })
@@ -1462,6 +1503,8 @@ export const register: Register = (on, options) => {
     const raw = tasks.filter(t => !t.id && t.section !== 'done')
     const ready = readyTasks(tasks)
     const run = await read($, runAtom)
+    const now = run ? await $.clock.now() : 0
+    const waiting = parked(tasks)
     const peers = (t: Task) => by(t.section)
     // `v` shows all tasks, only Claude's (T-) or only the engineer's (H-);
     // tasks without an ID yet show in every view. The graph shows them all.
@@ -1778,6 +1821,22 @@ export const register: Register = (on, options) => {
             <Button key={k('start-marked')} plain hotkey="g" label={`Start ${marked.length} marked`} onPress={() => void startBatch($, marked)} />
           )}
         </Box>
+        {run && (
+          <Box flexDirection="column" key="run-status">
+            <Text>
+              <Text bold color="blue">Run</Text> <Text dimColor>{run.branch} · {run.tasks.length}/{runWorkers} workers</Text>
+            </Text>
+            {run.tasks.map(rt => (
+              <Text key={`run:${rt.id}`}>
+                {'  ▸ '}{rt.id} <Text dimColor>{Math.floor((now - rt.since) / 60_000)}/{runTaskMinutes} min</Text>
+                {run.overCap.includes(rt.id) && <Text color="red"> past the cap</Text>}
+              </Text>
+            ))}
+            {waiting.length > 0 && <Text color="yellow">  ? waiting on you: {waiting.map(t => t.id).join(', ')}</Text>}
+            {review.length > 0 && <Text dimColor>  {review.length} in Review</Text>}
+            {run.tasks.length === 0 && waiting.length === 0 && ready.length === 0 && <Text dimColor>  idle: nothing ready</Text>}
+          </Box>
+        )}
         <Text> </Text>
         {heading('doing', shown(doing).length)}
         {shown(doing).map(row)}

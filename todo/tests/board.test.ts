@@ -68,6 +68,7 @@ function project(on: On, files: Record<string, string>, { realClock = false } = 
   if (!realClock) {
     on('clock.every', () => ({ value: undefined }))
     on('clock.after', () => ({ value: undefined }))
+    on('clock.now', () => ({ value: 0 }))
   }
   on('ui.log', () => ({ value: undefined }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -259,9 +260,8 @@ test('/todo run asks Claude to orchestrate the ready tasks: T- in Todo, no open 
   const { prompts } = project(on, { 'TODO.md': board })
   expect(await run('run')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks.' })
   await new Promise<void>(resolve => setTimeout(resolve, 20))
-  expect(prompts[0]).toBe(
-    'Run the board in TODO.md in long-running mode, following the task board rules (Long run): work the ready tasks one at a time without waiting for me between them, ' +
-      'with a time cap of 60 minutes per task. Ready now, in board order: T-5, T-9.',
+  expect(prompts[0]).toMatch(
+    /^Run the board in TODO\.md in long-running mode, following the task board rules \(Long run\): run branch run\/\d{4}-\d{2}-\d{2}-\d{4}, up to 2 workers at a time, a time cap of 60 minutes per task; don't wait for me between tasks\. Ready now, in board order: T-5, T-9\. Already running: T-2\.$/,
   )
 })
 
@@ -281,9 +281,10 @@ const RUN_BOARD = `# TODO
 
 ## Todo
 
-- T-3 Add retry to upload client
-- T-4 Then the docs
+- T-3 Add slugify
+- T-4 Then truncate
   > Depends: T-3
+- T-5 Add wordCount
 
 ## Doing
 
@@ -295,76 +296,105 @@ const turn = ($: Engine, kind: 'start' | 'complete', agentId?: string) =>
   kind === 'start'
     ? $.turn.start({ text: '', turnId: 't', ...(agentId ? { agentId } : {}) } as never)
     : $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 't', ...(agentId ? { agentId } : {}) } as never)
+const spawn = ($: Engine, description: string) =>
+  $.agent.spawn({ tool_use_id: 'u', prompt: 'do it', description, subagentType: 'general-purpose', parentModel: 'm', background: true, fork: false } as never)
+// The board with each task's section and notes given.
+const runBoardWith = (todo: string, doing = '', review = '') =>
+  `# TODO\n\n## Todo\n\n${todo}\n## Doing\n\n${doing}\n## Review\n\n${review}\n## Done\n`
 
-test('a long run times the task in Doing, stops its worker past the cap, notifies, and wakes Claude when idle', { options: { runTaskMinutes: 1 } }, async ($, on) => {
+test('a long run keeps two workers busy, stops only the one past its cap, notifies, and wakes Claude once per change', { options: { runTaskMinutes: 1 } }, async ($, on) => {
   const clock = mock.clock(on)
   on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
   on('turn.complete', () => ({ text: '' }) as never)
   on('tool.call', () => ({ result: 'ran' }) as never)
+  on('agent.spawn', (_$, e) => ({ model: 'm', agentId: e.description.startsWith('T-') ? `w${e.description.slice(2, 3)}` : 'x1' }) as never)
   const { prompts, notes, statuses, writeOutside } = project(on, { 'TODO.md': RUN_BOARD }, { realClock: true })
   await start($)
   await clock.advance(1600)
   await run('run')($)
   await clock.advance(10)
   expect(prompts).toHaveLength(1)
-  expect(prompts[0]).toContain('Ready now, in board order: T-3.')
-  // Claude takes it up: T-3 to Doing, a worker runs.
+  expect(prompts[0]).toContain('up to 2 workers at a time')
+  expect(prompts[0]).toContain('Ready now, in board order: T-3, T-5.')
+  const branch = /run branch (run\/\S+),/.exec(prompts[0]!)![1]
+  // Claude starts T-3, then T-5 half a minute later, each with a worker; and an unrelated subagent.
   await turn($, 'start')
-  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '').replace('## Doing\n', '## Doing\n\n- T-3 Add retry to upload client\n'))
+  writeOutside('TODO.md', runBoardWith('- T-4 Then truncate\n  > Depends: T-3\n- T-5 Add wordCount\n', '- T-3 Add slugify\n'))
+  await spawn($, 'T-3 Add slugify')
+  await spawn($, 'Explore the helpers')
+  await clock.advance(30_000)
+  writeOutside('TODO.md', runBoardWith('- T-4 Then truncate\n  > Depends: T-3\n', '- T-3 Add slugify\n- T-5 Add wordCount\n'))
+  await spawn($, 'T-5 Add wordCount')
   await clock.advance(1600)
-  expect(statuses.at(-1)).toBe('▸ T-3 Add retry to upload client · run: 0/1 min')
-  expect(await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'w1' } as never)).toMatchObject({ result: 'ran' })
-  await clock.advance(60_000)
-  expect(statuses.at(-1)).toBe('▸ T-3 Add retry to upload client · run: 1/1 min')
-  // Past the cap the worker is refused; the orchestrator (main loop) is not.
-  expect(await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'w1' } as never)).toMatchObject({
+  expect(statuses.at(-1)).toBe('▸ T-3 Add slugify (+1) · run: 2/2 workers')
+  await clock.advance(30_000)
+  // T-3 is past its cap: its worker is refused; T-5's, the other subagent and the orchestrator are not.
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'w3' } as never)).toMatchObject({
     deny: 'todo: T-3 is past its 1 minute cap in the long run. Stop, and report back where you got stuck.',
   })
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'w5' } as never)).toMatchObject({ result: 'ran' })
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'x1' } as never)).toMatchObject({ result: 'ran' })
   expect(await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).toMatchObject({ result: 'ran' })
-  // Claude parks it with a question; no prompt while its turn runs.
-  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '- T-3 Add retry to upload client\n  > Q: Stuck on the mock server: which one?\n'))
+  // T-3 parked, T-5 still running: no wake (T-4 waits on T-3).
+  writeOutside('TODO.md', runBoardWith('- T-3 Add slugify\n  > Q: Which library?\n- T-4 Then truncate\n  > Depends: T-3\n', '- T-5 Add wordCount\n'))
+  await turn($, 'complete')
   await clock.advance(1600)
   expect(notes).toEqual(['T-3 is parked: it has a question for you.'])
   expect(prompts).toHaveLength(1)
-  await turn($, 'complete')
+  // T-5 lands in Review: notified, and the run goes idle.
+  writeOutside('TODO.md', runBoardWith('- T-3 Add slugify\n  > Q: Which library?\n- T-4 Then truncate\n  > Depends: T-3\n', '', '- T-5 Add wordCount\n'))
   await clock.advance(1600)
-  expect(notes.at(-1)).toBe('Run idle: nothing ready. Waiting on you: T-3.')
+  expect(notes.slice(1)).toEqual(['T-5 is ready for your review.', 'Run idle: nothing ready. Waiting on you: T-3.'])
   expect(statuses.at(-1)).toBe('run: idle · 1 wait on you')
-  await clock.advance(1600)
-  expect(notes).toHaveLength(2)
-  // The answer makes T-3 ready: the mod wakes Claude, once.
-  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '- T-3 Add retry to upload client\n  > Q: Stuck on the mock server: which one?\n  > A: msw.\n'))
+  // The answer makes T-3 ready: one wake, on the same branch.
+  writeOutside('TODO.md', runBoardWith('- T-3 Add slugify\n  > Q: Which library?\n  > A: None.\n- T-4 Then truncate\n  > Depends: T-3\n', '', '- T-5 Add wordCount\n'))
   await clock.advance(1600)
   await clock.advance(1600)
   expect(prompts).toHaveLength(2)
+  expect(prompts[1]).toContain(`run branch ${branch},`)
   expect(prompts[1]).toContain('Ready now, in board order: T-3.')
-  // It lands in Review: a notification.
+  // A turn that starts nothing doesn't bring another wake until the board changes.
   await turn($, 'start')
-  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '').replace('## Review\n', '## Review\n\n- T-3 Add retry to upload client\n'))
+  await turn($, 'complete')
   await clock.advance(1600)
-  expect(notes.at(-1)).toBe('T-3 is ready for your review.')
+  expect(prompts).toHaveLength(2)
+  // Claude parks T-3 again with a follow-up; its answer brings the same ready
+  // tasks back, and still wakes Claude.
+  await turn($, 'start')
+  writeOutside('TODO.md', runBoardWith('- T-3 Add slugify\n  > Q: Which library?\n  > A: None.\n  > Q: None at all?\n- T-4 Then truncate\n  > Depends: T-3\n', '', '- T-5 Add wordCount\n'))
+  await turn($, 'complete')
+  await clock.advance(1600)
+  writeOutside('TODO.md', runBoardWith('- T-3 Add slugify\n  > Q: Which library?\n  > A: None.\n  > Q: None at all?\n  > A: None at all.\n- T-4 Then truncate\n  > Depends: T-3\n', '', '- T-5 Add wordCount\n'))
+  await clock.advance(1600)
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(3)
+  expect(prompts[2]).toContain('Ready now, in board order: T-3.')
   // Stopped: no more wakes, the status drops the run.
   await run('run stop')($)
-  await turn($, 'complete')
+  writeOutside('TODO.md', runBoardWith('- T-3 Add slugify\n  > Q: Which library?\n  > A: None.\n- T-4 Then truncate\n  > Depends: T-3\n- T-6 New\n', '', '- T-5 Add wordCount\n'))
   await clock.advance(1600)
-  expect(prompts).toHaveLength(2)
+  expect(prompts).toHaveLength(3)
   expect(statuses.at(-1)).toBeUndefined()
 })
 
-test('p shows Stop run while a run is on; /todo run stop says when there is none', async ($, on) => {
+test('p shows Stop run and the run block while a run is on; /todo run stop says when there is none', async ($, on) => {
   const { ui } = await panel($, on, { 'TODO.md': BOARD })
   expect(await run('run stop')($)).toMatchObject({ text: 'No run to stop.' })
+  expect(await ui.find({ key: 'run-status' })).toBeUndefined()
   await ui.press({ key: 'run-board' })
+  expect(await ui.find({ key: 'run-status' })).toBeDefined()
   await ui.press({ key: 'stop-run' })
   expect(await ui.find({ key: 'stop-run' })).toBeUndefined()
+  expect(await ui.find({ key: 'run-status' })).toBeUndefined()
   expect(await ui.find({ key: 'run-board' })).toBeDefined()
 })
 
-test('the rules keep a long run on branches and park what needs the engineer', async ($, on) => {
+test('the rules keep a long run on one run branch, workers in worktrees, and park what needs the engineer', async ($, on) => {
   const { files } = project(on, {})
   await run('init')($)
   expect(files['CLAUDE.md']).toContain('**Long run.**')
-  expect(files['CLAUDE.md']).toContain('Commit on that branch; never push or merge.')
+  expect(files['CLAUDE.md']).toContain('never check it out in the engineer\'s folder, never push it or merge it')
+  expect(files['CLAUDE.md']).toContain('add a git worktree on a branch `todo/T-<n>` from the run branch\'s tip')
   expect(files['CLAUDE.md']).toContain('it is ready again once a `> A:` answers it')
 })
 
