@@ -220,6 +220,60 @@ test('the rules forbid realign from touching IDs, titles, Q/A and Review or Done
   expect(files['CLAUDE.md']).toContain("Never change an ID, the engineer's title wording or a recorded Q/A, and leave Review and Done tasks alone.")
 })
 
+test('/todo run asks Claude to orchestrate the ready tasks: T- in Todo, no open question, deps out of Todo and Doing', async ($, on) => {
+  const board = `# TODO
+
+## Todo
+
+- T-4 Waits on Doing
+  > Depends: T-2
+- T-5 Waits on Review
+  > Depends: T-6
+- T-7 Has a question
+  > Q: Which API?
+- H-8 Call the vendor
+- T-9 Ready
+- raw task
+
+## Doing
+
+- T-2 Fix flaky auth test
+
+## Review
+
+- T-6 Reviewed soon
+
+## Done
+`
+  const { prompts } = project(on, { 'TODO.md': board })
+  expect(await run('run')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toBe(
+    'Run the board in TODO.md in long-running mode, following the task board rules (Long run): work the ready tasks one at a time without waiting for me between them, ' +
+      'with a time cap of 60 minutes per task. Ready now, in board order: T-5, T-9.',
+  )
+})
+
+test('p runs the board from the panel', async ($, on) => {
+  const { ui, prompts } = await panel($, on, { 'TODO.md': BOARD })
+  await ui.press({ key: 'run-board' })
+  expect(prompts[0]).toContain('Ready now, in board order: T-3.')
+})
+
+test('with nothing ready, /todo run says why and the panel shows no Run board', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': '# TODO\n\n## Todo\n\n- T-3 Asked\n  > Q: How?\n\n## Doing\n\n## Done\n' })
+  expect(await ui.find({ key: 'run-board' })).toBeUndefined()
+  expect(await run('run')($)).toMatchObject({ text: 'No ready tasks to run: every T- task in Todo has an open question or waits on another.' })
+})
+
+test('the rules keep a long run on branches and park what needs the engineer', async ($, on) => {
+  const { files } = project(on, {})
+  await run('init')($)
+  expect(files['CLAUDE.md']).toContain('**Long run.**')
+  expect(files['CLAUDE.md']).toContain('Commit on that branch; never push or merge.')
+  expect(files['CLAUDE.md']).toContain('it is ready again once a `> A:` answers it')
+})
+
 test('/todo archive moves Done tasks to TODO-archive.md', async ($, on) => {
   const { files } = project(on, { 'TODO.md': BOARD })
   await run('archive')($)

@@ -66,6 +66,7 @@ ${RULES_HEADING}
 - **The engineer's tasks.** An \`H-\` task is the engineer's: never start, work on or log it; they move it through the board themselves, and it skips Review.
 - **Review.** When a task is finished, move it to the end of \`## Review\` (adding that heading before \`## Done\` if missing) and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets. The engineer reviews it: they move it to Done, or back to Doing with a \`> Review: ...\` note saying what to fix; fix that, then move it to Review again with the log updated.
 - **Done.** A reviewed task sits at the top of \`## Done\` with the date appended to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), its log kept. Move a task to Done yourself only when the engineer asks.
+- **Long run.** When asked to run the board, orchestrate it: work the ready tasks one at a time, without waiting for the engineer between them, until none is ready. A task is ready when it is a \`T-\` task in \`## Todo\` with no open question and nothing in its Depends still in Todo or Doing; take them in board order. Only you, the orchestrator, edit the board: move each task to Doing, hand it to a worker subagent in its own git worktree on the branch \`todo/T-<n>\` (branched from the branch of a Review task it depends on), and write its Review log from the worker's report, naming the branch and commits. Commit on that branch; never push or merge. Fix drifted \`file:line\` references and Depends yourself and say so in the log; a change of scope, a task that looks obsolete or a split goes to the engineer as a \`> Q:\`. When a decision is the engineer's, or a task runs past its time cap, park it: write the \`> Q:\` under it (for the cap, where it got stuck), move it back to the top of \`## Todo\`, tell the engineer, and go on with the next ready task; it is ready again once a \`> A:\` answers it. When a Review task comes back with a \`> Review:\` note, add \`> Recheck: built on T-<n>, sent back from review\` to each open or Review task that depends on it. When none is ready, stop and list what waits on the engineer.
 - **Format.** A task is a line \`- T-<n> <title>\` or \`- H-<n> <title>\` (\`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
 ${MARK_END}`
 
@@ -660,6 +661,27 @@ function realign($: EngineInterface, t?: Task) {
   )
 }
 
+// Set from the `runTaskMinutes` option: the time cap per task in a long run.
+let runTaskMinutes = 60
+
+// T- tasks in Todo with no open question and no dep still in Todo or Doing
+// (a dep in Review counts as met: the run branches from it).
+const readyTasks = (tasks: Task[]) =>
+  tasks.filter(
+    t => t.section === 'todo' && t.id && !isHuman(t) && !t.question && !t.deps.some(d => tasks.some(o => o.id === d && (o.section === 'todo' || o.section === 'doing'))),
+  )
+
+// Asks Claude to orchestrate the board: the ready tasks one after another,
+// following the Long run rule, until none is ready.
+async function runBoard($: EngineInterface, ready: Task[]) {
+  await autoArchive($)
+  await ask(
+    $,
+    `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): work the ready tasks one at a time without waiting for me between them, ` +
+      `with a time cap of ${plural(runTaskMinutes, 'minute')} per task. Ready now, in board order: ${ready.map(t => t.id).join(', ')}.`,
+  )
+}
+
 function enrichAll($: EngineInterface, n: number) {
   return ask(
     $,
@@ -1208,6 +1230,7 @@ const unmetDeps = (t: Task, tasks: Task[]) => t.deps.filter(d => tasks.some(o =>
 export const register: Register = (on, options) => {
   if (typeof options.autoArchive === 'number') autoArchiveOver = options.autoArchive
   if (typeof options.boardsDir === 'string') boardsDirOption = options.boardsDir
+  if (typeof options.runTaskMinutes === 'number' && options.runTaskMinutes > 0) runTaskMinutes = options.runTaskMinutes
   // /resume (and /clear) swaps the session's state, empty or an old snapshot,
   // without loading the mod again: forget what the module saw, so the next
   // poll reads the board into the new session.
@@ -1220,7 +1243,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: 'Task board: /todo opens the panel, /todo <task> adds one, /todo init | enrich | realign [T-n] | archive | move | close',
+      description: 'Task board: /todo opens the panel, /todo <task> adds one, /todo init | enrich | realign [T-n] | run | archive | move | close',
     }).catch((err: unknown) => $.ui.log(`todo: /${COMMAND} not registered: ${String(err)}`))
     await load($).catch(() => {})
     $.clock.every(POLL_MS, () => void load($).catch(() => {}))
@@ -1252,6 +1275,12 @@ export const register: Register = (on, options) => {
       if (!id && open.length === 0) return { text: 'No open tasks to realign.' }
       $.clock.after(0, () => void realign($, t))
       return { text: t ? `Asked Claude to realign ${t.id}.` : `Asked Claude to realign ${plural(open.length, 'open task')}.` }
+    }
+    if (word === 'run') {
+      const ready = readyTasks(parse(await current($)))
+      if (ready.length === 0) return { text: 'No ready tasks to run: every T- task in Todo has an open question or waits on another.' }
+      $.clock.after(0, () => void runBoard($, ready))
+      return { text: `Asked Claude to run the board: ${plural(ready.length, 'ready task')}.` }
     }
     if (word === 'close') {
       const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
@@ -1334,6 +1363,7 @@ export const register: Register = (on, options) => {
     const by = (s: Section) => tasks.filter(t => t.section === s)
     const [todo, doing, review, done] = [by('todo'), by('doing'), by('review'), by('done')]
     const raw = tasks.filter(t => !t.id && t.section !== 'done')
+    const ready = readyTasks(tasks)
     const peers = (t: Task) => by(t.section)
     // `v` shows all tasks, only Claude's (T-) or only the engineer's (H-);
     // tasks without an ID yet show in every view. The graph shows them all.
@@ -1639,6 +1669,9 @@ export const register: Register = (on, options) => {
           )}
           {todo.length + doing.length > 0 && (
             <Button key={k('realign-all')} plain hotkey="w" label="Realign all" onPress={() => void realign($)} />
+          )}
+          {ready.length > 0 && (
+            <Button key={k('run-board')} plain hotkey="p" label={`Run board (${ready.length} ready)`} onPress={() => void runBoard($, ready)} />
           )}
           <Button key={k('stats')} plain hotkey="n" label={`Stats ${statsOpen ? '▾' : '▸'}`} onPress={() => void setFlag($, 'statsOpen', !statsOpen)} />
           {marked.length > 0 && (
