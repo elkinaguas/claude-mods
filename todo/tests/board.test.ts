@@ -377,7 +377,7 @@ test('a long run keeps two workers busy, stops only the one past its cap, notifi
   expect(statuses.at(-1)).toBeUndefined()
 })
 
-test('a long run outlives its session: a new one picks it up on the same branch, and only stop forgets it', async ($, on) => {
+test('a long run outlives its session: a new one picks it up on the same branch, only stop forgets it, and the stored run wins over a resumed one', async ($, on) => {
   const saved: Record<string, unknown> = {}
   on('store.get', (_$, e) => ({ value: saved[e.key] }))
   on('store.set', (_$, e) => {
@@ -402,7 +402,7 @@ test('a long run outlives its session: a new one picks it up on the same branch,
   on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
   on('turn.complete', () => ({ text: '' }) as never)
   const clock = mock.clock(on)
-  const { prompts } = project(on, { 'TODO.md': RUN_BOARD }, { realClock: true })
+  const { prompts, statuses } = project(on, { 'TODO.md': RUN_BOARD }, { realClock: true })
   await start($)
   await clock.advance(1600)
   await run('run')($)
@@ -425,6 +425,20 @@ test('a long run outlives its session: a new one picks it up on the same branch,
   await $.session.end({ reason: 'resume' } as never)
   await clock.advance(1600)
   expect(prompts).toHaveLength(2)
+  // An old session resumed with a run in its own state, since stopped
+  // elsewhere: nothing stored, so the run is dropped, not woken or saved.
+  await run('run')($)
+  await clock.advance(10)
+  expect(prompts).toHaveLength(3)
+  await turn($, 'start')
+  await turn($, 'complete')
+  delete saved['run:/project']
+  await $.session.end({ reason: 'resume' } as never)
+  await clock.advance(1600)
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(3)
+  expect(saved['run:/project']).toBeUndefined()
+  expect(statuses.at(-1)).toBeUndefined()
 })
 
 test('p shows Stop run and the run block while a run is on; /todo run stop says when there is none', async ($, on) => {

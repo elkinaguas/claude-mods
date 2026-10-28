@@ -382,16 +382,18 @@ async function setRun($: EngineInterface, fn: (r: RunState | null) => RunState |
   return run
 }
 
-// Once per session: a run stored by an earlier one comes back, its turn and
-// wake bookkeeping reset, so the next poll wakes Claude if a task is ready.
+// Once per session: the stored run is the one that counts, its turn and wake
+// bookkeeping reset, so the next poll wakes Claude if a task is ready. With
+// none stored, a run in the session's own state (an old one /resume brought
+// back, stopped or replaced since) is dropped.
 async function loadRun($: EngineInterface) {
   if (runLoaded) return
+  // A store that can't be read leaves the session's run as it is, and is tried again.
+  const stored = (await $.store.get(await runKey($))) as RunState | undefined
   runLoaded = true
-  if (await read($, runAtom)) return
-  const stored = (await $.store.get(await runKey($)).catch(() => undefined)) as RunState | undefined
-  if (!stored || typeof stored.branch !== 'string') return
-  runSaved = JSON.stringify(stored)
-  await update($, runAtom, () => ({ ...stored, prompted: false, wokeAt: null }))
+  const run = stored && typeof stored.branch === 'string' ? stored : null
+  runSaved = JSON.stringify(run)
+  await update($, runAtom, () => run && { ...run, prompted: false, wokeAt: null })
 }
 
 async function load($: EngineInterface) {
