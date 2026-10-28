@@ -460,7 +460,9 @@ test('the rules keep a long run on one run branch, workers in worktrees, and par
   await run('init')($)
   expect(files['CLAUDE.md']).toContain('**Long run.**')
   expect(files['CLAUDE.md']).toContain('never check it out in the engineer\'s folder, never push it or merge it')
-  expect(files['CLAUDE.md']).toContain('add a git worktree on a branch `todo/T-<n>` from the run branch\'s tip')
+  expect(files['CLAUDE.md']).toContain(
+    "add a git worktree at `.claude/worktrees/T-<n>` in the project (listed in `.git/info/exclude`; only if it can't be made there, in your session's scratchpad) on a branch `todo/T-<n>` from the run branch's tip",
+  )
   expect(files['CLAUDE.md']).toContain('it is ready again once a `> A:` answers it')
 })
 
