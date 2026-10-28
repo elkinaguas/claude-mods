@@ -377,6 +377,56 @@ test('a long run keeps two workers busy, stops only the one past its cap, notifi
   expect(statuses.at(-1)).toBeUndefined()
 })
 
+test('a long run outlives its session: a new one picks it up on the same branch, and only stop forgets it', async ($, on) => {
+  const saved: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: saved[e.key] }))
+  on('store.set', (_$, e) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  on('store.delete', (_$, e) => {
+    delete saved[e.key]
+    return { value: undefined }
+  })
+  // A new session's state is its own: the run reads as unset there until written.
+  let freshSession = false
+  on('session.end', () => ({ sessionId: 's1' }) as never)
+  on('state.get', async (_$, e, next) => {
+    const got = await next(e)
+    return freshSession && e.key === 'run' && got.value ? { value: { ...got.value, value: undefined } } : got
+  })
+  on('state.set', (_$, e, next) => {
+    if (e.plugin === 'todo' && e.key === 'run') freshSession = false
+    return next(e)
+  })
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
+  const clock = mock.clock(on)
+  const { prompts } = project(on, { 'TODO.md': RUN_BOARD }, { realClock: true })
+  await start($)
+  await clock.advance(1600)
+  await run('run')($)
+  await clock.advance(10)
+  const branch = /run branch (run\/\S+),/.exec(prompts[0]!)![1]
+  expect((saved['run:/project'] as { branch: string }).branch).toBe(branch)
+  // The session goes on under a new ID: its state starts empty, the run comes
+  // back from the store and wakes Claude on the same branch.
+  await turn($, 'start')
+  await turn($, 'complete')
+  await $.session.end({ reason: 'resume' } as never)
+  freshSession = true
+  await clock.advance(1600)
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(2)
+  expect(prompts[1]).toContain(`run branch ${branch},`)
+  expect(await run('run stop')($)).not.toMatchObject({ text: 'No run to stop.' })
+  expect(saved['run:/project']).toBeUndefined()
+  // Stopped stays stopped in the next session.
+  await $.session.end({ reason: 'resume' } as never)
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(2)
+})
+
 test('p shows Stop run and the run block while a run is on; /todo run stop says when there is none', async ($, on) => {
   const { ui } = await panel($, on, { 'TODO.md': BOARD })
   expect(await run('run stop')($)).toMatchObject({ text: 'No run to stop.' })

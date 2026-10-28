@@ -363,8 +363,40 @@ async function setFlag<K extends keyof PanelFlags>($: EngineInterface, name: K, 
   await $.store.set(await flagKey($, name), value).catch((err: unknown) => $.ui.log(`todo: ${name} not saved: ${String(err)}`))
 }
 
+// The long run, kept in the plugin's store per project too, so it outlives
+// the session: a restart, /resume or a session continued under a new ID
+// picks it up on the same branch. Only /todo run stop ends it.
+const runKey = async ($: EngineInterface) => `run:${await $.session.root()}`
+let runLoaded = false
+let runSaved = 'null'
+
+async function setRun($: EngineInterface, fn: (r: RunState | null) => RunState | null) {
+  const run = await update($, runAtom, fn)
+  const json = JSON.stringify(run ?? null)
+  if (json !== runSaved) {
+    runSaved = json
+    await (run ? $.store.set(await runKey($), run) : $.store.delete(await runKey($))).catch((err: unknown) =>
+      $.ui.log(`todo: long run not saved: ${String(err)}`),
+    )
+  }
+  return run
+}
+
+// Once per session: a run stored by an earlier one comes back, its turn and
+// wake bookkeeping reset, so the next poll wakes Claude if a task is ready.
+async function loadRun($: EngineInterface) {
+  if (runLoaded) return
+  runLoaded = true
+  if (await read($, runAtom)) return
+  const stored = (await $.store.get(await runKey($)).catch(() => undefined)) as RunState | undefined
+  if (!stored || typeof stored.branch !== 'string') return
+  runSaved = JSON.stringify(stored)
+  await update($, runAtom, () => ({ ...stored, prompted: false, wokeAt: null }))
+}
+
 async function load($: EngineInterface) {
   await loadFlags($).catch(() => {})
+  await loadRun($).catch(() => {})
   await findBoardDir($).catch(() => {})
   let refused: string | undefined = boardRefused
   const stat = await boardPath($, FILE)
@@ -713,7 +745,7 @@ const runBranch = () => {
 // until stopped; runTick wakes Claude again when it is idle and a worker is free.
 async function runBoard($: EngineInterface, ready: Task[]) {
   const tasks = parse(await current($))
-  const run = await update($, runAtom, r => ({
+  const run = await setRun($, r => ({
     ...(r ?? { branch: runBranch(), tasks: [], workers: [], overCap: [], prompted: false, idleNotified: false, wokeAt: null, ...seenNow(tasks) }),
     prompted: true,
     idleNotified: false,
@@ -730,7 +762,7 @@ async function runBoard($: EngineInterface, ready: Task[]) {
 }
 
 async function stopRun($: EngineInterface) {
-  await update($, runAtom, () => null)
+  await setRun($, () => null)
   await showStatus($)
 }
 
@@ -771,7 +803,7 @@ async function runTick($: EngineInterface) {
     void notify($, seen.asked.length ? `Run idle: nothing ready. Waiting on you: ${seen.asked.join(', ')}.` : 'Run idle: nothing ready.')
   }
   // A run stopped meanwhile stays stopped.
-  const left = await update($, runAtom, r => r && { ...r, ...seen, tasks: timed, workers, overCap, idleNotified: idle ? true : wake ? false : r.idleNotified })
+  const left = await setRun($, r => r && { ...r, ...seen, tasks: timed, workers, overCap, idleNotified: idle ? true : wake ? false : r.idleNotified })
   if (wake && left) await runBoard($, ready)
   await showStatus($)
 }
@@ -1328,12 +1360,15 @@ export const register: Register = (on, options) => {
   if (typeof options.boardsDir === 'string') boardsDirOption = options.boardsDir
   runTaskMinutes = typeof options.runTaskMinutes === 'number' && options.runTaskMinutes > 0 ? options.runTaskMinutes : 60
   runWorkers = typeof options.runWorkers === 'number' && options.runWorkers >= 1 ? Math.floor(options.runWorkers) : 2
+  runLoaded = false
+  runSaved = 'null'
   // /resume (and /clear) swaps the session's state, empty or an old snapshot,
   // without loading the mod again: forget what the module saw, so the next
   // poll reads the board into the new session.
   on('session.end', ($, e, next) => {
     seen = -1
     lastFocus = undefined
+    runLoaded = false
     return next(e)
   })
 
@@ -1343,7 +1378,7 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     if (e.agentId) return next(e)
     mainBusy = true
-    if (await read($, runAtom)) await update($, runAtom, run => run && { ...run, prompted: false })
+    if (await read($, runAtom)) await setRun($, run => run && { ...run, prompted: false })
     return next(e)
   })
   on('turn.complete', ($, e, next) => {
@@ -1358,7 +1393,7 @@ export const register: Register = (on, options) => {
     const id = /^(T-\d{1,6})\b/.exec(e.description)?.[1]
     if (id && result.agentId && (await read($, runAtom))) {
       const agentId = result.agentId
-      await update($, runAtom, r => r && { ...r, workers: [...r.workers.filter(w => w.agentId !== agentId), { agentId, id }] })
+      await setRun($, r => r && { ...r, workers: [...r.workers.filter(w => w.agentId !== agentId), { agentId, id }] })
     }
     return result
   })
