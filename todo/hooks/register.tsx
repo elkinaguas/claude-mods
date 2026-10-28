@@ -745,7 +745,9 @@ const runBranch = () => {
 // Asks Claude to orchestrate the board: up to runWorkers workers on the ready
 // tasks, following the Long run rule, all on one run branch. The run stays on
 // until stopped; runTick wakes Claude again when it is idle and a worker is free.
-async function runBoard($: EngineInterface, ready: Task[]) {
+// The prompt says who sent it: the engineer starting the run (the panel's key
+// leaves no trace in the transcript), or the panel waking Claude in one.
+async function runBoard($: EngineInterface, ready: Task[], woken = false) {
   const tasks = parse(await current($))
   const run = await setRun($, r => ({
     ...(r ?? { branch: runBranch(), tasks: [], workers: [], overCap: [], prompted: false, idleNotified: false, wokeAt: null, ...seenNow(tasks) }),
@@ -757,7 +759,10 @@ async function runBoard($: EngineInterface, ready: Task[]) {
   const busy = running(tasks).map(t => t.id)
   await ask(
     $,
-    `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): run branch ${run!.branch}, up to ${plural(runWorkers, 'worker')} at a time, ` +
+    (woken
+      ? `The task panel woke you: the long run on ${run!.branch} goes on, and a task is ready. `
+      : 'I started a long run of the board (from the task panel or /todo run). ') +
+      `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): run branch ${run!.branch}, up to ${plural(runWorkers, 'worker')} at a time, ` +
       `a time cap of ${plural(runTaskMinutes, 'minute')} per task; don't wait for me between tasks. Ready now, in board order: ${ready.map(t => t.id).join(', ')}.` +
       (busy.length ? ` Already running: ${busy.join(', ')}.` : ''),
   )
@@ -806,7 +811,7 @@ async function runTick($: EngineInterface) {
   }
   // A run stopped meanwhile stays stopped.
   const left = await setRun($, r => r && { ...r, ...seen, tasks: timed, workers, overCap, idleNotified: idle ? true : wake ? false : r.idleNotified })
-  if (wake && left) await runBoard($, ready)
+  if (wake && left) await runBoard($, ready, true)
   await showStatus($)
 }
 

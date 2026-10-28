@@ -261,7 +261,7 @@ test('/todo run asks Claude to orchestrate the ready tasks: T- in Todo, no open 
   expect(await run('run')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks.' })
   await new Promise<void>(resolve => setTimeout(resolve, 20))
   expect(prompts[0]).toMatch(
-    /^Run the board in TODO\.md in long-running mode, following the task board rules \(Long run\): run branch run\/\d{4}-\d{2}-\d{2}-\d{4}, up to 2 workers at a time, a time cap of 60 minutes per task; don't wait for me between tasks\. Ready now, in board order: T-5, T-9\. Already running: T-2\.$/,
+    /^I started a long run of the board \(from the task panel or \/todo run\)\. Run the board in TODO\.md in long-running mode, following the task board rules \(Long run\): run branch run\/\d{4}-\d{2}-\d{2}-\d{4}, up to 2 workers at a time, a time cap of 60 minutes per task; don't wait for me between tasks\. Ready now, in board order: T-5, T-9\. Already running: T-2\.$/,
   )
 })
 
@@ -353,6 +353,8 @@ test('a long run keeps two workers busy, stops only the one past its cap, notifi
   expect(prompts).toHaveLength(2)
   expect(prompts[1]).toContain(`run branch ${branch},`)
   expect(prompts[1]).toContain('Ready now, in board order: T-3.')
+  expect(prompts[0]).toStartWith('I started a long run of the board (from the task panel or /todo run). ')
+  expect(prompts[1]).toStartWith(`The task panel woke you: the long run on ${branch} goes on, and a task is ready. Run the board in TODO.md`)
   // A turn that starts nothing doesn't bring another wake until the board changes.
   await turn($, 'start')
   await turn($, 'complete')
