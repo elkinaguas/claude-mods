@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "A TODO.md task board (Todo / Doing / Review / Done) with a side panel: quick capture, Claude enrichment with IDs, reviews and done logs",
   "author": {
     "name": "Elkin Aguas"
@@ -22,7 +22,7 @@
     "runTaskMinutes": {
       "type": "number",
       "title": "Long run: minutes per task",
-      "description": "In a long run (/todo run), a task still unfinished after this many minutes is parked with a question and the run moves on.",
+      "description": "In a long run (/todo run), a task still unfinished after this many minutes is stopped: its worker's tool calls are refused, so it reports back and the task is parked with a question.",
       "default": 60
     },
     "boardsDir": {

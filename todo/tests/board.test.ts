@@ -88,10 +88,21 @@ function project(on: On, files: Record<string, string>, { realClock = false } = 
     return { value: undefined }
   })
   on('ui.panes', () => ({ value: [...panes].map(id => ({ id, isPlaced: true })) as never }))
-  on('ui.status', () => ({ value: undefined }))
+  const statuses: (string | undefined)[] = []
+  on('ui.status', (_$, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  const notes: string[] = []
+  on('ui.notify', (_$, e) => {
+    notes.push(e.text)
+    return { value: { isSent: true, channel: 'terminal' } } as never
+  })
   return {
     files,
     prompts,
+    statuses,
+    notes,
     panes,
     paths,
     writeOutside,
@@ -264,6 +275,89 @@ test('with nothing ready, /todo run says why and the panel shows no Run board', 
   const { ui } = await panel($, on, { 'TODO.md': '# TODO\n\n## Todo\n\n- T-3 Asked\n  > Q: How?\n\n## Doing\n\n## Done\n' })
   expect(await ui.find({ key: 'run-board' })).toBeUndefined()
   expect(await run('run')($)).toMatchObject({ text: 'No ready tasks to run: every T- task in Todo has an open question or waits on another.' })
+})
+
+const RUN_BOARD = `# TODO
+
+## Todo
+
+- T-3 Add retry to upload client
+- T-4 Then the docs
+  > Depends: T-3
+
+## Doing
+
+## Review
+
+## Done
+`
+const turn = ($: Engine, kind: 'start' | 'complete', agentId?: string) =>
+  kind === 'start'
+    ? $.turn.start({ text: '', turnId: 't', ...(agentId ? { agentId } : {}) } as never)
+    : $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 't', ...(agentId ? { agentId } : {}) } as never)
+
+test('a long run times the task in Doing, stops its worker past the cap, notifies, and wakes Claude when idle', { options: { runTaskMinutes: 1 } }, async ($, on) => {
+  const clock = mock.clock(on)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('tool.call', () => ({ result: 'ran' }) as never)
+  const { prompts, notes, statuses, writeOutside } = project(on, { 'TODO.md': RUN_BOARD }, { realClock: true })
+  await start($)
+  await clock.advance(1600)
+  await run('run')($)
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('Ready now, in board order: T-3.')
+  // Claude takes it up: T-3 to Doing, a worker runs.
+  await turn($, 'start')
+  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '').replace('## Doing\n', '## Doing\n\n- T-3 Add retry to upload client\n'))
+  await clock.advance(1600)
+  expect(statuses.at(-1)).toBe('▸ T-3 Add retry to upload client · run: 0/1 min')
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'w1' } as never)).toMatchObject({ result: 'ran' })
+  await clock.advance(60_000)
+  expect(statuses.at(-1)).toBe('▸ T-3 Add retry to upload client · run: 1/1 min')
+  // Past the cap the worker is refused; the orchestrator (main loop) is not.
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'w1' } as never)).toMatchObject({
+    deny: 'todo: T-3 is past its 1 minute cap in the long run. Stop, and report back where you got stuck.',
+  })
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls' } as never)).toMatchObject({ result: 'ran' })
+  // Claude parks it with a question; no prompt while its turn runs.
+  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '- T-3 Add retry to upload client\n  > Q: Stuck on the mock server: which one?\n'))
+  await clock.advance(1600)
+  expect(notes).toEqual(['T-3 is parked: it has a question for you.'])
+  expect(prompts).toHaveLength(1)
+  await turn($, 'complete')
+  await clock.advance(1600)
+  expect(notes.at(-1)).toBe('Run idle: nothing ready. Waiting on you: T-3.')
+  expect(statuses.at(-1)).toBe('run: idle · 1 wait on you')
+  await clock.advance(1600)
+  expect(notes).toHaveLength(2)
+  // The answer makes T-3 ready: the mod wakes Claude, once.
+  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '- T-3 Add retry to upload client\n  > Q: Stuck on the mock server: which one?\n  > A: msw.\n'))
+  await clock.advance(1600)
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(2)
+  expect(prompts[1]).toContain('Ready now, in board order: T-3.')
+  // It lands in Review: a notification.
+  await turn($, 'start')
+  writeOutside('TODO.md', RUN_BOARD.replace('- T-3 Add retry to upload client\n', '').replace('## Review\n', '## Review\n\n- T-3 Add retry to upload client\n'))
+  await clock.advance(1600)
+  expect(notes.at(-1)).toBe('T-3 is ready for your review.')
+  // Stopped: no more wakes, the status drops the run.
+  await run('run stop')($)
+  await turn($, 'complete')
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(2)
+  expect(statuses.at(-1)).toBeUndefined()
+})
+
+test('p shows Stop run while a run is on; /todo run stop says when there is none', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await run('run stop')($)).toMatchObject({ text: 'No run to stop.' })
+  await ui.press({ key: 'run-board' })
+  await ui.press({ key: 'stop-run' })
+  expect(await ui.find({ key: 'stop-run' })).toBeUndefined()
+  expect(await ui.find({ key: 'run-board' })).toBeDefined()
 })
 
 test('the rules keep a long run on branches and park what needs the engineer', async ($, on) => {
