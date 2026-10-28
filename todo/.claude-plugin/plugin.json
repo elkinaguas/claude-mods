@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.20",
+  "version": "0.1.28",
   "description": "A TODO.md task board (Todo / Doing / Review / Done) with a side panel: quick capture, Claude enrichment with IDs, reviews and done logs",
   "author": {
     "name": "Elkin Aguas"
@@ -18,6 +18,18 @@
       "title": "Auto-archive Done after",
       "description": "When a task starts and Done holds more than this many tasks, the oldest move to TODO-archive.md and the newest 10 stay. 0 turns it off.",
       "default": 20
+    },
+    "runTaskMinutes": {
+      "type": "number",
+      "title": "Long run: minutes per task",
+      "description": "In a long run (/todo run), a task still unfinished after this many minutes is stopped: its worker's tool calls are refused, so it reports back and the task is parked with a question.",
+      "default": 60
+    },
+    "runWorkers": {
+      "type": "number",
+      "title": "Long run: workers at once",
+      "description": "How many workers a long run (/todo run) keeps busy at the same time, each in its own git worktree.",
+      "default": 2
     },
     "boardsDir": {
       "type": "string",

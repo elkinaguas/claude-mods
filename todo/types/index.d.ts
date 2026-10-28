@@ -7,6 +7,19 @@ export type PanelFlags = { doneOpen: boolean; statsOpen: boolean; graphZoom: 1 |
 /** Which tasks the panel lists: all, Claude's (T-) or the engineer's (H-). */
 export type TypeFilter = 'all' | 'T' | 'H'
 
+/** A long run (/todo run) while on: its branch; the T- tasks in Doing and since when (ms); which subagent works which task; the tasks past their time cap; what the mod last saw (to notify on changes); whether it woke Claude since the last turn, and the board's shape when it did. */
+export type RunState = {
+  branch: string
+  tasks: { id: string; since: number }[]
+  workers: { agentId: string; id: string }[]
+  overCap: string[]
+  review: string[]
+  asked: string[]
+  prompted: boolean
+  idleNotified: boolean
+  wokeAt: string | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     todo: {
@@ -35,6 +48,8 @@ declare module 'claude-code' {
       flags: PanelFlags | null
       /** Which tasks the lists show (`v` cycles it). */
       typeFilter: TypeFilter
+      /** The long run, while one is on; null otherwise. */
+      run: RunState | null
     }
   }
 }
