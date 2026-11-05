@@ -1,0 +1,29 @@
+{
+  "name": "pi",
+  "version": "0.1.0",
+  "description": "Long-lived pi coding-agent sessions from Claude Code: a sandboxed session runner, a panel, a guard on ~/.pi and a check of the key-masking setup",
+  "author": {
+    "name": "Elkin Aguas"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open the panel when a session runs",
+      "description": "Open the pi sessions panel when a session starts running (it docks beside the transcript on wide terminals).",
+      "default": true
+    },
+    "caWarnDays": {
+      "type": "number",
+      "title": "Warn before the CA expires (days)",
+      "description": "Warn when the sandbox CA certificate (sandbox.network.tlsTerminate) expires within this many days. 0 warns only once it has expired.",
+      "default": 30
+    },
+    "allowUnsandboxed": {
+      "type": "boolean",
+      "title": "Allow pi without the sandbox (exposes your key)",
+      "description": "Let pi-session start pi when Claude Code's Bash sandbox is off. pi then reads your real provider key, and Claude's unsandboxed commands could too. Off: pi is refused outside the sandbox. Use a separate, revocable key if you turn this on.",
+      "default": false
+    }
+  }
+}
