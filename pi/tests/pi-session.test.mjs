@@ -49,7 +49,7 @@ after(() => {
 test('serve reports the model pi chose and goes idle', () => {
   const st = status('alpha')
   assert.equal(st.model, 'fake/echo')
-  assert.equal(st.sessionId, 'claude-alpha')
+  assert.match(st.sessionId, /^claude-alpha-[0-9a-z]+$/)
   assert.equal(st.cwd, root)
 })
 
@@ -116,6 +116,61 @@ test('serve refuses to run outside the sandbox unless allowed, and marks such a 
   cli('forget', 'bare')
 })
 
+test('stop and abort never write through a planted link or to a plain file', () => {
+  // A session that looks live, as a sandboxed process could fake one.
+  const fake = path.join(root, 'planted')
+  fs.mkdirSync(fake)
+  fs.writeFileSync(path.join(fake, 'status.json'), JSON.stringify({ name: 'planted', state: 'idle', heartbeatAt: Date.now() + 3600000 }))
+  const victim = path.join(root, 'victim.json')
+  fs.writeFileSync(victim, '{ "keep": true }\n')
+  fs.symlinkSync(victim, path.join(fake, 'in.fifo'))
+  assert.match(cliFails('stop', 'planted').out, /is a link, not planted's pipe/)
+  assert.match(cliFails('abort', 'planted').out, /is a link/)
+  fs.rmSync(path.join(fake, 'in.fifo'))
+  fs.writeFileSync(path.join(fake, 'in.fifo'), '')
+  assert.match(cliFails('stop', 'planted').out, /is not a pipe/)
+  assert.equal(fs.readFileSync(victim, 'utf8'), '{ "keep": true }\n')
+  assert.equal(fs.readFileSync(path.join(fake, 'in.fifo'), 'utf8'), '')
+  // A session folder that is itself a link is refused too.
+  fs.rmSync(fake, { recursive: true })
+  fs.mkdirSync(path.join(root, 'elsewhere'))
+  fs.writeFileSync(path.join(root, 'elsewhere', 'status.json'), JSON.stringify({ name: 'planted', state: 'idle', heartbeatAt: Date.now() + 3600000 }))
+  fs.symlinkSync(path.join(root, 'elsewhere'), fake)
+  assert.match(cliFails('stop', 'planted').out, /is not a folder/)
+  fs.rmSync(fake)
+  fs.rmSync(path.join(root, 'elsewhere'), { recursive: true })
+  fs.rmSync(victim)
+})
+
+test('a prompt too long for one pipe write arrives whole, through the inbox', () => {
+  const long = `start ${'x'.repeat(100000)} end`
+  const big = path.join(root, 'big.md')
+  fs.writeFileSync(big, long)
+  const id = cli('send', 'alpha', '--file', big).trim()
+  assert.equal(cli('wait', 'alpha', id, '--timeout', '10'), `echo: ${long}\n`)
+  assert.deepEqual(fs.readdirSync(path.join(root, 'alpha', 'inbox')), [])
+  // The next command still gets through.
+  const after = cli('send', 'alpha', 'after').trim()
+  assert.equal(cli('wait', 'alpha', after, '--timeout', '5'), 'echo: after\n')
+})
+
+test('aborting while pi asks ends the dialog, and the session goes idle', () => {
+  const id = cli('send', 'alpha', 'please ask again').trim()
+  assert.equal(cliFails('wait', 'alpha', id, '--timeout', '5').code, 3)
+  cli('abort', 'alpha')
+  const out = cli('wait', 'alpha', id, '--timeout', '5')
+  assert.ok(!/pi asks/.test(out))
+  assert.equal(status('alpha').state, 'idle')
+  assert.equal(status('alpha').dialog, null)
+})
+
+test('a live session whose heartbeat only looks stale (after sleep) is not taken for gone', () => {
+  const file = path.join(root, 'alpha', 'status.json')
+  fs.writeFileSync(file, JSON.stringify({ ...status('alpha'), heartbeatAt: Date.now() - 60000 }))
+  // forget reads it again after a beat: serve has written a fresh one by then.
+  assert.match(cliFails('forget', 'alpha').out, /running; stop it first/)
+})
+
 test('status lists sessions in one line each', () => {
   assert.match(cli('status'), /^alpha {2}idle {2}fake\/echo/m)
 })
@@ -125,13 +180,14 @@ test('names that pi would refuse are refused', () => {
 })
 
 test('stop ends the session; serving again reopens it and keeps its history', async () => {
+  const firstSessionId = status('alpha').sessionId
   cli('stop', 'alpha')
   await until(() => status('alpha').state === 'stopped')
   assert.match(cliFails('send', 'alpha', 'hi').out, /not running \(stopped\)/)
   assert.ok(!fs.existsSync(path.join(root, 'alpha', 'in.fifo')))
   server = await serve('alpha')
   const st = status('alpha')
-  assert.equal(st.sessionId, 'claude-alpha')
+  assert.equal(st.sessionId, firstSessionId)
   assert.ok(st.promptSeq >= 4)
   const id = cli('send', 'alpha', 'again').trim()
   assert.equal(cli('wait', 'alpha', id, '--timeout', '5'), 'echo: again\n')
@@ -146,4 +202,18 @@ test('a session whose serve died shows as lost, and forget refuses a live one', 
   assert.match(cli('status', 'alpha'), /alpha {2}lost/)
   assert.match(cli('forget', 'alpha'), /forgot alpha/)
   server = null
+})
+
+test('a name served again after forget starts a new pi conversation', async () => {
+  const child = await serve('gamma')
+  const first = status('gamma').sessionId
+  cli('stop', 'gamma')
+  await until(() => status('gamma').state === 'stopped')
+  child.kill()
+  cli('forget', 'gamma')
+  const again = await serve('gamma')
+  assert.notEqual(status('gamma').sessionId, first)
+  cli('stop', 'gamma')
+  await until(() => status('gamma').state === 'stopped')
+  again.kill()
 })

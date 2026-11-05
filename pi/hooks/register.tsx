@@ -71,6 +71,21 @@ export const resolvePath = (p: string, base: string, homeDir: string): string =>
   return `/${out.join('/')}`
 }
 
+const FILE_TOOLS = ['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Grep', 'Glob']
+
+/** Where a Grep or Glob search starts, as given: its path, an absolute Glob pattern's fixed folder, or the working folder. */
+export const searchRoot = (tool: string, input: Json, base: string): string | null => {
+  if (tool !== 'Grep' && tool !== 'Glob') return null
+  const p = str(input.path)
+  if (p) return p
+  const pattern = str(input.pattern) ?? ''
+  if (tool === 'Glob' && /^[/~]/.test(pattern)) {
+    const fixed = globBase(pattern)
+    return fixed === pattern ? pattern : fixed.replace(/\/[^/]*$/, '') || '/'
+  }
+  return base
+}
+
 const under = (abs: string, dir: string) => abs === dir || abs.startsWith(dir === '/' ? '/' : `${dir}/`)
 // The fixed part of a glob, before its first wildcard.
 const globBase = (pattern: string) => pattern.split(/[*?[{]/)[0] ?? ''
@@ -104,19 +119,58 @@ export const reachesPiDir = (tool: string, input: Json, base: string, homeDir: s
     // The home folder or any folder above it would descend into ~/.pi.
     if (isSearch && under(homeDir, abs)) return `a search of ${abs}`
   }
+  // A relative pattern is read from the search root, so one that climbs out
+  // with .. (../.p*/agent/*) is caught by where its fixed folders lead.
+  const root = resolvePath(paths[0] || base, base, homeDir)
   for (const g of patterns.filter(Boolean)) {
     if (/(^|\/)\.pi(\/|$)|auth\.json/.test(g)) return `the pattern ${g}`
     const fixed = globBase(g)
-    if (fixed.startsWith('/') || fixed.startsWith('~')) {
-      const abs = resolvePath(fixed || '/', base, homeDir)
-      if (under(abs, piDir) || (under(homeDir, abs) && g !== fixed)) return `the pattern ${g}`
-    }
+    const absolute = fixed.startsWith('/') || fixed.startsWith('~')
+    const folder = absolute ? fixed || '/' : fixed.includes('/') ? fixed.slice(0, fixed.lastIndexOf('/')) : ''
+    if (!absolute && !folder) continue
+    const abs = resolvePath(folder, root, homeDir)
+    if (under(abs, piDir) || (under(homeDir, abs) && g !== fixed)) return `the pattern ${g}`
   }
   return null
 }
 
-const PI_RE = /pi-session|(^|[^\w.-])\.pi(\/|\s|$|["'])|auth\.json|(^|[\s;&|(`])pi(\s|$)/
+// Read on the command with quotes and backslashes taken out, so ~/.p"i" and
+// ~/.p\i match too, and with glob spellings of the folder (~/.p?, ~/.p*).
+// Text matching can never catch every spelling (a variable, say): only the
+// sandbox does. It keeps the obvious ways out.
+const PI_RE = /pi-session|(^|[^\w.-])\.p[i?*[{]|auth(\.json|[?*[{])|agent\/a[?*[{]|(^|[\s;&|(`])pi(\s|$)/
+const AUTH_RE = /auth(\.json|[?*[{])|agent\/a[?*[{]|\.p[?*[{][^\s]*\/agent\/a/
 const ALLOW_RE = /--allow-unsandboxed/
+const flat = (command: string) => command.replace(/["'\\]/g, '')
+
+/** The commands a settings layer lets run outside the sandbox, and whether Bash may ask to leave it. */
+export const sandboxEscapes = (texts: (string | null)[]): { excluded: string[]; unsandboxedAllowed: boolean } => {
+  const excluded = new Set<string>()
+  let unsandboxedAllowed = false
+  for (const text of texts) {
+    if (text === null) continue
+    try {
+      const sandbox = obj(obj(JSON.parse(text)).sandbox)
+      for (const c of Array.isArray(sandbox.excludedCommands) ? sandbox.excludedCommands : []) if (typeof c === 'string' && c.trim()) excluded.add(c.trim())
+      if (sandbox.allowUnsandboxedCommands === true) unsandboxedAllowed = true
+    } catch {
+      // A file that does not parse is ignored by Claude Code too.
+    }
+  }
+  return { excluded: [...excluded], unsandboxedAllowed }
+}
+
+/** Whether any command in a Bash line is one the sandbox leaves out (sandbox.excludedCommands). */
+export const runsExcluded = (command: string, excluded: string[]): boolean => {
+  if (!excluded.length) return false
+  const names = new Set(excluded.map(c => c.split(/[\s:]/)[0]!.replace(/\*$/, '')).filter(Boolean))
+  for (const part of command.split(/[;&|\n]|\$\(|`|\(/)) {
+    const words = part.trim().replace(/^((\w+=\S*|sudo|env|exec|command|nohup|time)\s+)+/, '').split(/\s+/)
+    const first = (words[0] ?? '').split('/').pop() ?? ''
+    if (first && names.has(first)) return true
+  }
+  return false
+}
 
 /**
  * Why a Bash command must not run, or null. Unsandboxed, a command that names
@@ -124,10 +178,13 @@ const ALLOW_RE = /--allow-unsandboxed/
  * own check is for the person to allow (option allowUnsandboxed), not Claude.
  */
 export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUnsandboxed: boolean }): string | null => {
-  if (ALLOW_RE.test(command) && !o.allowUnsandboxed)
+  const text = flat(command)
+  // pi-session trusts this to tell it runs in the sandbox; only the sandbox sets it.
+  if (/SANDBOX_RUNTIME/.test(text)) return 'pi: SANDBOX_RUNTIME is set by the sandbox itself; a command may not set or change it.'
+  if (ALLOW_RE.test(text) && !o.allowUnsandboxed)
     return 'pi: --allow-unsandboxed lets pi read your real key, and only you can allow it (/plugin configure pi@claude-mods, allowUnsandboxed). Run pi-session inside the sandbox instead.'
-  if (!o.unsandboxed || !PI_RE.test(command)) return null
-  if (/auth\.json/.test(command)) return 'pi: this command would run outside the sandbox and names auth.json, which holds your real provider key.'
+  if (!o.unsandboxed || !PI_RE.test(text)) return null
+  if (AUTH_RE.test(text)) return 'pi: this command would run outside the sandbox and names auth.json, which holds your real provider key.'
   if (o.allowUnsandboxed) return null
   return 'pi: this command would run outside the Bash sandbox, where pi and Claude could read your real provider key. Turn the sandbox on, or allow it yourself (/plugin configure pi@claude-mods, allowUnsandboxed).'
 }
@@ -199,9 +256,9 @@ export const daysLeft = (opensslOut: string, now: number): number | null => {
   return Number.isNaN(at) ? null : Math.floor((at - now) / 86400000)
 }
 
-async function check($: EngineInterface): Promise<string[]> {
-  const path = `${home}/.claude/settings.json`
-  const text = await $.fs.read(path).catch(() => null)
+/** The settings files that shape the sandbox: user settings, and the layers above them. */
+async function readSettings($: EngineInterface): Promise<{ text: string | null; layers: SettingsLayer[] }> {
+  const text = await $.fs.read(`${home}/.claude/settings.json`).catch(() => null)
   const layers: SettingsLayer[] = []
   for (const [name, at] of [
     ['managed settings', '/etc/claude-code/managed-settings.json'],
@@ -211,8 +268,20 @@ async function check($: EngineInterface): Promise<string[]> {
     if (name !== 'managed settings' && !cwd) continue
     layers.push({ name, text: await $.fs.read(at).catch(() => null) })
   }
+  return { text, layers }
+}
+
+async function check($: EngineInterface): Promise<string[]> {
+  const { text, layers } = await readSettings($)
   sandboxOff = !sandboxSetting(layers, text).enabled
   const problems = settingsProblems(text, home, layers)
+  const escapes = sandboxEscapes([text, ...layers.map(l => l.text)])
+  if (!sandboxOff && escapes.excluded.length)
+    problems.push(
+      `sandbox.excludedCommands (${escapes.excluded.join(', ')}) run outside the sandbox, where they can read your real key. The pi guard refuses ones that name pi or its key, but cannot catch every spelling.`,
+    )
+  if (!sandboxOff && escapes.unsandboxedAllowed)
+    problems.push('sandbox.allowUnsandboxedCommands is on: a Bash call can ask to leave the sandbox, where it can read your real key. The pi guard refuses ones that name pi or its key, but cannot catch every spelling.')
   const bare = (await read($, sessionsAtom)).filter(x => x.sandboxed === false && LIVE.includes(x.state))
   if (bare.length)
     problems.push(`${bare.map(x => x.name).join(', ')} ${bare.length === 1 ? 'runs' : 'run'} outside the sandbox: pi holds your real provider key.`)
@@ -346,18 +415,29 @@ export const register: Register = (on, options) => {
     const input = e as unknown as Json
     if (e.tool === 'Bash') {
       const command = str(input.command) ?? ''
-      const why = bashRefusal(command, { unsandboxed: sandboxOff || input.dangerouslyDisableSandbox === true, allowUnsandboxed })
+      // Read the settings now, not at session start: the sandbox can be turned
+      // off mid-session, and excluded commands run outside it even when on.
+      const { text, layers } = await readSettings($)
+      sandboxOff = !sandboxSetting(layers, text).enabled
+      const { excluded } = sandboxEscapes([text, ...layers.map(l => l.text)])
+      const unsandboxed = sandboxOff || input.dangerouslyDisableSandbox === true || runsExcluded(command, excluded)
+      const why = bashRefusal(command, { unsandboxed, allowUnsandboxed })
       if (why) return { deny: why }
       const allowed = allowUnsandboxed ? withAllowFlag(command) : command
       return allowed === command ? next(e) : next({ ...e, command: allowed })
     }
-    let hit = reachesPiDir(e.tool, input, cwd || home, home)
-    // A link elsewhere that lands in ~/.pi: check where it really leads.
-    const target = str(input.file_path) ?? str(input.notebook_path)
-    if (!hit && target && ['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(e.tool)) {
-      const st = await $.fs.stat(resolvePath(target, cwd || home, home), { resolve: true }).catch(() => null)
+    const base = cwd || home
+    let hit = reachesPiDir(e.tool, input, base, home)
+    // A link elsewhere that lands in ~/.pi: check where it really leads. A
+    // search follows a link given as its root (ripgrep does), so Grep and Glob
+    // are checked too, at their path, the root of an absolute Glob pattern,
+    // or the working folder.
+    const target = searchRoot(e.tool, input, base) ?? str(input.file_path) ?? str(input.notebook_path)
+    if (!hit && target && FILE_TOOLS.includes(e.tool)) {
+      const st = await $.fs.stat(resolvePath(target, base, home), { resolve: true }).catch(() => null)
       const real = st && 'realPath' in st ? str((st as unknown as Json).realPath) : null
-      if (real && under(real, `${home}/.pi`)) hit = real
+      const isSearch = e.tool === 'Grep' || e.tool === 'Glob'
+      if (real && (under(real, `${home}/.pi`) || (isSearch && under(home, real)))) hit = `${target} (a link to ${real})`
     }
     if (!hit) return next(e)
     return { deny: `pi: ${hit} is in ~/.pi, which holds your provider key. Read session logs with pi-session (read, status) instead.` }

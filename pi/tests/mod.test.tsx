@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bashRefusal, daysLeft, reachesPiDir, resolvePath, sandboxSetting, settingsProblems, withAllowFlag } from '../hooks/register'
+import { bashRefusal, daysLeft, reachesPiDir, resolvePath, runsExcluded, sandboxEscapes, sandboxSetting, settingsProblems, withAllowFlag } from '../hooks/register'
 
 const HOME = '/home/u'
 
@@ -35,6 +35,15 @@ test('the guard catches every way a file tool reaches ~/.pi', () => {
   expect(reachesPiDir('Glob', { pattern: '/home/u/proj/**' }, HOME, HOME)).toBe(null)
 })
 
+test('a relative Glob pattern that climbs out to ~/.pi is caught', () => {
+  const hit = (input: Record<string, unknown>) => reachesPiDir('Glob', input, '/home/u/proj', HOME)
+  expect(hit({ pattern: '../.p*/agent/*' })).toBe('the pattern ../.p*/agent/*')
+  expect(hit({ pattern: '../../u/.p?/**' })).toBe('the pattern ../../u/.p?/**')
+  expect(hit({ pattern: '*/agent/*', path: '/home/u/.pi' })).toBe('/home/u/.pi')
+  expect(hit({ pattern: '../other/*.ts' })).toBe(null)
+  expect(hit({ pattern: 'src/**/*.ts' })).toBe(null)
+})
+
 test('the guard lets ordinary calls through', () => {
   const hit = (tool: string, input: Record<string, unknown>) => reachesPiDir(tool, input, '/home/u/proj', HOME)
   expect(hit('Read', { file_path: '/home/u/proj/README.md' })).toBe(null)
@@ -56,6 +65,10 @@ test('a file tool call into ~/.pi is refused before it runs', async ($, on) => {
 
 test('a Bash call that asks to leave the sandbox is refused when it reaches pi', async ($, on) => {
   on('env.get', () => ({ value: HOME }))
+  on('fs.read', (_, e) => {
+    if (e.path === '/home/u/.claude/settings.json') return { value: JSON.stringify(goodSettings) }
+    throw new Error('missing')
+  })
   on('tool.call', () => ({ result: {} }))
   const refused = await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs serve demo', dangerouslyDisableSandbox: true } as never)
   expect(refused.deny).toMatch(/outside the Bash sandbox/)
@@ -88,6 +101,33 @@ test('with allowUnsandboxed on, the mod itself lets serve start outside the sand
   expect(cat.deny).toMatch(/names auth\.json/)
 })
 
+test('a search rooted at a link into ~/.pi is refused', async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  const real: Record<string, string> = {
+    '/home/u/proj/notes.txt': '/home/u/.pi/agent/auth.json',
+    '/home/u/proj/cfg': '/home/u/.pi/agent',
+    '/home/u/proj/up': '/home',
+  }
+  on('fs.stat', (_, e) => ({ value: { kind: 'file', size: 1, mtimeMs: 0, isLink: e.path in real, realPath: real[e.path] ?? e.path } }))
+  on('tool.call', () => ({ result: {} }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.read', () => {
+    throw new Error('missing')
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('clock.now', () => ({ value: 0 }))
+  on('clock.every', () => ({ value: undefined }))
+  on('command.register', () => ({ value: { command: 'pi' } }))
+  on('ui.toast', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/home/u/proj', surface: 'terminal', isInteractive: true })
+  const grepFile = await $.tool.call({ tool: 'Grep', pattern: '.', path: 'notes.txt', output_mode: 'content' } as never)
+  expect(grepFile.deny).toMatch(/notes\.txt \(a link to \/home\/u\/\.pi\/agent\/auth\.json\)/)
+  expect((await $.tool.call({ tool: 'Grep', pattern: 'key', path: 'cfg' } as never)).deny).toMatch(/a link to \/home\/u\/\.pi\/agent/)
+  expect((await $.tool.call({ tool: 'Glob', pattern: '**/*', path: 'up' } as never)).deny).toMatch(/a link to \/home\)/)
+  expect((await $.tool.call({ tool: 'Grep', pattern: 'func main', path: 'src' } as never)).deny).toBe(undefined)
+  expect((await $.tool.call({ tool: 'Grep', pattern: 'func main' } as never)).deny).toBe(undefined)
+})
+
 test('a link that leads into ~/.pi is refused too', async ($, on) => {
   on('env.get', () => ({ value: HOME }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: 0, isLink: true, realPath: '/home/u/.pi/agent/auth.json' } }))
@@ -115,6 +155,39 @@ test('the setup check names each broken piece', () => {
 
   expect(settingsProblems('{ "sandbox": ', HOME).join()).toMatch(/does not parse/)
   expect(settingsProblems(null, HOME).join()).toMatch(/missing/)
+})
+
+test('Bash: other spellings of the key file, SANDBOX_RUNTIME and excluded commands', () => {
+  const off = { unsandboxed: true, allowUnsandboxed: false }
+  const allowed = { unsandboxed: true, allowUnsandboxed: true }
+  const on = { unsandboxed: false, allowUnsandboxed: false }
+  expect(bashRefusal('cat ~/.p?/agent/auth*', off)).toMatch(/names auth\.json/)
+  expect(bashRefusal('cat ~/.p"i"/agent/a*.json', allowed)).toMatch(/names auth\.json/)
+  expect(bashRefusal('ls ~/.p\\i/agent', off)).toMatch(/outside the Bash sandbox/)
+  expect(bashRefusal('SANDBOX_RUNTIME=1 node /x/pi-session.mjs serve x', on)).toMatch(/set by the sandbox itself/)
+  expect(bashRefusal('export SANDBOX_""RUNTIME=1', on)).toMatch(/set by the sandbox itself/)
+  expect(bashRefusal('npm test -- auth', allowed)).toBe(null)
+  expect(runsExcluded('docker run -v ~/.pi/agent:/k alpine cat /k/auth.json', ['docker'])).toBe(true)
+  expect(runsExcluded('cd x && FOO=1 sudo /usr/bin/docker ps', ['docker:*'])).toBe(true)
+  expect(runsExcluded('ls; git status', ['docker'])).toBe(false)
+  expect(sandboxEscapes([JSON.stringify({ sandbox: { excludedCommands: ['docker'], allowUnsandboxedCommands: true } }), null, '{'])).toEqual({ excluded: ['docker'], unsandboxedAllowed: true })
+})
+
+test('each Bash call reads the settings again, so a sandbox turned off mid-session or an excluded command counts as unsandboxed', async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  on('tool.call', () => ({ result: {} }))
+  let user = JSON.stringify(goodSettings)
+  on('fs.read', (_, e) => {
+    if (e.path === '/home/u/.claude/settings.json') return { value: user }
+    throw new Error('missing')
+  })
+  const serveCmd = { tool: 'Bash', command: 'node /x/pi-session.mjs serve demo' } as never
+  expect((await $.tool.call(serveCmd)).deny).toBe(undefined)
+  user = JSON.stringify({ ...goodSettings, sandbox: { ...goodSettings.sandbox, enabled: false } })
+  expect((await $.tool.call(serveCmd)).deny).toMatch(/outside the Bash sandbox/)
+  user = JSON.stringify({ ...goodSettings, sandbox: { ...goodSettings.sandbox, excludedCommands: ['docker'] } })
+  expect((await $.tool.call({ tool: 'Bash', command: 'docker run -v ~/.pi/agent:/k alpine cat /k/auth.json' } as never)).deny).toMatch(/names auth\.json/)
+  expect((await $.tool.call(serveCmd)).deny).toBe(undefined)
 })
 
 test('the sandbox setting is read from the file that wins', () => {

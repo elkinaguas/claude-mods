@@ -62,9 +62,10 @@ process.stdin.on('data', chunk => {
       finish(msg, cmd.confirmed ? ' (confirmed)' : ' (declined)')
     } else if (cmd.type === 'abort') {
       out({ id: cmd.id, type: 'response', command: 'abort', success: true })
-      if (slow) {
+      if (slow || pendingDialog) {
         clearTimeout(slow)
         slow = null
+        pendingDialog = null
         queue.length = 0
         busy = false
         out({ type: 'agent_end', messages: [], willRetry: false })

@@ -22,6 +22,8 @@ const HEARTBEAT_MS = 5000
 // or the machine slept through it). Each sandboxed command has its own process
 // namespace, so a pid cannot be checked from another command.
 const STALE_MS = 20000
+// The most a command line may take to arrive in one piece (PIPE_BUF).
+const PIPE_LINE = 4096
 const DIALOGS = ['select', 'confirm', 'input', 'editor']
 // Claude Code's Bash sandbox sets this in every command it wraps. Outside it,
 // pi would read the real provider key from ~/.pi/agent/auth.json.
@@ -105,22 +107,59 @@ const needName = name => {
   if (!NAME_RE.test(name)) fail(`"${name}" is not a session name: letters, digits, . _ - (start and end with a letter or digit).`)
   return name
 }
-const needLive = name => {
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+// A stale heartbeat alone does not prove a serve is gone: after the machine
+// sleeps, every heartbeat looks old until the serve's next beat. So a live
+// state with a stale heartbeat is read again after more than one beat, and
+// the session counts as gone only if the heartbeat has not moved.
+const settledStatus = async name => {
   const st = readStatus(name)
+  if (!st || isLive(st) || !LIVE.includes(st.state)) return st
+  await sleep(HEARTBEAT_MS + 1500)
+  return readStatus(name)
+}
+const needLive = async name => {
+  const st = await settledStatus(name)
   if (!isLive(st)) fail(`${name} is not running (${shownState(st)}). Start it in the background: pi-session serve ${name}`)
   return st
 }
 
 // Writes one command to a running serve's pipe. Non-blocking open fails at
 // once (ENXIO) when nothing reads the pipe, instead of hanging.
+// The panel runs stop and abort outside the sandbox, and sandboxed commands
+// can write in the sessions folder: so the session folder must be a real
+// folder, in.fifo is never followed as a link, and only a pipe is written to.
+// Otherwise a planted link would turn this into a write to any file of yours.
 const toPipe = (name, cmd) => {
   let fd
   try {
-    fd = fs.openSync(file(name, 'in.fifo'), fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)
+    if (!fs.lstatSync(dir(name)).isDirectory()) fail(`${dir(name)} is not a folder; refusing to write to it.`)
+    fd = fs.openSync(file(name, 'in.fifo'), fs.constants.O_WRONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW)
   } catch (err) {
+    if (err.code === 'ELOOP') fail(`${file(name, 'in.fifo')} is a link, not ${name}'s pipe; refusing to write through it.`)
     fail(`${name} is not listening (${err.code}). Serve it again.`)
   }
-  fs.writeSync(fd, `${JSON.stringify(cmd)}\n`)
+  if (!fs.fstatSync(fd).isFIFO()) {
+    fs.closeSync(fd)
+    fail(`${file(name, 'in.fifo')} is not a pipe; refusing to write to it.`)
+  }
+  // A write of at most PIPE_BUF (4096) bytes to a pipe is all or nothing, so
+  // a line never arrives cut, nor mixed with another sender's. A full pipe
+  // refuses it (EAGAIN): try again for a while. Longer prompts go by file.
+  const line = Buffer.from(`${JSON.stringify(cmd)}\n`)
+  if (line.length > PIPE_LINE) fail(`internal: a ${line.length}-byte command does not fit the pipe.`)
+  for (let tries = 0; ; tries++) {
+    try {
+      fs.writeSync(fd, line)
+      break
+    } catch (err) {
+      if (err.code !== 'EAGAIN' || tries > 300) {
+        fs.closeSync(fd)
+        fail(`${name} did not take the command (${err.code}); is it stuck?`)
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100)
+    }
+  }
   fs.closeSync(fd)
 }
 
@@ -148,18 +187,19 @@ const argSummary = args => {
   return oneLine(key ? args[key] : JSON.stringify(args), 90)
 }
 
-function serve(name, flags, extra) {
+async function serve(name, flags, extra) {
   if (!SANDBOXED && !flags['allow-unsandboxed'])
     fail(`not inside Claude Code's Bash sandbox, so pi would read your real provider key. Run it from Claude's Bash tool with the sandbox on.`)
   fs.mkdirSync(dir(name), { recursive: true })
-  const before = readStatus(name)
+  const before = await settledStatus(name)
   if (isLive(before)) fail(`${name} is already running.`)
   const meta = readJson(file(name, 'meta.json'), {})
   const cwd = path.resolve(flags.cwd ?? meta.cwd ?? process.cwd())
   const model = flags.model ?? meta.model
   const thinking = flags.thinking ?? meta.thinking
-  // pi's own session id: reopened (not recreated) when the session is served again.
-  const sessionId = meta.sessionId ?? `claude-${name}`
+  // pi's own session id: reopened when the session is served again, and new
+  // for a new session, so a name used again after forget starts afresh.
+  const sessionId = meta.sessionId ?? `claude-${name}-${Date.now().toString(36)}`
   writeJson(file(name, 'meta.json'), { name, cwd, model, thinking, sessionId, createdAt: meta.createdAt ?? Date.now() })
 
   const fifo = file(name, 'in.fifo')
@@ -224,7 +264,9 @@ function serve(name, flags, extra) {
     setTimeout(() => pi.kill('SIGTERM'), 10000).unref()
   }
 
+  let finished = false
   onLines(pipeIn, line => {
+    if (finished) return
     let cmd
     try {
       cmd = JSON.parse(line)
@@ -232,6 +274,20 @@ function serve(name, flags, extra) {
       return
     }
     if (cmd.type === '__stop') return end()
+    if (cmd.type === 'prompt' && typeof cmd.messageFile === 'string') {
+      // A long prompt send left in the inbox: only a plain file there.
+      const at = file(name, `inbox/${path.basename(cmd.messageFile)}`)
+      try {
+        if (!fs.lstatSync(at).isFile()) throw new Error('not a file')
+        cmd.message = fs.readFileSync(at, 'utf8')
+      } catch (err) {
+        log(`! could not read ${cmd.messageFile}: ${err.message}`)
+        return
+      } finally {
+        fs.rmSync(at, { force: true })
+      }
+      delete cmd.messageFile
+    }
     if (cmd.type === 'prompt') {
       st.promptSeq += 1
       st.prompts[cmd.id] = st.promptSeq
@@ -240,8 +296,9 @@ function serve(name, flags, extra) {
       log(`\n## you · ${cmd.id} · ${clock()}${cmd.streamingBehavior === 'steer' ? ' · steer' : ''}\n${cmd.message}`)
     }
     if (cmd.type === 'extension_ui_response') {
+      // Back to what the session was doing when pi asked.
+      st.state = st.dialog?.inRun === false ? 'idle' : 'busy'
       st.dialog = null
-      st.state = 'busy'
       log(`  answered ${cmd.id}`)
     }
     if (cmd.type === 'abort') log(`  abort requested · ${clock()}`)
@@ -256,6 +313,7 @@ function serve(name, flags, extra) {
 
   let lastDeltaSave = 0
   onLines(pi.stdout, line => {
+    if (finished) return
     events.write(`${line}\n`)
     let r
     try {
@@ -317,12 +375,17 @@ function serve(name, flags, extra) {
         break
       case 'extension_ui_request':
         if (DIALOGS.includes(r.method)) {
-          st.dialog = { id: r.id, method: r.method, title: r.title ?? r.message ?? '', options: r.options ?? null }
+          // inRun: asked during a run, which pi's next settle ends; outside
+          // one (an extension at startup) it stays until answered.
+          const inRun = st.state === 'busy' || (st.state === 'waiting' && st.dialog?.inRun !== false)
+          st.dialog = { id: r.id, method: r.method, title: r.title ?? r.message ?? '', options: r.options ?? null, inRun }
           st.state = 'waiting'
           log(`? ${r.method} ${r.id}: ${st.dialog.title}${r.options ? ` [${r.options.join(' | ')}]` : ''}`)
         }
         break
       case 'agent_settled':
+        // A run's dialog ends with the run (aborted, or resolved by pi).
+        if (st.dialog?.inRun !== false) st.dialog = null
         st.state = st.dialog ? 'waiting' : 'idle'
         // Only prompts pi had accepted before settling are done; one still in
         // flight starts a new run.
@@ -343,6 +406,8 @@ function serve(name, flags, extra) {
   pi.stdin.write(`${JSON.stringify({ id: 'pi-session-state', type: 'get_state' })}\n`)
 
   const finish = (state, code, why) => {
+    if (finished) return
+    finished = true
     clearInterval(beat)
     st.state = state
     st.exitCode = code
@@ -356,31 +421,41 @@ function serve(name, flags, extra) {
     events.end()
     process.exitCode = code ?? 1
   }
+  pi.stdin.on('error', () => {})
   pi.on('error', err => finish('failed', 127, `could not start ${PI}: ${err.message}`))
-  pi.on('exit', (code, signal) => {
+  // 'close' comes after pi's last output has been read, unlike 'exit'.
+  pi.on('close', (code, signal) => {
     if (ending && (code === 0 || signal === 'SIGTERM')) finish('stopped', code ?? 0)
     else finish('failed', code ?? 1, st.error ?? `pi exited (${signal ?? code}); see ${file(name, 'stderr.log')}`)
   })
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, end)
 }
 
-function send(name, flags, rest) {
-  needLive(name)
+async function send(name, flags, rest) {
+  await needLive(name)
   let message = rest.join(' ')
   if (flags.file) message = fs.readFileSync(flags.file, 'utf8')
   else if (message === '-') message = fs.readFileSync(0, 'utf8')
   if (!message.trim()) fail('nothing to send.')
-  const id = `p${Date.now().toString(36)}`
+  const id = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
   // Always says how to queue: pi refuses a plain prompt while it streams,
   // and our status can trail pi by a moment.
-  toPipe(name, { id, type: 'prompt', message, streamingBehavior: flags.steer ? 'steer' : 'followUp' })
+  const cmd = { id, type: 'prompt', message, streamingBehavior: flags.steer ? 'steer' : 'followUp' }
+  if (Buffer.byteLength(JSON.stringify(cmd)) + 1 > PIPE_LINE) {
+    // Too long for one pipe write: serve reads it from the inbox instead.
+    fs.mkdirSync(file(name, 'inbox'), { recursive: true })
+    fs.writeFileSync(file(name, `inbox/${id}.md`), message)
+    delete cmd.message
+    cmd.messageFile = `${id}.md`
+  }
+  toPipe(name, cmd)
   process.stdout.write(`${id}\n`)
 }
 
 async function wait(name, id, flags) {
   const deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity
   for (;;) {
-    const st = readStatus(name)
+    const st = await settledStatus(name)
     if (!st) fail(`no session ${name}.`)
     const target = id ? st.prompts?.[id] : st.promptSeq
     if (id && target == null && isLive(st)) {
@@ -449,8 +524,8 @@ function status(name, flags) {
   }
 }
 
-function answer(name, reqId, flags, rest) {
-  const st = needLive(name)
+async function answer(name, reqId, flags, rest) {
+  const st = await needLive(name)
   if (!reqId) fail('name the request id.')
   const d = st.dialog
   if (!d || d.id !== reqId) fail(`${name} has no open dialog ${reqId}${d ? ` (open: ${d.id})` : ''}.`)
@@ -463,8 +538,8 @@ function answer(name, reqId, flags, rest) {
   process.stdout.write('answered\n')
 }
 
-function forget(name) {
-  const st = readStatus(name)
+async function forget(name) {
+  const st = await settledStatus(name)
   if (isLive(st)) fail(`${name} is running; stop it first.`)
   if (!fs.existsSync(dir(name))) fail(`no session ${name}.`)
   fs.rmSync(dir(name), { recursive: true, force: true })
@@ -475,10 +550,10 @@ const [cmd, ...argv] = process.argv.slice(2)
 const { flags, rest, extra } = parse(argv)
 switch (cmd) {
   case 'serve':
-    serve(needName(rest[0]), flags, extra)
+    await serve(needName(rest[0]), flags, extra)
     break
   case 'send':
-    send(needName(rest[0]), flags, rest.slice(1))
+    await send(needName(rest[0]), flags, rest.slice(1))
     break
   case 'wait':
     await wait(needName(rest[0]), rest[1], flags)
@@ -491,20 +566,20 @@ switch (cmd) {
     status(rest[0] ? needName(rest[0]) : undefined, flags)
     break
   case 'answer':
-    answer(needName(rest[0]), rest[1], flags, rest.slice(2))
+    await answer(needName(rest[0]), rest[1], flags, rest.slice(2))
     break
   case 'abort':
-    needLive(needName(rest[0]))
+    await needLive(needName(rest[0]))
     toPipe(rest[0], { id: `a${Date.now().toString(36)}`, type: 'abort' })
     process.stdout.write('abort sent\n')
     break
   case 'stop':
-    needLive(needName(rest[0]))
+    await needLive(needName(rest[0]))
     toPipe(rest[0], { type: '__stop' })
     process.stdout.write('stopping\n')
     break
   case 'forget':
-    forget(needName(rest[0]))
+    await forget(needName(rest[0]))
     break
   default:
     process.stdout.write(`${USAGE}\n`)
