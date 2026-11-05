@@ -14,6 +14,11 @@
       "name": "todo",
       "source": "./todo",
       "description": "A TODO.md task board (Todo / Doing / Review / Done) with a side panel: quick capture, Claude enrichment with IDs, reviews and done logs"
+    },
+    {
+      "name": "pi",
+      "source": "./pi",
+      "description": "Long-lived pi coding-agent sessions from Claude Code: a sandboxed session runner, a panel, a guard on ~/.pi and a check of the key-masking setup"
     }
   ]
 }
