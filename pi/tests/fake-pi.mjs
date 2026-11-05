@@ -46,7 +46,7 @@ process.stdin.on('data', chunk => {
     const cmd = JSON.parse(buf.slice(0, i))
     buf = buf.slice(i + 1)
     if (cmd.type === 'get_state') {
-      out({ id: cmd.id, type: 'response', command: 'get_state', success: true, data: { model: { provider: 'fake', id: 'echo' }, sessionFile: '/tmp/fake.jsonl', isStreaming: false } })
+      out({ id: cmd.id, type: 'response', command: 'get_state', success: true, data: { model: { provider: process.env.FAKE_PI_PROVIDER || 'opencode-go', id: 'echo' }, sessionFile: '/tmp/fake.jsonl', isStreaming: false } })
     } else if (cmd.type === 'prompt' && /\breject\b/.test(cmd.message)) {
       out({ id: cmd.id, type: 'response', command: 'prompt', success: false, error: 'no model selected' })
     } else if (cmd.type === 'prompt') {

@@ -16,7 +16,7 @@ A `TODO.md` task board (Todo / Doing / Done) with a panel beside the transcript:
 
 ## pi
 
-Long-lived [pi](https://github.com/earendil-works/pi) coding-agent sessions run from Claude Code inside its Bash sandbox, so pi only sees a masked provider key: a session runner Claude drives, a panel listing the sessions, a guard keeping Claude's file tools out of `~/.pi`, and a check of the sandbox settings that do the masking. It needs a one-time sandbox setup before pi will start: see the [pi README](pi/README.md).
+Long-lived [pi](https://github.com/earendil-works/pi) coding-agent sessions run from Claude Code inside its Bash sandbox, so pi only sees a masked provider key: a session runner Claude drives, a panel listing the sessions, a guard keeping Claude's file tools out of `~/.pi`, and a check of the sandbox settings that do the masking. For now it works only with an opencode-go API key, and it needs a one-time sandbox setup before pi will start: see the [pi README](pi/README.md).
 
 ## Install
 

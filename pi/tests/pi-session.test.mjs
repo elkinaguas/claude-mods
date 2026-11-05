@@ -11,7 +11,13 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const SCRIPT = path.join(here, '..', 'scripts', 'pi-session.mjs')
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-session-'))
 // As inside Claude Code's sandbox, whether or not the tests run in one.
-const env = { ...process.env, SANDBOX_RUNTIME: '1', PI_SESSIONS_DIR: root, PI_SESSION_PI: path.join(here, 'fake-pi.mjs') }
+// A home of its own whose pi login is an opencode-go API key alone, as the gate needs.
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-home-'))
+const authFile = path.join(home, '.pi', 'agent', 'auth.json')
+const goodAuth = JSON.stringify({ 'opencode-go': { type: 'api_key', key: 'placeholder' } })
+fs.mkdirSync(path.dirname(authFile), { recursive: true })
+fs.writeFileSync(authFile, goodAuth)
+const env = { ...process.env, HOME: home, SANDBOX_RUNTIME: '1', PI_SESSIONS_DIR: root, PI_SESSION_PI: path.join(here, 'fake-pi.mjs') }
 const { SANDBOX_RUNTIME: _, ...bareEnv } = env
 const cli = (...args) => execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8' })
 const cliFails = (...args) => {
@@ -33,7 +39,7 @@ const until = async (fn, ms = 5000) => {
 
 let server
 const serve = async name => {
-  const child = spawn('node', [SCRIPT, 'serve', name, '--cwd', root], { env, stdio: 'ignore' })
+  const child = spawn('node', [SCRIPT, 'serve', name, '--cwd', root, '--model', 'opencode-go/echo'], { env, stdio: 'ignore' })
   await until(() => fs.existsSync(path.join(root, name, 'status.json')) && status(name).state === 'idle')
   return child
 }
@@ -44,11 +50,12 @@ before(async () => {
 after(() => {
   server?.kill()
   fs.rmSync(root, { recursive: true, force: true })
+  fs.rmSync(home, { recursive: true, force: true })
 })
 
 test('serve reports the model pi chose and goes idle', () => {
   const st = status('alpha')
-  assert.equal(st.model, 'fake/echo')
+  assert.equal(st.model, 'opencode-go/echo')
   assert.match(st.sessionId, /^claude-alpha-[0-9a-z]+$/)
   assert.equal(st.cwd, root)
 })
@@ -98,14 +105,14 @@ test('a wait that times out with --abort stops the run', () => {
 test('serve refuses to run outside the sandbox unless allowed, and marks such a session', async () => {
   let out = ''
   try {
-    execFileSync('node', [SCRIPT, 'serve', 'bare', '--cwd', root], { env: bareEnv, encoding: 'utf8', stdio: 'pipe' })
+    execFileSync('node', [SCRIPT, 'serve', 'bare', '--cwd', root, '--model', 'opencode-go/echo'], { env: bareEnv, encoding: 'utf8', stdio: 'pipe' })
   } catch (err) {
     out = `${err.stderr}`
     assert.equal(err.status, 1)
   }
   assert.match(out, /not inside Claude Code's Bash sandbox/)
   assert.ok(!fs.existsSync(path.join(root, 'bare')))
-  const child = spawn('node', [SCRIPT, 'serve', 'bare', '--cwd', root, '--allow-unsandboxed'], { env: bareEnv, stdio: 'ignore' })
+  const child = spawn('node', [SCRIPT, 'serve', 'bare', '--cwd', root, '--model', 'opencode-go/echo', '--allow-unsandboxed'], { env: bareEnv, stdio: 'ignore' })
   await until(() => fs.existsSync(path.join(root, 'bare', 'status.json')) && status('bare').state === 'idle')
   assert.equal(status('bare').sandboxed, false)
   assert.equal(status('alpha').sandboxed, true)
@@ -171,8 +178,46 @@ test('a live session whose heartbeat only looks stale (after sleep) is not taken
   assert.match(cliFails('forget', 'alpha').out, /running; stop it first/)
 })
 
+test('the gate: serve runs pi only on opencode-go, with its API key the only login', async () => {
+  const refused = (args, auth = goodAuth) => {
+    fs.writeFileSync(authFile, auth)
+    try {
+      return cliFails('serve', 'gated', '--cwd', root, ...args).out
+    } finally {
+      fs.writeFileSync(authFile, goodAuth)
+    }
+  }
+  assert.match(refused([]), /name the model: --model opencode-go\/<id>/)
+  assert.match(refused([]), /only with an opencode-go API key/)
+  assert.match(refused(['--model', 'anthropic/claude-x']), /is not an opencode-go model/)
+  assert.match(refused(['--model', 'opencode-go/echo', '--', '--provider', 'anthropic']), /extra pi arguments .* are off/)
+  assert.match(refused(['--model', 'opencode-go/echo'], JSON.stringify({ 'opencode-go': { type: 'oauth', refresh: 'r' } })), /no opencode-go API key \(its login is oauth\)/)
+  assert.match(
+    refused(['--model', 'opencode-go/echo'], JSON.stringify({ 'opencode-go': { type: 'api_key', key: 'k' }, anthropic: { type: 'oauth', refresh: 'r' } })),
+    /also holds anthropic/,
+  )
+  assert.match(refused(['--model', 'opencode-go/echo'], '{'), /could not read/)
+  fs.rmSync(path.join(root, 'gated'), { recursive: true, force: true })
+  // pi picking another provider after all ends the session.
+  const child = spawn('node', [SCRIPT, 'serve', 'other', '--cwd', root, '--model', 'opencode-go/echo'], { env: { ...env, FAKE_PI_PROVIDER: 'anthropic' }, stdio: 'ignore' })
+  await until(() => fs.existsSync(path.join(root, 'other', 'status.json')) && ['stopped', 'failed'].includes(status('other').state))
+  assert.match(status('other').error, /pi runs anthropic\/echo, not opencode-go/)
+  child.kill()
+  cli('forget', 'other')
+})
+
+test('serve passes only its own commands to pi: a model switch written to the pipe is refused', () => {
+  const fd = fs.openSync(path.join(root, 'alpha', 'in.fifo'), fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)
+  fs.writeSync(fd, `${JSON.stringify({ type: 'set_model', provider: 'anthropic', modelId: 'x' })}\n`)
+  fs.closeSync(fd)
+  const id = cli('send', 'alpha', 'still here').trim()
+  assert.equal(cli('wait', 'alpha', id, '--timeout', '5'), 'echo: still here\n')
+  assert.match(cli('read', 'alpha', '--tail', '20'), /refused a set_model command/)
+  assert.equal(status('alpha').model, 'opencode-go/echo')
+})
+
 test('status lists sessions in one line each', () => {
-  assert.match(cli('status'), /^alpha {2}idle {2}fake\/echo/m)
+  assert.match(cli('status'), /^alpha {2}idle {2}opencode-go\/echo/m)
 })
 
 test('names that pi would refuse are refused', () => {
