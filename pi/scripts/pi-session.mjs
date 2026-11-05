@@ -28,10 +28,18 @@ const DIALOGS = ['select', 'confirm', 'input', 'editor']
 // Claude Code's Bash sandbox sets this in every command it wraps. Outside it,
 // pi would read the real provider key from ~/.pi/agent/auth.json.
 const SANDBOXED = !!process.env.SANDBOX_RUNTIME
+// The gate: for now the mod runs pi only on opencode-go, with an API key that
+// is the only login in pi's auth.json. So pi-session can't be used to reach
+// any other provider's credentials (a Claude subscription login, say).
+const PROVIDER = 'opencode-go'
+const AUTH = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
+// What serve passes on from its pipe to pi; anything else (set_model, say) is refused.
+const PIPE_TYPES = ['prompt', 'abort', 'extension_ui_response', '__stop']
+const GATE_NOTE = `For now the pi mod works only with an ${PROVIDER} API key.`
 
 const USAGE = `pi-session: long-lived pi sessions for Claude Code
 
-  serve <name> [--cwd DIR] [--model PROVIDER/ID] [--thinking LEVEL] [--allow-unsandboxed] [-- PI_ARGS...]
+  serve <name> --model opencode-go/ID [--cwd DIR] [--thinking LEVEL] [--allow-unsandboxed]
       Run pi for this session until stopped. Run it in the background.
       Serving a stopped session again reopens its conversation. Refused
       outside Claude Code's sandbox unless --allow-unsandboxed (pi then reads
@@ -187,6 +195,26 @@ const argSummary = args => {
   return oneLine(key ? args[key] : JSON.stringify(args), 90)
 }
 
+// Refuses to serve unless the model is opencode-go's and auth.json holds an
+// opencode-go API key and nothing else. Reads only the entries' names and
+// types: inside the sandbox the key itself is masked anyway.
+function gate(model, extra) {
+  if (extra.length) fail(`extra pi arguments (${extra.join(' ')}) are off. ${GATE_NOTE}`)
+  if (!model) fail(`name the model: --model ${PROVIDER}/<id>. ${GATE_NOTE}`)
+  if (!model.startsWith(`${PROVIDER}/`)) fail(`${model} is not an ${PROVIDER} model. ${GATE_NOTE}`)
+  let auth
+  try {
+    auth = JSON.parse(fs.readFileSync(AUTH, 'utf8'))
+  } catch (err) {
+    fail(`could not read ${AUTH} (${err.code ?? 'not JSON'}). Log in to ${PROVIDER} in pi with an API key first. ${GATE_NOTE}`)
+  }
+  const entry = auth && typeof auth === 'object' ? auth[PROVIDER] : null
+  if (!entry || entry.type !== 'api_key') fail(`${AUTH} has no ${PROVIDER} API key${entry?.type ? ` (its login is ${entry.type})` : ''}. ${GATE_NOTE}`)
+  const others = Object.keys(auth).filter(n => n !== PROVIDER)
+  if (others.length)
+    fail(`${AUTH} also holds ${others.join(', ')}. pi-session runs pi only while the ${PROVIDER} API key is the only login there, so no other provider's credentials are within reach. Log out of the others in pi first. ${GATE_NOTE}`)
+}
+
 async function serve(name, flags, extra) {
   if (!SANDBOXED && !flags['allow-unsandboxed'])
     fail(`not inside Claude Code's Bash sandbox, so pi would read your real provider key. Run it from Claude's Bash tool with the sandbox on.`)
@@ -197,6 +225,7 @@ async function serve(name, flags, extra) {
   const cwd = path.resolve(flags.cwd ?? meta.cwd ?? process.cwd())
   const model = flags.model ?? meta.model
   const thinking = flags.thinking ?? meta.thinking
+  gate(model, extra)
   // pi's own session id: reopened when the session is served again, and new
   // for a new session, so a name used again after forget starts afresh.
   const sessionId = meta.sessionId ?? `claude-${name}-${Date.now().toString(36)}`
@@ -210,7 +239,6 @@ async function serve(name, flags, extra) {
   const args = ['--mode', 'rpc', '--session-id', sessionId]
   if (model) args.push('--model', model)
   if (thinking) args.push('--thinking', thinking)
-  args.push(...extra)
 
   const st = {
     name,
@@ -273,6 +301,11 @@ async function serve(name, flags, extra) {
     } catch {
       return
     }
+    if (!PIPE_TYPES.includes(cmd?.type)) {
+      // A model or provider switch would get past the gate; only our own commands go to pi.
+      log(`! refused a ${String(cmd?.type)} command: only prompts, answers, abort and stop reach pi. ${GATE_NOTE}`)
+      return save()
+    }
     if (cmd.type === '__stop') return end()
     if (cmd.type === 'prompt' && typeof cmd.messageFile === 'string') {
       // A long prompt send left in the inbox: only a plain file there.
@@ -327,6 +360,12 @@ async function serve(name, flags, extra) {
         if (r.id === 'pi-session-state' && r.success) {
           const m = r.data?.model
           if (m) st.model = `${m.provider}/${m.id}`
+          if (m?.provider !== PROVIDER) {
+            // pi chose another provider after all: end the session.
+            st.error = `pi runs ${st.model ?? 'no model'}, not ${PROVIDER}. ${GATE_NOTE}`
+            log(`! ${st.error}`)
+            end()
+          }
           st.sessionFile = r.data?.sessionFile ?? null
           if (st.state === 'starting') st.state = r.data?.isStreaming ? 'busy' : 'idle'
         } else if (!r.success) {

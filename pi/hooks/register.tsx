@@ -179,8 +179,15 @@ export const runsExcluded = (command: string, excluded: string[]): boolean => {
  */
 export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUnsandboxed: boolean }): string | null => {
   const text = flat(command)
-  // pi-session trusts this to tell it runs in the sandbox; only the sandbox sets it.
-  if (/SANDBOX_RUNTIME/.test(text)) return 'pi: SANDBOX_RUNTIME is set by the sandbox itself; a command may not set or change it.'
+  // pi-session trusts this to tell it runs in the sandbox; only the sandbox
+  // sets it. Naming it (a search, say) is fine; setting or unsetting it is not.
+  if (/SANDBOX_RUNTIME\s*=|unset\s+(-v\s+)?SANDBOX_RUNTIME/.test(text))
+    return 'pi: SANDBOX_RUNTIME is set by the sandbox itself; a command may not set or change it.'
+  // Likewise the program pi-session runs as pi: pointing it elsewhere would get past the gate.
+  if (/PI_SESSION_PI\s*=/.test(text)) return 'pi: PI_SESSION_PI is for the mod\'s own tests; a command may not set it.'
+  // The opencode-go gate lives in pi-session, so pi runs only through it
+  // (pi run directly could use any provider, and `pi auth` prints keys).
+  if (runsExcluded(text, ['pi'])) return `pi: run pi only through pi-session (node <pi mod>/scripts/pi-session.mjs serve <name> --model opencode-go/<id>). For now the pi mod works only with an opencode-go API key.`
   if (ALLOW_RE.test(text) && !o.allowUnsandboxed)
     return 'pi: --allow-unsandboxed lets pi read your real key, and only you can allow it (/plugin configure pi@claude-mods, allowUnsandboxed). Run pi-session inside the sandbox instead.'
   if (!o.unsandboxed || !PI_RE.test(text)) return null
@@ -241,6 +248,11 @@ export const settingsProblems = (settingsText: string | null, homeDir: string, l
   const entry = files.map(obj).find(f => resolvePath(str(f.path) ?? '', homeDir, homeDir) === auth)
   const masked = str(entry?.mode) === 'mask'
   if (!masked) out.push('~/.pi/agent/auth.json is not masked (sandbox.credentials.files, mode "mask"): commands Claude runs can read your key.')
+  // The opencode-go gate: the real key may be put back on opencode.ai only.
+  const hosts = Array.isArray(entry?.injectHosts) ? (entry!.injectHosts as unknown[]).filter((h): h is string => typeof h === 'string') : []
+  const otherHosts = hosts.filter(h => h !== 'opencode.ai')
+  if (masked && otherHosts.length)
+    out.push(`auth.json's key is also put back on ${otherHosts.join(', ')}. For now the pi mod works only with an opencode-go API key: set injectHosts to ["opencode.ai"].`)
   const deny = Array.isArray(obj(s.permissions).deny) ? (obj(s.permissions).deny as unknown[]) : []
   if (deny.some(r => typeof r === 'string' && /^Read\(.*auth\.json/.test(r)))
     out.push('A Read(...) deny rule on auth.json turns the mask into a block: pi finds no key. Remove it; the pi mod guards Claude\'s file tools instead.')
@@ -361,7 +373,8 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
 
   node ${script($)} <command>
 
-- Start: run \`serve <name> --cwd <dir> [--model provider/id]\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way.
+- Start: run \`serve <name> --cwd <dir> --model opencode-go/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused).
+- For now pi works only on opencode-go with an API key: serve refuses another provider's model, extra pi arguments, and an auth.json holding any other login. If it refuses, tell the person why; never try to get around the gate.
 - Work: \`send <name> "<prompt>"\` prints a prompt id. While pi works a new prompt queues as a follow-up; \`--steer\` delivers it before pi's next model call instead.
 - Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply (exit 3: pi asks a question, answer with \`answer <name> <request-id> <value>\`). To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply.
 - Control: \`status\`, \`abort <name>\` (stop the current run), \`stop <name>\` (end the session), \`forget <name>\`.

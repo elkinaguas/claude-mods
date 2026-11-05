@@ -167,6 +167,23 @@ test('Bash: other spellings of the key file, SANDBOX_RUNTIME and excluded comman
   expect(bashRefusal('SANDBOX_RUNTIME=1 node /x/pi-session.mjs serve x', on)).toMatch(/set by the sandbox itself/)
   expect(bashRefusal('export SANDBOX_""RUNTIME=1', on)).toMatch(/set by the sandbox itself/)
   expect(bashRefusal('npm test -- auth', allowed)).toBe(null)
+  // Naming it is fine; only setting it is refused.
+  expect(bashRefusal('grep -n SANDBOX_RUNTIME pi/scripts/pi-session.mjs', on)).toBe(null)
+  expect(bashRefusal('unset SANDBOX_RUNTIME; node x', on)).toMatch(/set by the sandbox itself/)
+  expect(bashRefusal('PI_SESSION_PI=/bin/sh node /x/pi-session.mjs serve x', on)).toMatch(/PI_SESSION_PI is for the mod/)
+})
+
+test('the opencode-go gate: pi only through pi-session, the key only on opencode.ai', () => {
+  const on = { unsandboxed: false, allowUnsandboxed: false }
+  for (const c of ['pi --list-models', 'pi auth print anthropic', 'cd x && pi -p "hi" --provider anthropic', '~/.npm-global/bin/pi --mode rpc'])
+    expect(bashRefusal(c, on)).toMatch(/run pi only through pi-session.*only with an opencode-go API key/)
+  expect(bashRefusal('node /x/pi/scripts/pi-session.mjs serve demo --model opencode-go/glm-5.3', on)).toBe(null)
+  expect(bashRefusal('ls pi/tests && git log -- pi', on)).toBe(null)
+  const wide = {
+    ...goodSettings,
+    sandbox: { ...goodSettings.sandbox, credentials: { files: [{ path: '/home/u/.pi/agent/auth.json', mode: 'mask', injectHosts: ['opencode.ai', 'api.anthropic.com'] }] } },
+  }
+  expect(settingsProblems(JSON.stringify(wide), HOME).join()).toMatch(/also put back on api\.anthropic\.com.*only with an opencode-go API key/)
   expect(runsExcluded('docker run -v ~/.pi/agent:/k alpine cat /k/auth.json', ['docker'])).toBe(true)
   expect(runsExcluded('cd x && FOO=1 sudo /usr/bin/docker ps', ['docker:*'])).toBe(true)
   expect(runsExcluded('ls; git status', ['docker'])).toBe(false)
@@ -206,7 +223,7 @@ test('unsandboxed, Bash commands that reach pi or its key are refused', () => {
   const allowed = { unsandboxed: true, allowUnsandboxed: true }
   expect(bashRefusal('node /x/pi-session.mjs serve demo', off)).toMatch(/outside the Bash sandbox/)
   expect(bashRefusal('cat ~/.pi/agent/auth.json', off)).toMatch(/names auth\.json/)
-  expect(bashRefusal('pi --mode rpc', off)).toMatch(/outside the Bash sandbox/)
+  expect(bashRefusal('pi --mode rpc', off)).toMatch(/run pi only through pi-session/)
   expect(bashRefusal('ls ~/.pi', off)).toMatch(/outside the Bash sandbox/)
   expect(bashRefusal('git status', off)).toBe(null)
   expect(bashRefusal('ls pi/tests', off)).toBe(null)
