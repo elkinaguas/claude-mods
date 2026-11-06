@@ -24,6 +24,12 @@
       "title": "Allow pi without the sandbox (exposes your key)",
       "description": "Let pi-session start pi when Claude Code's Bash sandbox is off. pi then reads your real provider key, and Claude's unsandboxed commands could too. Off: pi is refused outside the sandbox. Use a separate, revocable key if you turn this on.",
       "default": false
+    },
+    "trustedModelHosts": {
+      "type": "string",
+      "title": "Trusted model hosts",
+      "description": "Hosts where pi may also run models defined in ~/.pi/agent/models.json, such as your company's internal model: comma-separated, as host (default port only), host:port or host:*, with *.domain for subdomains. Every provider in models.json must then be at one of them and auth.json must hold no login. Empty: opencode-go only.",
+      "default": ""
     }
   }
 }

@@ -45,6 +45,9 @@ let cwd = ''
 let autoOpen = true
 let caWarnDays = 30
 let allowUnsandboxed = false
+// The person's trusted model hosts (option trustedModelHosts), valid entries only.
+let trustedHosts: string[] = []
+let badHosts: string[] = []
 // What the settings say about the sandbox, from the last check.
 let sandboxOff = false
 let seen = ''
@@ -187,7 +190,10 @@ export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUns
   if (/PI_SESSION_PI\s*=/.test(text)) return 'pi: PI_SESSION_PI is for the mod\'s own tests; a command may not set it.'
   // The opencode-go gate lives in pi-session, so pi runs only through it
   // (pi run directly could use any provider, and `pi auth` prints keys).
-  if (runsExcluded(text, ['pi'])) return `pi: run pi only through pi-session (node <pi mod>/scripts/pi-session.mjs serve <name> --model opencode-go/<id>). For now the pi mod works only with an opencode-go API key.`
+  if (runsExcluded(text, ['pi'])) return `pi: run pi only through pi-session (node <pi mod>/scripts/pi-session.mjs serve <name> --model <provider>/<id>). The pi mod works only with an opencode-go API key, or a model at a host you trust (option trustedModelHosts).`
+  // The trusted hosts are the person's option; the mod passes them, never Claude.
+  if (/--trusted-hosts/.test(text))
+    return 'pi: the trusted model hosts come from your option trustedModelHosts (/plugin configure pi@claude-mods); the mod passes them to serve itself, and a command may not.'
   if (ALLOW_RE.test(text) && !o.allowUnsandboxed)
     return 'pi: --allow-unsandboxed lets pi read your real key, and only you can allow it (/plugin configure pi@claude-mods, allowUnsandboxed). Run pi-session inside the sandbox instead.'
   if (!o.unsandboxed || !PI_RE.test(text)) return null
@@ -204,6 +210,19 @@ export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUns
  */
 export const withAllowFlag = (command: string): string =>
   command.replace(/(pi-session(?:\.mjs)?["']?\s+serve)(?=\s|$)(?![^;&|\n]*--allow-unsandboxed)/g, '$1 --allow-unsandboxed')
+
+/** The same, adding `--trusted-hosts <list>` (the person's option, entries already validated) to each serve. */
+export const withTrustedHosts = (command: string, hosts: string[]): string =>
+  hosts.length ? command.replace(/(pi-session(?:\.mjs)?["']?\s+serve)(?=\s|$)/g, `$1 --trusted-hosts ${hosts.join(',')}`) : command
+
+// Matches pi-session's host entry: host, host:port or host:*, with *. for subdomains and [v6].
+const HOST_ENTRY = /^(\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:]+\])(?::(\d{1,5}|\*))?$/i
+
+/** The option's comma- or space-separated entries, split into valid ones and the rest. */
+export const parseTrustedHosts = (value: unknown): { valid: string[]; invalid: string[] } => {
+  const all = typeof value === 'string' ? value.split(/[\s,]+/).filter(Boolean) : []
+  return { valid: all.filter(h => HOST_ENTRY.test(h)).map(h => h.toLowerCase()), invalid: all.filter(h => !HOST_ENTRY.test(h)) }
+}
 
 /** One settings file that can set sandbox.enabled, highest precedence first. */
 export type SettingsLayer = { name: string; text: string | null }
@@ -241,8 +260,19 @@ export const settingsProblems = (settingsText: string | null, homeDir: string, l
   const out: string[] = []
   const sandbox = obj(s.sandbox)
   const on = sandboxSetting(layers, settingsText)
-  if (!on.enabled)
-    out.push(`The Bash sandbox is off (${on.source}): pi would read your real provider key, and so could Claude's commands. ${allowUnsandboxed ? 'allowUnsandboxed is on, so pi-session starts pi anyway.' : 'pi-session refuses to start pi.'}`)
+  if (!on.enabled) {
+    out.push(
+      `The Bash sandbox is off (${on.source}): pi would read your real provider key, and so could Claude's commands. ${
+        !allowUnsandboxed
+          ? 'pi-session refuses to start pi.'
+          : trustedHosts.length
+            ? `allowUnsandboxed is on, so pi-session starts pi anyway, on a model at your trusted hosts (${trustedHosts.join(', ')}) or on opencode-go.`
+            : 'allowUnsandboxed is on, so pi-session starts pi anyway.'
+      }`,
+    )
+    // The mask and TLS termination only act inside the sandbox: nothing more to check.
+    return out
+  }
   const auth = `${homeDir}/.pi/agent/auth.json`
   const files = Array.isArray(obj(sandbox.credentials).files) ? (obj(sandbox.credentials).files as unknown[]) : []
   const entry = files.map(obj).find(f => resolvePath(str(f.path) ?? '', homeDir, homeDir) === auth)
@@ -287,6 +317,8 @@ async function check($: EngineInterface): Promise<string[]> {
   const { text, layers } = await readSettings($)
   sandboxOff = !sandboxSetting(layers, text).enabled
   const problems = settingsProblems(text, home, layers)
+  if (badHosts.length)
+    problems.push(`trustedModelHosts has entries that are not a host, host:port or host:* (${badHosts.join(', ')}); they are ignored.`)
   const escapes = sandboxEscapes([text, ...layers.map(l => l.text)])
   if (!sandboxOff && escapes.excluded.length)
     problems.push(
@@ -373,8 +405,8 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
 
   node ${script($)} <command>
 
-- Start: run \`serve <name> --cwd <dir> --model opencode-go/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused).
-- For now pi works only on opencode-go with an API key: serve refuses another provider's model, extra pi arguments, and an auth.json holding any other login. If it refuses, tell the person why; never try to get around the gate.
+- Start: run \`serve <name> --cwd <dir> --model <provider>/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused).
+- pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); the mod passes those hosts to serve itself` : ''}. serve refuses any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If it refuses, tell the person why; never try to get around the gate.
 - Work: \`send <name> "<prompt>"\` prints a prompt id. While pi works a new prompt queues as a follow-up; \`--steer\` delivers it before pi's next model call instead.
 - Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply (exit 3: pi asks a question, answer with \`answer <name> <request-id> <value>\`). To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply.
 - Control: \`status\`, \`abort <name>\` (stop the current run), \`stop <name>\` (end the session), \`forget <name>\`.
@@ -401,6 +433,7 @@ export const register: Register = (on, options) => {
   autoOpen = options.autoOpen !== false
   caWarnDays = typeof options.caWarnDays === 'number' && options.caWarnDays >= 0 ? options.caWarnDays : 30
   allowUnsandboxed = options.allowUnsandboxed === true
+  ;({ valid: trustedHosts, invalid: badHosts } = parseTrustedHosts(options.trustedModelHosts))
   seen = ''
 
   on('session.start', async ($, e, next) => {
@@ -436,7 +469,7 @@ export const register: Register = (on, options) => {
       const unsandboxed = sandboxOff || input.dangerouslyDisableSandbox === true || runsExcluded(command, excluded)
       const why = bashRefusal(command, { unsandboxed, allowUnsandboxed })
       if (why) return { deny: why }
-      const allowed = allowUnsandboxed ? withAllowFlag(command) : command
+      const allowed = withTrustedHosts(allowUnsandboxed ? withAllowFlag(command) : command, trustedHosts)
       return allowed === command ? next(e) : next({ ...e, command: allowed })
     }
     const base = cwd || home

@@ -1,6 +1,18 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bashRefusal, daysLeft, reachesPiDir, resolvePath, runsExcluded, sandboxEscapes, sandboxSetting, settingsProblems, withAllowFlag } from '../hooks/register'
+import {
+  bashRefusal,
+  daysLeft,
+  parseTrustedHosts,
+  reachesPiDir,
+  resolvePath,
+  runsExcluded,
+  sandboxEscapes,
+  sandboxSetting,
+  settingsProblems,
+  withAllowFlag,
+  withTrustedHosts,
+} from '../hooks/register'
 
 const HOME = '/home/u'
 
@@ -171,6 +183,44 @@ test('Bash: other spellings of the key file, SANDBOX_RUNTIME and excluded comman
   expect(bashRefusal('grep -n SANDBOX_RUNTIME pi/scripts/pi-session.mjs', on)).toBe(null)
   expect(bashRefusal('unset SANDBOX_RUNTIME; node x', on)).toMatch(/set by the sandbox itself/)
   expect(bashRefusal('PI_SESSION_PI=/bin/sh node /x/pi-session.mjs serve x', on)).toMatch(/PI_SESSION_PI is for the mod/)
+})
+
+test('trusted model hosts: parsed from the option, passed to serve by the mod only', () => {
+  expect(parseTrustedHosts('llm.corp.example.com, *.corp.example.com:8443 localhost:* [::1]:8080 bad/host')).toEqual({
+    valid: ['llm.corp.example.com', '*.corp.example.com:8443', 'localhost:*', '[::1]:8080'],
+    invalid: ['bad/host'],
+  })
+  expect(parseTrustedHosts(undefined)).toEqual({ valid: [], invalid: [] })
+  expect(withTrustedHosts('node /x/pi-session.mjs serve demo --model corp/m', ['llm.corp', 'localhost:*'])).toBe(
+    'node /x/pi-session.mjs serve --trusted-hosts llm.corp,localhost:* demo --model corp/m',
+  )
+  expect(withTrustedHosts('node /x/pi-session.mjs status', ['llm.corp'])).toBe('node /x/pi-session.mjs status')
+  expect(withTrustedHosts('node /x/pi-session.mjs serve demo', [])).toBe('node /x/pi-session.mjs serve demo')
+  expect(bashRefusal('node /x/pi-session.mjs serve demo --trusted-hosts api.openai.com', { unsandboxed: false, allowUnsandboxed: false })).toMatch(
+    /come from your option trustedModelHosts/,
+  )
+})
+
+test('with trustedModelHosts set, the mod adds them to serve', { options: { trustedModelHosts: 'llm.corp.example.com' } }, async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  on('fs.read', (_, e) => {
+    if (e.path === '/home/u/.claude/settings.json') return { value: JSON.stringify(goodSettings) }
+    throw new Error('missing')
+  })
+  const seen: string[] = []
+  on('tool.call', (_, e) => {
+    seen.push(String((e as unknown as { command?: string }).command))
+    return { result: {} }
+  })
+  expect((await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs serve corp --model corp/m' } as never)).deny).toBe(undefined)
+  expect(seen.at(-1)).toBe('node /x/pi-session.mjs serve --trusted-hosts llm.corp.example.com corp --model corp/m')
+})
+
+test('without the sandbox the check says so once, not the mask and TLS lines that only act inside it', () => {
+  const off = JSON.stringify({ sandbox: { enabled: false } })
+  const problems = settingsProblems(off, HOME)
+  expect(problems.length).toBe(1)
+  expect(problems[0]).toMatch(/sandbox is off.*refuses to start pi/)
 })
 
 test('the opencode-go gate: pi only through pi-session, the key only on opencode.ai', () => {

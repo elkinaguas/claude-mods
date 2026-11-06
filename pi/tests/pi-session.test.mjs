@@ -206,6 +206,63 @@ test('the gate: serve runs pi only on opencode-go, with its API key the only log
   cli('forget', 'other')
 })
 
+test('a model at a trusted host: host and port matched exactly, models.json and auth.json kept clean', async () => {
+  const modelsFile = path.join(home, '.pi', 'agent', 'models.json')
+  const corp = (baseUrl, more = {}) => JSON.stringify({ providers: { corp: { baseUrl, apiKey: 'dummy', models: [{ id: 'm' }] }, ...more } })
+  // With an opencode-go login still in auth.json, a config whose hosts pass
+  // stops at the auth.json rule; one whose hosts fail stops before it.
+  const outcome = (models, hosts, model = 'corp/m') => {
+    fs.writeFileSync(modelsFile, models)
+    try {
+      return cliFails('serve', 'corp', '--cwd', root, '--model', model, ...(hosts ? ['--trusted-hosts', hosts] : [])).out
+    } finally {
+      fs.rmSync(modelsFile, { force: true })
+    }
+  }
+  const passes = /holds opencode-go\. A model at a trusted host runs only while auth\.json holds no login/
+  const fails = /defines corp with no base URL at a trusted host/
+  // Host alone: the scheme's default port only.
+  assert.match(outcome(corp('https://llm.corp.example.com/v1'), 'llm.corp.example.com'), passes)
+  assert.match(outcome(corp('https://llm.corp.example.com:443/v1'), 'llm.corp.example.com'), passes)
+  assert.match(outcome(corp('https://llm.corp.example.com:8443/v1'), 'llm.corp.example.com'), fails)
+  assert.match(outcome(corp('http://llm.corp.example.com/v1'), 'llm.corp.example.com'), passes)
+  // An explicit port, or any port.
+  assert.match(outcome(corp('https://llm.corp.example.com:8443/v1'), 'llm.corp.example.com:8443'), passes)
+  assert.match(outcome(corp('https://llm.corp.example.com:9000/v1'), 'llm.corp.example.com:8443'), fails)
+  assert.match(outcome(corp('http://localhost:11434/v1'), 'localhost:*'), passes)
+  // *. covers subdomains, not the domain itself; other hosts never pass.
+  assert.match(outcome(corp('https://llm.corp.example.com/v1'), '*.corp.example.com'), passes)
+  assert.match(outcome(corp('https://corp.example.com/v1'), '*.corp.example.com'), fails)
+  assert.match(outcome(corp('https://llm.corp.example.com.evil.io/v1'), 'llm.corp.example.com'), fails)
+  // Every provider in models.json must be at a trusted host, in either mode.
+  assert.match(outcome(corp('https://llm.corp.example.com/v1', { openai: { baseUrl: 'https://api.openai.com/v1', apiKey: 'sk' } }), 'llm.corp.example.com'), /defines openai with no base URL/)
+  assert.match(outcome(corp('https://llm.corp.example.com/v1'), null, 'opencode-go/echo'), fails)
+  // No trusted hosts: only opencode-go.
+  assert.match(outcome('{}', null), /is not an opencode-go model/)
+  assert.match(outcome(corp('https://llm.corp.example.com/v1'), 'llm.corp.example.com', 'other/m'), /other is not defined in .*models\.json/)
+  assert.match(outcome('{}', 'not a host!'), /not a host, host:port or host:\*/)
+  fs.rmSync(path.join(root, 'corp'), { recursive: true, force: true })
+
+  // With auth.json empty it serves, on the trusted provider.
+  fs.writeFileSync(modelsFile, corp('https://llm.corp.example.com/v1'))
+  fs.writeFileSync(authFile, '{}')
+  const child = spawn('node', [SCRIPT, 'serve', 'corp', '--cwd', root, '--model', 'corp/m', '--trusted-hosts', 'llm.corp.example.com'], {
+    env: { ...env, FAKE_PI_PROVIDER: 'corp' },
+    stdio: 'ignore',
+  })
+  try {
+    await until(() => fs.existsSync(path.join(root, 'corp', 'status.json')) && status('corp').state === 'idle')
+    assert.equal(status('corp').model, 'corp/echo')
+    cli('stop', 'corp')
+    await until(() => status('corp').state === 'stopped')
+  } finally {
+    child.kill()
+    fs.rmSync(modelsFile, { force: true })
+    fs.writeFileSync(authFile, goodAuth)
+  }
+  cli('forget', 'corp')
+})
+
 test('serve passes only its own commands to pi: a model switch written to the pipe is refused', () => {
   const fd = fs.openSync(path.join(root, 'alpha', 'in.fifo'), fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)
   fs.writeSync(fd, `${JSON.stringify({ type: 'set_model', provider: 'anthropic', modelId: 'x' })}\n`)
