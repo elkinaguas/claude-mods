@@ -2,15 +2,14 @@
 
 Long-lived [pi](https://github.com/earendil-works/pi) coding-agent sessions run from Claude Code, with pi kept inside Claude Code's Bash sandbox so it only ever sees a masked provider key.
 
-> **For now, this mod works only with an opencode-go API key.** pi must be logged in to `opencode-go` with an API key (not OAuth), and that key must be the only login in `~/.pi/agent/auth.json`. `pi-session serve` refuses to start otherwise:
+> **This mod works only with an opencode-go API key, or a model at a host you trust.** `pi-session serve` refuses to start unless one of these holds:
 >
-> - a model from another provider (`--model` must be `opencode-go/<id>`), or no model;
-> - extra pi arguments;
-> - an `auth.json` holding any other provider's login.
+> - **opencode-go:** `--model opencode-go/<id>`, with an opencode-go API key (not OAuth) that is the only login in `~/.pi/agent/auth.json`;
+> - **a trusted host:** `--model <provider>/<id>` for a provider that `~/.pi/agent/models.json` points at a host listed in the option `trustedModelHosts` (see [Trusted model hosts](#trusted-model-hosts)), with no login in `auth.json`.
 >
-> If pi still ends up on another provider, the session is stopped. Running `pi` directly, rather than through `pi-session`, is refused, and so are model switches sent to a session's pipe. The setup check also flags a mask that puts the key back on any host other than `opencode.ai`.
+> Either way, every provider in `models.json` must be at a trusted host, and extra pi arguments are refused. If pi still ends up on another provider, the session is stopped. Running `pi` directly, rather than through `pi-session`, is refused, and so are model switches sent to a session's pipe. The setup check also flags a mask that puts the key back on any host other than `opencode.ai`.
 >
-> This keeps the mod from becoming a way to reach other credentials, such as a Claude subscription login in pi, which must never be used outside Claude Code. Support for other providers may come later.
+> This keeps the mod from becoming a way to reach other credentials, such as a Claude subscription login in pi, which must never be used outside Claude Code.
 
 > **Setup required before first use.** This mod is safe by default: it refuses to start pi until Claude Code's Bash sandbox is on and masks your provider key. The sandbox is off by default in Claude Code, so out of the box `/pi check` reports problems and pi won't start. Set it up once, as described in [Why the sandbox setup](#why-the-sandbox-setup), then run `/pi check` until it says the setup looks right.
 >
@@ -54,10 +53,32 @@ The mod never starts pi itself: a mod's code runs outside the sandbox, where pi 
 
 Make the CA once with `openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=Claude sandbox CA" -keyout ~/.config/claude-sandbox-ca/ca.key -out ~/.config/claude-sandbox-ca/ca.crt` (the proxy reads RSA keys only). Then log in to `opencode-go` in pi with an API key, and keep it the only login in `auth.json` (see the note at the top).
 
+## Trusted model hosts
+
+To run pi on a model your organisation hosts, such as an internal OpenAI-compatible endpoint, define it in pi's `~/.pi/agent/models.json` and list its host in the option `trustedModelHosts` (`/plugin configure pi@claude-mods`). Only you can set it: the mod passes the list to `serve` itself, and a command that passes `--trusted-hosts` is refused.
+
+```jsonc
+// ~/.pi/agent/models.json
+{ "providers": { "corp": { "baseUrl": "https://llm.corp.example.com/v1", "api": "openai-completions", "apiKey": "dummy", "models": [{ "id": "corp-coder" }] } } }
+```
+
+With `trustedModelHosts` set to `llm.corp.example.com`, Claude serves it with `--model corp/corp-coder`. Entries are comma-separated, and ports are matched exactly:
+
+| Entry | Matches |
+| --- | --- |
+| `llm.corp.example.com` | that host on the URL scheme's default port (443 for https, 80 for http) |
+| `llm.corp.example.com:8443` | that host on port 8443 only |
+| `localhost:*` | that host on any port |
+| `*.corp.example.com` | its subdomains (not `corp.example.com` itself), default port; `*.corp.example.com:8443` for a port |
+
+Every provider in `models.json` must be at a trusted host, and `auth.json` must be empty or missing, so no other service's key is within reach. `serve` reads only provider names and base URLs, never a key or token.
+
+Without the sandbox (with `allowUnsandboxed` on), Claude could read `models.json`. That's harmless with a dummy token, but a real one would be exposed to Claude like any unsandboxed secret. What pi reads (your code, files) goes to that host: list only hosts your organisation runs.
+
 ## pi-session
 
 ```
-pi-session serve <name> --model opencode-go/ID [--cwd DIR] [--thinking LEVEL] [--allow-unsandboxed]
+pi-session serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]   # --allow-unsandboxed, --trusted-hosts: added by the mod
 pi-session send <name> [--steer] <prompt...> | --file FILE | -
 pi-session wait <name> [ID] [--timeout SECONDS [--abort]]   # exit 3: pi asks; 2: timed out (--abort stops the run)
 pi-session read <name> [--last | --tail N | --since LINE]

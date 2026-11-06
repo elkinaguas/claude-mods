@@ -28,22 +28,56 @@ const DIALOGS = ['select', 'confirm', 'input', 'editor']
 // Claude Code's Bash sandbox sets this in every command it wraps. Outside it,
 // pi would read the real provider key from ~/.pi/agent/auth.json.
 const SANDBOXED = !!process.env.SANDBOX_RUNTIME
-// The gate: for now the mod runs pi only on opencode-go, with an API key that
-// is the only login in pi's auth.json. So pi-session can't be used to reach
-// any other provider's credentials (a Claude subscription login, say).
+// The gate: the mod runs pi only on opencode-go, with an API key that is the
+// only login in pi's auth.json, or on a model whose provider models.json
+// points at a host the person trusts (option trustedModelHosts, passed by the
+// mod as --trusted-hosts). So pi-session can't be used to reach any other
+// provider's credentials (a Claude subscription login, say).
 const PROVIDER = 'opencode-go'
 const AUTH = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
+const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')
 // What serve passes on from its pipe to pi; anything else (set_model, say) is refused.
 const PIPE_TYPES = ['prompt', 'abort', 'extension_ui_response', '__stop']
-const GATE_NOTE = `For now the pi mod works only with an ${PROVIDER} API key.`
+const GATE_NOTE = `The pi mod works only with an ${PROVIDER} API key, or a model at a host you trust (option trustedModelHosts).`
+
+/**
+ * One trusted host entry: `host` (the URL scheme's default port only),
+ * `host:port`, `host:*` (any port), with `*.domain` for its subdomains and
+ * `[v6]` for an IPv6 address. Null when the entry is not one of these.
+ */
+const parseHostEntry = entry => {
+  const m = /^(\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:]+\])(?::(\d{1,5}|\*))?$/i.exec(entry.trim())
+  if (!m) return null
+  return { sub: !!m[1], host: m[2].toLowerCase(), port: m[3] ?? null }
+}
+
+/** Whether a URL's host and port are one of the trusted entries. */
+const trustedUrl = (url, entries) => {
+  let u
+  try {
+    u = new URL(url)
+  } catch {
+    return false
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return false
+  const host = u.hostname.toLowerCase()
+  const port = u.port || (u.protocol === 'https:' ? '443' : '80')
+  return entries.some(e => {
+    const hostOk = e.sub ? host.endsWith(`.${e.host}`) : host === e.host
+    const portOk = e.port === '*' || (e.port ?? (u.protocol === 'https:' ? '443' : '80')) === port
+    return hostOk && portOk
+  })
+}
 
 const USAGE = `pi-session: long-lived pi sessions for Claude Code
 
-  serve <name> --model opencode-go/ID [--cwd DIR] [--thinking LEVEL] [--allow-unsandboxed]
+  serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]
       Run pi for this session until stopped. Run it in the background.
-      Serving a stopped session again reopens its conversation. Refused
+      Serving a stopped session again reopens its conversation. PROVIDER is
+      opencode-go, or one models.json points at a trusted host. Refused
       outside Claude Code's sandbox unless --allow-unsandboxed (pi then reads
-      your real key; the pi mod allows the flag only when you enable it).
+      your real key). The pi mod adds --allow-unsandboxed and
+      --trusted-hosts itself, from your options; Claude never passes them.
   send <name> [--steer] <prompt...> | --file FILE | -
       Send a prompt. Prints its id. While pi works it is queued as a
       follow-up, or with --steer delivered before pi's next model call.
@@ -181,7 +215,7 @@ const parse = argv => {
       extra.push(...argv.slice(i + 1))
       break
     }
-    if (/^--(cwd|model|thinking|timeout|tail|since|file)$/.test(a)) flags[a.slice(2)] = argv[++i]
+    if (/^--(cwd|model|thinking|timeout|tail|since|file|trusted-hosts)$/.test(a)) flags[a.slice(2)] = argv[++i]
     else if (/^--(steer|last|json|cancel|abort|allow-unsandboxed)$/.test(a)) flags[a.slice(2)] = true
     else rest.push(a)
   }
@@ -195,19 +229,58 @@ const argSummary = args => {
   return oneLine(key ? args[key] : JSON.stringify(args), 90)
 }
 
-// Refuses to serve unless the model is opencode-go's and auth.json holds an
-// opencode-go API key and nothing else. Reads only the entries' names and
-// types: inside the sandbox the key itself is masked anyway.
-function gate(model, extra) {
-  if (extra.length) fail(`extra pi arguments (${extra.join(' ')}) are off. ${GATE_NOTE}`)
-  if (!model) fail(`name the model: --model ${PROVIDER}/<id>. ${GATE_NOTE}`)
-  if (!model.startsWith(`${PROVIDER}/`)) fail(`${model} is not an ${PROVIDER} model. ${GATE_NOTE}`)
-  let auth
+// auth.json's logins, or {} when it is missing or empty; null when it does not parse.
+const readAuth = () => {
+  let text
   try {
-    auth = JSON.parse(fs.readFileSync(AUTH, 'utf8'))
+    text = fs.readFileSync(AUTH, 'utf8')
   } catch (err) {
-    fail(`could not read ${AUTH} (${err.code ?? 'not JSON'}). Log in to ${PROVIDER} in pi with an API key first. ${GATE_NOTE}`)
+    return err.code === 'ENOENT' ? {} : null
   }
+  if (!text.trim()) return {}
+  try {
+    const v = JSON.parse(text)
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null
+  } catch {
+    return null
+  }
+}
+
+// Refuses to serve unless the model is opencode-go's with its API key the only
+// login in auth.json, or its provider is defined in models.json on a trusted
+// host with no login in auth.json. Either way every provider models.json
+// defines must be on a trusted host, so no other service's key sits there.
+// Reads only names, types and base URLs, never a key or a token.
+function gate(model, extra, trustedList) {
+  if (extra.length) fail(`extra pi arguments (${extra.join(' ')}) are off. ${GATE_NOTE}`)
+  const entries = (trustedList ?? '').split(',').filter(Boolean).map(parseHostEntry)
+  if (entries.some(e => !e)) fail(`--trusted-hosts holds an entry that is not a host, host:port or host:*. ${GATE_NOTE}`)
+  if (!model) fail(`name the model: --model ${PROVIDER}/<id>, or <provider>/<id> for a provider at a trusted host. ${GATE_NOTE}`)
+  const provider = model.split('/')[0]
+  let models = {}
+  try {
+    models = JSON.parse(fs.readFileSync(MODELS, 'utf8'))
+  } catch (err) {
+    if (err.code !== 'ENOENT') fail(`could not read ${MODELS} (${err.code ?? 'not JSON'}). ${GATE_NOTE}`)
+  }
+  const providers = models && typeof models.providers === 'object' && models.providers ? models.providers : {}
+  const untrusted = Object.entries(providers)
+    .filter(([, p]) => !(p && typeof p.baseUrl === 'string' && trustedUrl(p.baseUrl, entries)))
+    .map(([n]) => n)
+  if (untrusted.length)
+    fail(`${MODELS} defines ${untrusted.join(', ')} with no base URL at a trusted host. pi-session runs pi only while every provider there is at a host you trust, so no other service's key is within reach. ${GATE_NOTE}`)
+  if (provider !== PROVIDER) {
+    if (!entries.length) fail(`${model} is not an ${PROVIDER} model. ${GATE_NOTE}`)
+    if (!providers[provider]) fail(`${provider} is not defined in ${MODELS}, at a trusted host. ${GATE_NOTE}`)
+    const auth = readAuth()
+    if (auth === null) fail(`${AUTH} does not parse. ${GATE_NOTE}`)
+    const logins = Object.keys(auth)
+    if (logins.length)
+      fail(`${AUTH} holds ${logins.join(', ')}. A model at a trusted host runs only while auth.json holds no login, so no other provider's credentials are within reach. ${GATE_NOTE}`)
+    return
+  }
+  const auth = readAuth()
+  if (auth === null) fail(`could not read ${AUTH} (not JSON). Log in to ${PROVIDER} in pi with an API key first. ${GATE_NOTE}`)
   const entry = auth && typeof auth === 'object' ? auth[PROVIDER] : null
   if (!entry || entry.type !== 'api_key') fail(`${AUTH} has no ${PROVIDER} API key${entry?.type ? ` (its login is ${entry.type})` : ''}. ${GATE_NOTE}`)
   const others = Object.keys(auth).filter(n => n !== PROVIDER)
@@ -225,7 +298,7 @@ async function serve(name, flags, extra) {
   const cwd = path.resolve(flags.cwd ?? meta.cwd ?? process.cwd())
   const model = flags.model ?? meta.model
   const thinking = flags.thinking ?? meta.thinking
-  gate(model, extra)
+  gate(model, extra, flags['trusted-hosts'])
   // pi's own session id: reopened when the session is served again, and new
   // for a new session, so a name used again after forget starts afresh.
   const sessionId = meta.sessionId ?? `claude-${name}-${Date.now().toString(36)}`
@@ -360,9 +433,9 @@ async function serve(name, flags, extra) {
         if (r.id === 'pi-session-state' && r.success) {
           const m = r.data?.model
           if (m) st.model = `${m.provider}/${m.id}`
-          if (m?.provider !== PROVIDER) {
-            // pi chose another provider after all: end the session.
-            st.error = `pi runs ${st.model ?? 'no model'}, not ${PROVIDER}. ${GATE_NOTE}`
+          if (m?.provider !== model.split('/')[0]) {
+            // pi chose another provider than the gate let through: end the session.
+            st.error = `pi runs ${st.model ?? 'no model'}, not ${model.split('/')[0]}. ${GATE_NOTE}`
             log(`! ${st.error}`)
             end()
           }
