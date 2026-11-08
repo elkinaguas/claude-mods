@@ -36,6 +36,8 @@ const MAX_DECLINES_PER_RUN = 100
 const START_MS = Number(process.env.PI_SESSION_START_MS) || 120000
 // Sent once, with a conversation's first prompt. Starts with what the tests' fake pi strips.
 const WORK_NOTE = "\n\n[Session note: nobody can answer questions while you work. Don't stop to ask: make a reasonable choice, finish the work, and list open questions and assumptions in your final reply, unless this prompt asks for a fixed format.]"
+// Without the sandbox a wrong choice has the person's full rights behind it.
+const UNSANDBOXED_NOTE = "\n\n[Session note: nobody can answer questions while you work. Don't stop to ask: make a reasonable choice, finish the work, and list open questions and assumptions in your final reply, unless this prompt asks for a fixed format. You run without a sandbox, with the person's full rights: don't do anything destructive or hard to undo, such as deleting files, force-pushing, or changing anything outside this project. Leave it undone and say so in your final reply.]"
 // Claude Code's Bash sandbox sets this in every command it wraps. Outside it,
 // pi would read the real provider key from ~/.pi/agent/auth.json.
 const SANDBOXED = !!process.env.SANDBOX_RUNTIME
@@ -294,6 +296,19 @@ const realTarget = p => {
 }
 const within = (p, base) => p === base || p.startsWith(`${base}${path.sep}`)
 
+// Without the sandbox nothing else limits --out, and it writes pi's text: only the
+// folder the command runs in and the temp folder, unless either holds the home
+// folder (dotfiles), and never into .git or .claude, whose files can run code.
+// status.json's cwd is not used: pi can rewrite it.
+const unsandboxedOutProblem = real => {
+  const home = realTarget(os.homedir())
+  const roots = [process.cwd(), os.tmpdir()].map(realTarget).filter(r => !within(home, r))
+  const root = roots.find(r => within(real, r))
+  if (!root) return `without the sandbox it can only write under ${roots.join(' or ') || 'a folder other than your home'}`
+  if (path.relative(root, real).split(path.sep).some(s => s === '.git' || s === '.claude')) return 'without the sandbox it can not write in .git or .claude'
+  return null
+}
+
 // Where --out may write: resolved, so no link or relative path reaches ~/.pi
 // (auth.json and the session files pi-session and its panel trust are there).
 const outTarget = p => {
@@ -310,6 +325,15 @@ const outTarget = p => {
     // A dangling ~/.pi: the path as named is all there is to compare.
   }
   if (homes.some(h => within(real, h))) fail(`refusing --out ${p}: ${real} is in ~/.pi. Write it in the project or the scratchpad.`)
+  if (!SANDBOXED) {
+    let problem
+    try {
+      problem = unsandboxedOutProblem(real)
+    } catch (err) {
+      problem = err.message
+    }
+    if (problem) fail(`refusing --out ${p}: ${problem}.`)
+  }
   const st = fs.lstatSync(real, { throwIfNoEntry: false })
   if (st && !st.isFile()) fail(`refusing --out ${p}: ${real} is not a plain file.`)
   return real
@@ -553,7 +577,7 @@ async function serve(name, flags, extra, first = null) {
     }
     if (cmd.type === 'prompt') {
       // Serving again keeps promptSeq, so this is once per conversation.
-      if (st.promptSeq === 0) cmd.message += WORK_NOTE
+      if (st.promptSeq === 0) cmd.message += SANDBOXED ? WORK_NOTE : UNSANDBOXED_NOTE
       st.promptSeq += 1
       st.prompts[cmd.id] = st.promptSeq
       if (cmd.format === 'findings') st.findingsSeqs = [...st.findingsSeqs, st.promptSeq].slice(-50)
