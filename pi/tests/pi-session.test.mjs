@@ -757,6 +757,49 @@ test('a serve from before dialogs were declined, still waiting, counts as runnin
   fs.rmSync(path.join(root, 'legacy'), { recursive: true })
 })
 
+test('without the sandbox pi is also told to leave destructive steps undone; inside it, not', async () => {
+  const bare = await runOnce(['bare-note', '--allow-unsandboxed', ...AT, 'hi'], bareEnv)
+  assert.equal(bare.code, 0, bare.err)
+  assert.match(cli('read', 'bare-note', '--tail', '20'), /You run without a sandbox, with the person's full rights: don't do anything destructive.*Leave it undone/)
+  cli('forget', 'bare-note')
+  const inside = await runOnce(['in-note', ...AT, 'hi'])
+  assert.equal(inside.code, 0, inside.err)
+  const transcript = cli('read', 'in-note', '--tail', '20')
+  assert.match(transcript, /\[Session note: nobody can answer questions/)
+  assert.ok(!/without a sandbox/.test(transcript))
+  cli('forget', 'in-note')
+})
+
+test('without the sandbox --out writes only under the working or temp folder, never home, .git or .claude', () => {
+  const realRoot = fs.realpathSync(root)
+  const work = path.join(realRoot, 'bare-work')
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-elsewhere-'))
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-temp-'))
+  fs.mkdirSync(work)
+  // No such session: a path that passes goes on to say so, and one refused says why.
+  const tryOut = (target, opts = {}) =>
+    spawnSync('node', [SCRIPT, 'wait', 'nosuch', '--out', target], { env: { ...bareEnv, TMPDIR: temp }, cwd: work, encoding: 'utf8', ...opts }).stderr
+  const allowed = /no session nosuch/
+  const refused = /without the sandbox/
+  assert.match(tryOut(path.join(work, 'report.md')), allowed)
+  assert.match(tryOut('relative.md'), allowed)
+  assert.match(tryOut(path.join(temp, 'deep', 'report.md')), allowed)
+  assert.match(tryOut(path.join(elsewhere, 'report.md')), refused)
+  assert.match(tryOut(path.join(home, '.bashrc')), refused)
+  assert.match(tryOut(path.join(work, '.git', 'hooks', 'pre-commit')), /can not write in \.git or \.claude/)
+  assert.match(tryOut(path.join(work, '.claude', 'settings.json')), /can not write in \.git or \.claude/)
+  // A link inside the folder that leads out of it counts as where it leads.
+  fs.symlinkSync(elsewhere, path.join(work, 'out-link'))
+  assert.match(tryOut(path.join(work, 'out-link', 'report.md')), refused)
+  // Run from the home folder, that folder is no root: dotfiles stay out of reach.
+  assert.match(tryOut(path.join(fs.realpathSync(home), '.bashrc'), { cwd: home }), refused)
+  // The sandbox has its own limits, so inside it this check does not apply.
+  assert.match(spawnSync('node', [SCRIPT, 'wait', 'nosuch', '--out', path.join(elsewhere, 'report.md')], { env, cwd: work, encoding: 'utf8' }).stderr, allowed)
+  fs.rmSync(work, { recursive: true })
+  fs.rmSync(elsewhere, { recursive: true })
+  fs.rmSync(temp, { recursive: true })
+})
+
 test('a question does not hold up run: it is declined, the reply comes, and the session stops', async () => {
   const end = await runOnce(['asks', ...AT, 'please ask me'])
   assert.equal(end.code, 0, end.err)
