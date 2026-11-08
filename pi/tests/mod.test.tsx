@@ -305,6 +305,9 @@ test("Claude's instructions cover run, and status over old task output after a r
   expect(text).toMatch(/A question does not end it/)
   expect(text).toMatch(/`serve` and `run` refuse to start outside the sandbox/)
   expect(text).toMatch(/After a restart, use `status <name>`.*Never go by the output of a task from before the restart/)
+  expect(text).toMatch(/add `--out FILE` to write it to a file/)
+  expect(text).toMatch(/`send <name> --format findings "<prompt>"`.*exits 4/)
+  expect(text).not.toMatch(/--purge/)
 })
 
 test('without the sandbox the check says so once, not the mask and TLS lines that only act inside it', () => {
