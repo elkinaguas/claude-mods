@@ -14,7 +14,8 @@ const PANE = 'pi'
 const TITLE = 'pi sessions'
 const COMMAND = 'pi'
 const POLL_MS = 2000
-const LIVE = ['starting', 'idle', 'busy']
+// 'waiting': only a serve started before dialogs were declined still writes it.
+const LIVE = ['starting', 'idle', 'busy', 'waiting']
 // Matches pi-session.mjs: a serve whose heartbeat is older is gone.
 const STALE_MS = 20000
 // Named colours only, so light and dark terminal themes both read.
@@ -210,11 +211,59 @@ export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUns
  * itself. Inside the sandbox the flag changes nothing.
  */
 export const withAllowFlag = (command: string): string =>
-  command.replace(/(pi-session(?:\.mjs)?["']?\s+(?:serve|run))(?=\s|$)(?![^;&|\n]*--allow-unsandboxed)/g, '$1 --allow-unsandboxed')
+  addToPiStarts(command, rest => (/^[^;&|\n]*--allow-unsandboxed/.test(rest) ? '' : ' --allow-unsandboxed'))
 
 /** The same, adding `--trusted-hosts <list>` (the person's option, entries already validated) to each serve or run. */
 export const withTrustedHosts = (command: string, hosts: string[]): string =>
-  hosts.length ? command.replace(/(pi-session(?:\.mjs)?["']?\s+(?:serve|run))(?=\s|$)/g, `$1 --trusted-hosts ${hosts.join(',')}`) : command
+  hosts.length ? addToPiStarts(command, () => ` --trusted-hosts ${hosts.join(',')}`) : command
+
+// A shell command that runs pi-session serve or run: optional variables and a
+// wrapper or node, then pi-session as the program. Anything else, such as a
+// commit message that mentions it, is left alone; a spelling this misses gets
+// no flags, and pi-session then refuses it.
+const PI_START = /(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:nohup|exec|env)\s+)*(?:(?:\S*\/)?node\s+(?:-\S+\s+)*)?(?:"[^"\n]*pi-session(?:\.mjs)?"|'[^'\n]*pi-session(?:\.mjs)?'|[^\s"';&|()]*pi-session(?:\.mjs)?)\s+(?:serve|run)(?=\s|$)/y
+
+/** Adds text after each pi-session serve or run that starts a shell command, outside any quotes. */
+const addToPiStarts = (command: string, addition: (rest: string) => string): string => {
+  let out = ''
+  let i = 0
+  let atStart = true
+  let quote: string | null = null
+  while (i < command.length) {
+    const c = command[i]!
+    if (atStart && !quote) {
+      if (/[ \t]/.test(c)) {
+        out += c
+        i += 1
+        continue
+      }
+      PI_START.lastIndex = i
+      const m = PI_START.exec(command)
+      if (m) {
+        i += m[0].length
+        out += m[0] + addition(command.slice(i))
+        atStart = false
+        continue
+      }
+      atStart = false
+    }
+    if (c === '\\' && quote !== "'") {
+      out += command.slice(i, i + 2)
+      i += 2
+      continue
+    }
+    if (quote) {
+      if (c === quote) quote = null
+    } else if (c === '"' || c === "'") {
+      quote = c
+    } else if (/[;&|\n(`]/.test(c)) {
+      atStart = true
+    }
+    out += c
+    i += 1
+  }
+  return out
+}
 
 // Matches pi-session's host entry: host, host:port or host:*, with *. for subdomains and [v6].
 const HOST_ENTRY = /^(\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:]+\])(?::(\d{1,5}|\*))?$/i

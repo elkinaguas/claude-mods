@@ -231,6 +231,34 @@ test('run starts pi too: the flags are added to it as to serve, and only there',
   }
 })
 
+test('the flags go only on a command that runs pi-session, never into text that mentions it', () => {
+  const hosts = ['llm.corp']
+  for (const mention of [
+    'git commit -m "pi: pi-session run now stops the session"',
+    `git commit -m 'see; node /x/pi-session.mjs run demo'`,
+    'echo "node /x/pi-session.mjs serve demo"',
+    `grep 'pi-session run ' README.md`,
+    'grep -n pi-session run README.md',
+    'node /x/pi-session.mjs send s "compare with pi-session run output"',
+    'git commit -m "first\n\nnode /x/pi-session.mjs run demo"',
+  ]) {
+    expect(withTrustedHosts(mention, hosts)).toBe(mention)
+    expect(withAllowFlag(mention)).toBe(mention)
+  }
+  // Real invocations, also after another command, with variables or a wrapper.
+  const added = ' --trusted-hosts llm.corp'
+  for (const [before, after] of [
+    ['cd /w && node /x/pi-session.mjs run demo', `cd /w && node /x/pi-session.mjs run${added} demo`],
+    ['A=1 node --no-warnings "/x y/pi-session.mjs" serve demo', `A=1 node --no-warnings "/x y/pi-session.mjs" serve${added} demo`],
+    ['nohup /usr/bin/node /x/pi-session.mjs serve demo', `nohup /usr/bin/node /x/pi-session.mjs serve${added} demo`],
+    ['pi-session run demo', `pi-session run${added} demo`],
+    ['x=$(node /x/pi-session.mjs run demo)', `x=$(node /x/pi-session.mjs run${added} demo)`],
+    ['git log "a;b"; node /x/pi-session.mjs run demo', `git log "a;b"; node /x/pi-session.mjs run${added} demo`],
+  ] as const) {
+    expect(withTrustedHosts(before, hosts)).toBe(after)
+  }
+})
+
 test('the guard treats run as it does serve', () => {
   const on = { unsandboxed: false, allowUnsandboxed: false }
   const off = { unsandboxed: true, allowUnsandboxed: false }
