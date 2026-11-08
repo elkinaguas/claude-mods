@@ -14,7 +14,7 @@ const PANE = 'pi'
 const TITLE = 'pi sessions'
 const COMMAND = 'pi'
 const POLL_MS = 2000
-const LIVE = ['starting', 'idle', 'busy', 'waiting']
+const LIVE = ['starting', 'idle', 'busy']
 // Matches pi-session.mjs: a serve whose heartbeat is older is gone.
 const STALE_MS = 20000
 // Named colours only, so light and dark terminal themes both read.
@@ -22,7 +22,6 @@ const STATE_COLOR: Record<string, string> = {
   idle: 'green',
   busy: 'yellow',
   starting: 'yellow',
-  waiting: 'magenta',
   stopped: 'gray',
   failed: 'red',
   lost: 'red',
@@ -30,7 +29,7 @@ const STATE_COLOR: Record<string, string> = {
 
 // Which session the card shows when none is picked: the one most likely to
 // need you first.
-const ATTENTION = ['waiting', 'failed', 'busy', 'starting', 'idle', 'lost', 'stopped']
+const ATTENTION = ['failed', 'busy', 'starting', 'idle', 'lost', 'stopped']
 const rank = (state: string) => {
   const i = ATTENTION.indexOf(state)
   return i === -1 ? ATTENTION.length : i
@@ -354,7 +353,6 @@ async function check($: EngineInterface): Promise<string[]> {
 const toSession = (name: string, raw: Json, now: number): PiSession => {
   const state = str(raw.state) ?? 'unknown'
   const beat = num(raw.heartbeatAt) ?? 0
-  const dialog = obj(raw.dialog)
   return {
     name,
     state: LIVE.includes(state) && now - beat > STALE_MS ? 'lost' : state,
@@ -364,7 +362,6 @@ const toSession = (name: string, raw: Json, now: number): PiSession => {
     runStartedAt: num(raw.runStartedAt),
     lastTool: str(raw.lastTool),
     lastReply: str(raw.lastReply),
-    dialog: str(dialog.id) ? { id: str(dialog.id)!, method: str(dialog.method) ?? '', title: str(dialog.title) ?? '' } : null,
     error: str(raw.error),
     sandboxed: typeof raw.sandboxed === 'boolean' ? raw.sandboxed : null,
   }
@@ -417,9 +414,9 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
 
 - Start: run \`serve <name> --cwd <dir> --model <provider>/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused).
 - pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); the mod passes those hosts to serve and run itself` : ''}. serve and run refuse any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If they refuse, tell the person why; never try to get around the gate.
-- One-shot: \`run <name> --model <provider>/<id> [--cwd <dir>] --file <prompt file>\` (or a quoted prompt) with run_in_background starts the session, sends the prompt, prints pi's reply and stops the session, so you are notified when it is done. It takes wait's \`--timeout SECONDS --abort\`, \`--out FILE\` and exit codes, and \`--format findings\`. A question does not end it, since that would end pi: it prints the question and goes on once you \`answer\`. So you are not notified of a question: on a long run, also run \`wait <name>\` with run_in_background once \`status <name>\` shows it running (exit 3 when pi asks). \`--keep\` leaves the session running for follow-ups; the call then ends only when the session does, so the same \`wait <name>\` tells you when the reply is there.
+- One-shot: \`run <name> --model <provider>/<id> [--cwd <dir>] --file <prompt file>\` (or a quoted prompt) with run_in_background starts the session, sends the prompt, prints pi's reply and stops the session, so you are notified when it is done. It takes wait's \`--timeout SECONDS --abort\`, \`--out FILE\` and exit codes, and \`--format findings\`. \`--keep\` leaves the session running for follow-ups; the call then ends only when the session does, so run \`wait <name>\` with run_in_background to be told when the reply is there.
 - Work: \`send <name> "<prompt>"\` prints a prompt id. While pi works a new prompt queues as a follow-up; \`--steer\` delivers it before pi's next model call instead.
-- Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply (exit 3: pi asks a question, answer with \`answer <name> <request-id> <value>\`). To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. For a long reply, add \`--out FILE\` to write it to a file and print only its path and size. To ask for review findings as a checked JSON array, use \`send <name> --format findings "<prompt>"\`: \`wait\` prints only the array, or exits 4 if the reply is invalid. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply.
+- Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply. Sessions never stop for questions: pi is told to finish and list its assumptions, and a question from a pi extension is declined at once and named on stderr, so a step it guarded may have been skipped. To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. For a long reply, add \`--out FILE\` to write it to a file and print only its path and size. To ask for review findings as a checked JSON array, use \`send <name> --format findings "<prompt>"\`: \`wait\` prints only the array, or exits 4 if the reply is invalid. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply.
 - Control: \`status\`, \`abort <name>\` (stop the current run), \`stop <name>\` (end the session), \`forget <name>\`.
 - After a Claude Code restart, \`serve <name>\` again reopens the conversation (a killed \`run\` too); work that was mid-run is lost, so ask pi to continue.
 - After a restart, use \`status <name>\` for how a session stands, and \`read <name> --last\` for its last reply. Never go by the output of a task from before the restart: it is old, and those tasks are gone.
@@ -428,8 +425,8 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
 - \`serve\` and \`run\` refuse to start outside the sandbox. ${allowUnsandboxed ? 'The person has allowed pi without the sandbox (option allowUnsandboxed), so the mod lets them start there by itself: use them as usual, never add flags for it, and when the sandbox is off tell them pi holds their real key.' : 'Never try to get around that; tell the person the sandbox is off.'}`
 
 // Stop, abort and forget only write to a session's pipe or files, so the mod
-// runs them itself; serving again and answering go through Claude, so pi
-// starts inside the sandbox.
+// runs them itself; serving again goes through Claude, so pi starts inside
+// the sandbox.
 async function runScript($: EngineInterface, args: string[]) {
   const ran = await $.process.run(['node', script($), ...args]).catch((err: unknown) => ({ exitCode: 1, stdout: '', stderr: String(err) }))
   const out = (ran.exitCode === 0 ? ran.stdout : ran.stderr || ran.stdout).trim()
@@ -536,18 +533,13 @@ export const register: Register = (on, options) => {
     const fallback = [...list].sort((a, b) => rank(a.state) - rank(b.state))[0]
     const s = list.find(x => x.name === picked) ?? fallback
     const live = list.filter(x => LIVE.includes(x.state)).length
-    const asking = list.filter(x => x.state === 'waiting').length
     // Every tile is as wide as the longest name (up to 14), so they line up.
     const tileWidth = Math.min(15, Math.max(...list.map(x => x.name.length), 4) + 2)
     const counts = ATTENTION.map(state => ({ state, n: list.filter(x => x.state === state).length })).filter(c => c.n)
 
     const card = (s: PiSession) => {
       const isLive = LIVE.includes(s.state)
-      const activity = s.dialog
-        ? `asks (${s.dialog.method} ${s.dialog.id}): ${s.dialog.title}`
-        : s.lastTool
-          ? `→ ${s.lastTool}`
-          : null
+      const activity = s.lastTool ? `→ ${s.lastTool}` : null
       // A busy session counts from the start of its run, the others from pi's last event.
       const since = s.state === 'busy' && s.runStartedAt ? s.runStartedAt : s.lastActivity
       return (
@@ -558,14 +550,11 @@ export const register: Register = (on, options) => {
           </Text>
           <Text dimColor>{clip(`${s.model ?? '-'}  ${short(s.cwd)}`, cols)}</Text>
           {s.sandboxed === false && <Text color="red" bold wrap="wrap">! runs outside the sandbox: pi holds your real provider key</Text>}
-          {activity && <Text color={s.dialog ? 'magenta' : undefined}>{clip(activity, cols * 2)}</Text>}
+          {activity && <Text>{clip(activity, cols * 2)}</Text>}
           {s.error && <Text color="red" wrap="wrap">error: {s.error}</Text>}
           {s.lastReply && <Text dimColor wrap="wrap">last: {s.lastReply}</Text>}
           <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1} key="actions">
-            {s.dialog && (
-              <Button key="answer" plain hotkey="y" label="Answer" onPress={() => ask($, `The pi session ${s.name} asks (${s.dialog!.method} ${s.dialog!.id}): ${s.dialog!.title}\nAnswer it: `)} />
-            )}
-            {(s.state === 'busy' || s.state === 'waiting') && <Button key="abort" plain hotkey="a" label="Abort" onPress={() => void runScript($, ['abort', s.name])} />}
+            {s.state === 'busy' && <Button key="abort" plain hotkey="a" label="Abort" onPress={() => void runScript($, ['abort', s.name])} />}
             {isLive && <Button key="stop" plain hotkey="s" label="Stop" onPress={() => void runScript($, ['stop', s.name])} />}
             {!isLive && <Button key="resume" plain hotkey="r" label="Resume" onPress={() => ask($, `Serve the pi session ${s.name} again and ask it to continue where it left off.`)} />}
             <Button key="transcript" plain hotkey="t" label="Transcript" onPress={() => ask($, `Show me the last 40 lines of the pi session ${s.name}'s transcript.`)} />
@@ -583,7 +572,7 @@ export const register: Register = (on, options) => {
         {list.length === 0 && <Text dimColor>No pi sessions yet. Ask Claude to start one.</Text>}
         {list.length > 0 && (
           <Text dimColor>
-            {list.length} session{list.length === 1 ? '' : 's'} · {live} running{asking ? ` · ${asking} asking` : ''}
+            {list.length} session{list.length === 1 ? '' : 's'} · {live} running
           </Text>
         )}
         {list.length > 0 && (

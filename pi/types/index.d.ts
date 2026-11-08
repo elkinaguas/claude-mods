@@ -1,7 +1,7 @@
 /** One pi session as its status.json says (written by scripts/pi-session.mjs serve). */
 export type PiSession = {
   name: string
-  /** starting | idle | busy | waiting | stopped | failed, or `lost` when a live state's heartbeat went stale. */
+  /** starting | idle | busy | stopped | failed, or `lost` when a live state's heartbeat went stale. */
   state: string
   cwd: string | null
   model: string | null
@@ -12,8 +12,6 @@ export type PiSession = {
   lastTool: string | null
   /** The start of pi's last reply. */
   lastReply: string | null
-  /** A dialog an extension opened, waiting for `pi-session answer`. */
-  dialog: { id: string; method: string; title: string } | null
   error: string | null
   /** false when serve ran outside Claude Code's sandbox (allowUnsandboxed); null from an older serve. */
   sandboxed: boolean | null

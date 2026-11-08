@@ -77,14 +77,44 @@ test('a prompt sent while pi works is queued and both get answered', () => {
   assert.match(transcript, /→ read README\.md/)
 })
 
-test('a dialog makes wait exit 3, and answer resumes the run', () => {
+test('a dialog is declined at once, the run goes on, and wait names it apart from the reply', () => {
   const id = cli('send', 'alpha', 'please ask me').trim()
-  const asked = cliFails('wait', 'alpha', id, '--timeout', '5')
-  assert.equal(asked.code, 3)
-  assert.match(asked.out, /confirm d1\): Proceed\?/)
-  assert.equal(status('alpha').state, 'waiting')
-  cli('answer', 'alpha', 'd1', 'yes')
-  assert.equal(cli('wait', 'alpha', id, '--timeout', '5'), 'echo: please ask me (confirmed)\n')
+  const done = spawnSync('node', [SCRIPT, 'wait', 'alpha', id, '--timeout', '5'], { env, encoding: 'utf8' })
+  assert.equal(done.status, 0, done.stderr)
+  assert.equal(done.stdout, 'echo: please ask me (declined)\n')
+  assert.match(done.stderr, /alpha declined a question from an extension \(confirm\): Proceed\?/)
+  assert.equal(status('alpha').state, 'idle')
+  assert.deepEqual(status('alpha').declined, [{ method: 'confirm', title: 'Proceed?' }])
+  assert.match(cli('read', 'alpha', '--tail', '8'), /! declined confirm d1: Proceed\?/)
+  assert.match(cli('status', 'alpha'), /declined 1 extension question in its last run/)
+  // The next run starts with a clean list.
+  const next = cli('send', 'alpha', 'plain').trim()
+  const after = spawnSync('node', [SCRIPT, 'wait', 'alpha', next, '--timeout', '5'], { env, encoding: 'utf8' })
+  assert.equal(after.stderr, '')
+  assert.deepEqual(status('alpha').declined, [])
+  // Nothing is left to answer with.
+  assert.equal(spawnSync('node', [SCRIPT, 'answer', 'alpha', 'd1', 'yes'], { env, encoding: 'utf8' }).status, 1)
+})
+
+test('pi hears once per conversation not to stop for questions, also after serving again', async () => {
+  const live = await serve('noted')
+  const first = cli('send', 'noted', 'first').trim()
+  assert.equal(cli('wait', 'noted', first, '--timeout', '5'), 'echo: first\n')
+  const second = cli('send', 'noted', 'second').trim()
+  cli('wait', 'noted', second, '--timeout', '5')
+  cli('stop', 'noted')
+  await until(() => status('noted').state === 'stopped')
+  live.kill()
+  const again = await serve('noted')
+  const third = cli('send', 'noted', 'third').trim()
+  cli('wait', 'noted', third, '--timeout', '5')
+  const transcript = cli('read', 'noted', '--tail', '60')
+  assert.equal(transcript.match(/\[Session note: nobody can answer questions/g).length, 1)
+  assert.match(transcript, /first\n\n\[Session note:.*list open questions and assumptions in your final reply/)
+  cli('stop', 'noted')
+  await until(() => status('noted').state === 'stopped')
+  again.kill()
+  cli('forget', 'noted')
 })
 
 test('a prompt pi refuses ends wait with the error instead of hanging', () => {
@@ -102,23 +132,14 @@ test('a wait that times out with --abort stops the run', () => {
   assert.match(cli('read', 'alpha', '--tail', '5'), /settled \(aborted\)/)
 })
 
-test('a run records its start from agent_start, kept while pi asks, cleared when it settles', async () => {
+test('a run records its start from agent_start and clears it when it settles', async () => {
   assert.equal(status('alpha').runStartedAt, null)
   const before = Date.now()
-  const id = cli('send', 'alpha', 'please ask me').trim()
-  await until(() => status('alpha').state === 'waiting')
-  const started = status('alpha').runStartedAt
-  assert.equal(typeof started, 'number')
-  assert.ok(started >= before && started <= Date.now())
-  cli('answer', 'alpha', 'd1', 'yes')
-  cli('wait', 'alpha', id, '--timeout', '5')
-  assert.equal(status('alpha').state, 'idle')
-  assert.equal(status('alpha').runStartedAt, null)
-
   const slow = cli('send', 'alpha', 'slow: a long job').trim()
-  await until(() => status('alpha').state === 'busy')
+  await until(() => status('alpha').state === 'busy' && status('alpha').runStartedAt)
   const running = status('alpha').runStartedAt
-  assert.ok(running >= started)
+  assert.equal(typeof running, 'number')
+  assert.ok(running >= before && running <= Date.now())
   // Pi's later events move lastActivity, not the run's start.
   await until(() => status('alpha').lastTool?.startsWith('bash'))
   assert.equal(status('alpha').runStartedAt, running)
@@ -377,16 +398,6 @@ test('a prompt too long for one pipe write arrives whole, through the inbox', ()
   // The next command still gets through.
   const after = cli('send', 'alpha', 'after').trim()
   assert.equal(cli('wait', 'alpha', after, '--timeout', '5'), 'echo: after\n')
-})
-
-test('aborting while pi asks ends the dialog, and the session goes idle', () => {
-  const id = cli('send', 'alpha', 'please ask again').trim()
-  assert.equal(cliFails('wait', 'alpha', id, '--timeout', '5').code, 3)
-  cli('abort', 'alpha')
-  const out = cli('wait', 'alpha', id, '--timeout', '5')
-  assert.ok(!/pi asks/.test(out))
-  assert.equal(status('alpha').state, 'idle')
-  assert.equal(status('alpha').dialog, null)
 })
 
 test('a live session whose heartbeat only looks stale (after sleep) is not taken for gone', () => {
@@ -658,39 +669,13 @@ test('--keep means nothing in the commands that do not take it', async () => {
   cli('forget', 'words')
 })
 
-test('a question does not end run: pi stays up, an answer goes on to the reply, then it stops', async () => {
-  const run = startRun(['asks', ...AT, 'please ask me'])
-  await until(() => /confirm d1\): Proceed\?/.test(run.seen.out))
-  assert.equal(status('asks').state, 'waiting')
-  // Past the wait's next polls: still up, and the question printed once.
-  await new Promise(r => setTimeout(r, 2500))
-  assert.ok(stillRunning(run.child))
-  assert.equal(status('asks').state, 'waiting')
-  assert.equal(run.seen.out.match(/pi asks/g).length, 1)
-  // A wait beside it gets the exit 3 run can't give.
-  const beside = cliFails('wait', 'asks', '--timeout', '5')
-  assert.equal(beside.code, 3)
-  assert.match(beside.out, /pi-session answer asks d1/)
-  cli('answer', 'asks', 'd1', 'yes')
-  const end = await run.done
+test('a question does not hold up run: it is declined, the reply comes, and the session stops', async () => {
+  const end = await runOnce(['asks', ...AT, 'please ask me'])
   assert.equal(end.code, 0, end.err)
-  assert.match(end.out, /echo: please ask me \(confirmed\)\n$/)
+  assert.equal(end.out, 'echo: please ask me (declined)\n')
+  assert.match(end.err, /asks declined a question from an extension \(confirm\): Proceed\?/)
   assert.equal(status('asks').state, 'stopped')
   cli('forget', 'asks')
-})
-
-test('a question under a cap: --abort ends the run and exits 2; without it the session stops and exits 2', async () => {
-  const aborted = await runOnce(['asks-cap', ...AT, '--timeout', '1', '--abort', 'please ask me'])
-  assert.equal(aborted.code, 2, aborted.err)
-  assert.match(aborted.out, /pi asks/)
-  assert.match(aborted.err, /timed out after 1s; its run was aborted/)
-  assert.equal(status('asks-cap').state, 'stopped')
-  assert.match(cli('read', 'asks-cap', '--tail', '6'), /settled \(aborted\)/)
-  const capped = await runOnce(['asks-cap', '--timeout', '1', 'please ask me'])
-  assert.equal(capped.code, 2, capped.err)
-  assert.match(capped.err, /still waiting after 1s/)
-  assert.equal(status('asks-cap').state, 'stopped')
-  cli('forget', 'asks-cap')
 })
 
 test('run --timeout: exit 2, with --abort as wait does it, and the session stops', async () => {
