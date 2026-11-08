@@ -1,5 +1,12 @@
 # pi
 
+> **⚠️ Early and still being hardened: use with caution.** This mod's security has not been independently audited, and it may change between versions.
+>
+> - **The sandbox is what protects your key.** The guard on Bash commands only matches text, so it can be fooled, and the notes sent to pi are instructions a model can ignore.
+> - **Without the sandbox (`allowUnsandboxed`)**, pi has your full rights and your real key. This mode is the least tested, and a session might keep running after its Bash call ends. Use a separate, low-limit key you can revoke.
+> - **pi extensions run with pi's rights**, and this mod doesn't review them. Only install ones you trust.
+> - **Sessions don't stop to ask.** Check what pi did before you rely on it.
+
 Long-lived [pi](https://github.com/earendil-works/pi) coding-agent sessions run from Claude Code, with pi kept inside Claude Code's Bash sandbox so it only ever sees a masked provider key.
 
 > **This mod works only with an opencode-go API key, or a model at a host you trust.** `pi-session serve` refuses to start unless one of these holds:
