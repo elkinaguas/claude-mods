@@ -345,6 +345,77 @@ test('the panel lists sessions from their status files', async ($, on) => {
   await ui.unmount()
 })
 
+// One session and a hand on the poll: each tick() lets one period of
+// clock.every through, then waits for what it set off.
+const pollingPane = async ($: any, on: any, session: object, startAt: number) => {
+  const clock = { now: startAt, panes: [] as object[], writes: [] as string[] }
+  let release = () => {}
+  on('env.get', () => ({ value: HOME }))
+  on('clock.now', () => ({ value: clock.now }))
+  on('clock.every', () => new Promise(resolve => (release = () => resolve({ value: undefined }))))
+  on('command.register', () => ({ value: { command: 'pi' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.panes', () => ({ value: clock.panes }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [{ name: 'demo', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] }))
+  on('fs.read', (_: unknown, e: { path: string }) => {
+    if (e.path.endsWith('/demo/status.json')) return { value: JSON.stringify(session) }
+    throw new Error('missing')
+  })
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/home/u/proj', surface: 'terminal', isInteractive: true })
+  const tick = async () => {
+    release()
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  return { clock, tick }
+}
+
+const OPEN = { id: 'pi', title: 'pi sessions', isShown: true, isFocused: false, isPlaced: true }
+const T0 = Date.parse('2026-10-28T18:00:00Z')
+
+test('a busy card counts from the run start, and the poll moves it while the pane is open', async ($, on) => {
+  const session = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000, runStartedAt: T0 - 30000 }
+  const { clock, tick } = await pollingPane($, on, session, T0)
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 30s/)
+  clock.now += 10000
+  await tick()
+  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 40s/)
+  await ui.unmount()
+})
+
+test('an idle card keeps the time since the last activity', async ($, on) => {
+  const session = { state: 'idle', heartbeatAt: T0 + 3600000, lastActivity: T0 - 7000, runStartedAt: T0 - 30000 }
+  const { clock, tick } = await pollingPane($, on, session, T0)
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo idle 7s/)
+  clock.now += 2000
+  await tick()
+  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo idle 9s/)
+  await ui.unmount()
+})
+
+test('with the pane closed or behind another tab, the poll redraws nothing', async ($, on) => {
+  const session = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000, runStartedAt: T0 - 30000 }
+  const { clock, tick } = await pollingPane($, on, session, T0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  for (const panes of [[], [{ ...OPEN, isShown: false }]]) {
+    clock.panes = panes
+    clock.now += 10000
+    await tick()
+    expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 30s/)
+  }
+  // The same poll with the pane on screen does redraw, so the above is not a dead poll.
+  clock.panes = [OPEN]
+  await tick()
+  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 50s/)
+  await ui.unmount()
+})
+
 test('/pi check reports settings that do not parse instead of failing', async ($, on) => {
   on('env.get', () => ({ value: HOME }))
   on('fs.read', (_, e) => {

@@ -6,6 +6,8 @@ export type PiSession = {
   cwd: string | null
   model: string | null
   lastActivity: number | null
+  /** When pi's current run started (agent_start); null between runs or from an older serve. */
+  runStartedAt: number | null
   /** The tool pi runs now, in one line. */
   lastTool: string | null
   /** The start of pi's last reply. */
@@ -26,6 +28,8 @@ declare module 'claude-code' {
       warnings: string[]
       /** The session the panel's card shows, picked from its grid; null shows the one needing you most. */
       selected: string | null
+      /** Bumped by the poll while the pane is on screen, to redraw the card's age. */
+      tick: number
     }
   }
 }

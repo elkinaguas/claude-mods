@@ -323,6 +323,7 @@ async function serve(name, flags, extra) {
     sessionFile: null,
     startedAt: Date.now(),
     lastActivity: Date.now(),
+    runStartedAt: null,
     heartbeatAt: Date.now(),
     promptSeq: before?.promptSeq ?? 0,
     acceptedSeq: before?.promptSeq ?? 0,
@@ -455,6 +456,7 @@ async function serve(name, flags, extra) {
       case 'agent_start':
         st.state = 'busy'
         st.error = null
+        st.runStartedAt = Date.now()
         break
       case 'turn_end':
         st.turns += 1
@@ -503,6 +505,7 @@ async function serve(name, flags, extra) {
         // flight starts a new run.
         st.settledSeq = st.acceptedSeq
         st.lastTool = null
+        st.runStartedAt = null
         log(`· settled${r.aborted ? ' (aborted)' : ''} · ${clock()}`)
         break
       case 'message_update':
@@ -524,6 +527,7 @@ async function serve(name, flags, extra) {
     st.state = state
     st.exitCode = code
     st.dialog = null
+    st.runStartedAt = null
     if (why) st.error = why
     save()
     log(`# ${state}${code != null ? ` (exit ${code})` : ''} · ${clock()}`)
