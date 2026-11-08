@@ -17,7 +17,7 @@ import path from 'node:path'
 const ROOT = process.env.PI_SESSIONS_DIR || path.join(os.homedir(), '.pi', 'agent', 'claude-sessions')
 const PI = process.env.PI_SESSION_PI || 'pi'
 const NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/
-const LIVE = ['starting', 'idle', 'busy', 'waiting']
+const LIVE = ['starting', 'idle', 'busy']
 const HEARTBEAT_MS = 5000
 // A serve whose heartbeat is older than this is gone (killed with Claude Code,
 // or the machine slept through it). Each sandboxed command has its own process
@@ -25,7 +25,11 @@ const HEARTBEAT_MS = 5000
 const STALE_MS = 20000
 // The most a command line may take to arrive in one piece (PIPE_BUF).
 const PIPE_LINE = 4096
+// Dialogs an extension can open. Nobody is there to answer: serve declines them.
 const DIALOGS = ['select', 'confirm', 'input', 'editor']
+const MAX_DECLINED = 20
+// Sent once, with a conversation's first prompt. Starts with what the tests' fake pi strips.
+const WORK_NOTE = "\n\n[Session note: nobody can answer questions while you work. Don't stop to ask: make a reasonable choice, finish the work, and list open questions and assumptions in your final reply, unless this prompt asks for a fixed format.]"
 // Claude Code's Bash sandbox sets this in every command it wraps. Outside it,
 // pi would read the real provider key from ~/.pi/agent/auth.json.
 const SANDBOXED = !!process.env.SANDBOX_RUNTIME
@@ -38,7 +42,7 @@ const PROVIDER = 'opencode-go'
 const AUTH = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
 const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')
 // What serve passes on from its pipe to pi; anything else (set_model, say) is refused.
-const PIPE_TYPES = ['prompt', 'abort', 'extension_ui_response', '__stop']
+const PIPE_TYPES = ['prompt', 'abort', '__stop']
 const GATE_NOTE = `The pi mod works only with an ${PROVIDER} API key, or a model at a host you trust (option trustedModelHosts).`
 const PI_HOME = path.join(os.homedir(), '.pi')
 // Where pi keeps its own copy of each conversation: all that forget --purge may delete.
@@ -100,24 +104,21 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
       serve, send and wait in one call, run in the background: starts the
       session under serve's checks, sends the prompt, prints the reply as wait
-      does and stops the session. Exit codes, --out and findings are wait's,
-      but a question does not end it (that would end pi, which lives in this
-      process): it prints the question and goes on once answered. A timeout
-      without --abort stops the session too. --keep leaves it running after
+      does and stops the session. Exit codes, --out and findings are wait's.
+      A timeout without --abort stops the session too. --keep leaves it running after
       the reply for follow-ups; the call then ends when the session does, with
       the reply's exit code if that was not 0. Resume a killed one with serve.
   wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]
       Block until pi has settled (after prompt ID, or everything sent so far),
-      then print its last reply. Exit 3 when pi waits on a dialog, 2 on
-      timeout; with --abort a timeout also stops pi's run. --out writes the
+      then print its last reply. Exit 2 on timeout; with --abort a timeout also
+      stops pi's run. Sessions never stop for questions: a dialog an extension
+      opens is declined at once, and wait names it on stderr. --out writes the
       reply to FILE and prints only its path and size; FILE can't be in ~/.pi.
       A findings reply comes as the JSON array alone. Exit 4 if it fails the
       check: the error is reported, nothing is written, read --last has it.
   read <name> [--last | --tail N | --since LINE]
       Print the transcript (default: last 40 lines), or the last reply.
   status [name] [--json]
-  answer <name> <request-id> <value...> | --cancel
-      Answer a dialog an extension opened (confirm takes yes or no).
   abort <name>     Stop pi's current run; the session stays.
   stop <name>      End the session; serve it again later to continue.
   forget <name> [--purge]
@@ -264,7 +265,7 @@ const parse = (argv, cmd) => {
       flags[a.slice(2)] = argv[++i]
     else if (a === '--keep' && cmd === 'run') flags.keep = true
     else if (a === '--purge' && cmd === 'forget') flags.purge = true
-    else if (/^--(steer|last|json|cancel|abort|allow-unsandboxed)$/.test(a)) flags[a.slice(2)] = true
+    else if (/^--(steer|last|json|abort|allow-unsandboxed)$/.test(a)) flags[a.slice(2)] = true
     else rest.push(a)
   }
   return { flags, rest, extra }
@@ -481,7 +482,7 @@ async function serve(name, flags, extra, first = null) {
     turns: before?.turns ?? 0,
     lastTool: null,
     lastReply: before?.lastReply ?? null,
-    dialog: null,
+    declined: [],
     error: null,
     exitCode: null,
   }
@@ -521,7 +522,7 @@ async function serve(name, flags, extra, first = null) {
   const takeCommand = cmd => {
     if (!PIPE_TYPES.includes(cmd?.type)) {
       // A model or provider switch would get past the gate; only our own commands go to pi.
-      log(`! refused a ${String(cmd?.type)} command: only prompts, answers, abort and stop reach pi. ${GATE_NOTE}`)
+      log(`! refused a ${String(cmd?.type)} command: only prompts, abort and stop reach pi. ${GATE_NOTE}`)
       return save()
     }
     if (cmd.type === '__stop') return end()
@@ -540,6 +541,8 @@ async function serve(name, flags, extra, first = null) {
       delete cmd.messageFile
     }
     if (cmd.type === 'prompt') {
+      // Serving again keeps promptSeq, so this is once per conversation.
+      if (st.promptSeq === 0) cmd.message += WORK_NOTE
       st.promptSeq += 1
       st.prompts[cmd.id] = st.promptSeq
       if (cmd.format === 'findings') st.findingsSeq = st.promptSeq
@@ -547,12 +550,6 @@ async function serve(name, flags, extra, first = null) {
       const ids = Object.keys(st.prompts)
       if (ids.length > 50) delete st.prompts[ids[0]]
       log(`\n## you · ${cmd.id} · ${clock()}${cmd.streamingBehavior === 'steer' ? ' · steer' : ''}\n${cmd.message}`)
-    }
-    if (cmd.type === 'extension_ui_response') {
-      // Back to what the session was doing when pi asked.
-      st.state = st.dialog?.inRun === false ? 'idle' : 'busy'
-      st.dialog = null
-      log(`  answered ${cmd.id}`)
     }
     if (cmd.type === 'abort') log(`  abort requested · ${clock()}`)
     save()
@@ -618,6 +615,7 @@ async function serve(name, flags, extra, first = null) {
         st.state = 'busy'
         st.error = null
         st.runStartedAt = Date.now()
+        st.declined = []
         break
       case 'turn_end':
         st.turns += 1
@@ -650,18 +648,16 @@ async function serve(name, flags, extra, first = null) {
         break
       case 'extension_ui_request':
         if (DIALOGS.includes(r.method)) {
-          // inRun: asked during a run, which pi's next settle ends; outside
-          // one (an extension at startup) it stays until answered.
-          const inRun = st.state === 'busy' || (st.state === 'waiting' && st.dialog?.inRun !== false)
-          st.dialog = { id: r.id, method: r.method, title: r.title ?? r.message ?? '', options: r.options ?? null, inRun }
-          st.state = 'waiting'
-          log(`? ${r.method} ${r.id}: ${st.dialog.title}${r.options ? ` [${r.options.join(' | ')}]` : ''}`)
+          // Like a subagent, a session finishes and reports instead of stopping
+          // to ask. Declining approves nothing: a permission extension hears no.
+          const title = oneLine(String(r.title ?? r.message ?? ''), 200)
+          if (!ending) pi.stdin.write(`${JSON.stringify({ type: 'extension_ui_response', id: r.id, cancelled: true })}\n`)
+          if (st.declined.length < MAX_DECLINED) st.declined.push({ method: r.method, title })
+          log(`! declined ${r.method} ${r.id}: ${title}`)
         }
         break
       case 'agent_settled':
-        // A run's dialog ends with the run (aborted, or resolved by pi).
-        if (st.dialog?.inRun !== false) st.dialog = null
-        st.state = st.dialog ? 'waiting' : 'idle'
+        st.state = 'idle'
         // Only prompts pi had accepted before settling are done; one still in
         // flight starts a new run.
         st.settledSeq = st.acceptedSeq
@@ -687,7 +683,6 @@ async function serve(name, flags, extra, first = null) {
     clearInterval(beat)
     st.state = state
     st.exitCode = code
-    st.dialog = null
     st.runStartedAt = null
     if (why) st.error = why
     save()
@@ -744,30 +739,25 @@ async function send(name, flags, rest) {
   process.stdout.write(`${id}\n`)
 }
 
-// With holdsPi (run) this process is what keeps pi alive, so a question can't
-// end it as exit 3 would: it is printed once, and the wait goes on after the answer.
-async function wait(name, id, flags, { holdsPi = false, deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity } = {}) {
+// On stderr, so stdout stays the reply alone (a findings array, or --out's path).
+const reportDeclined = (name, st) => {
+  for (const d of st?.declined ?? []) process.stderr.write(`pi-session: ${name} declined a question from an extension (${d.method}): ${d.title}\n`)
+}
+
+async function wait(name, id, flags, { deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity } = {}) {
   if (id?.startsWith('--')) fail(`wait does not take ${id}.`)
   if ('out' in flags) {
     if (!flags.out) fail('--out names a file.')
     prepareOut(flags.out)
   }
-  let asked = null
   for (;;) {
     const st = await settledStatus(name)
     if (!st) fail(`no session ${name}.`)
     const target = id ? st.prompts?.[id] : st.promptSeq
     if (id && target == null && isLive(st)) {
       // The prompt may still be in the pipe: give serve a moment.
-    } else if (st.state === 'waiting' && st.dialog) {
-      if (asked !== st.dialog.id) {
-        process.stdout.write(`pi asks (${st.dialog.method} ${st.dialog.id}): ${st.dialog.title}\n`)
-        if (st.dialog.options) process.stdout.write(`options: ${st.dialog.options.join(' | ')}\n`)
-        process.stdout.write(`Answer: pi-session answer ${name} ${st.dialog.id} <value>\n`)
-      }
-      asked = st.dialog.id
-      if (!holdsPi) leave(3)
     } else if (st.settledSeq >= (target ?? 0) && st.state !== 'busy' && st.state !== 'starting') {
+      reportDeclined(name, st)
       let reply = lastReply(name)
       if (st.findingsSeq && st.findingsSeq === st.settledSeq) {
         // An error means the reply there is an older one, not the answer to this prompt.
@@ -781,7 +771,6 @@ async function wait(name, id, flags, { holdsPi = false, deadline = flags.timeout
     } else if (!isLive(st)) {
       fail(`${name} ${shownState(st)} before settling${st.error ? `: ${st.error}` : ''}.`)
     }
-    if (st.state !== 'waiting') asked = null
     if (Date.now() > deadline) {
       if (flags.abort && isLive(st)) return abortAfterTimeout(name, flags)
       fail(`still ${st.state} after ${flags.timeout}s.`, 2)
@@ -795,14 +784,13 @@ async function abortAfterTimeout(name, flags) {
   toPipe(name, { id: `a${Date.now().toString(36)}`, type: 'abort' })
   const until = Date.now() + 15000
   let st = readStatus(name)
-  // A run's question ends with the run; one asked outside a run (dialog.inRun false) stays.
-  const working = s => s.state === 'busy' || (s.state === 'waiting' && s.dialog?.inRun !== false)
-  while (isLive(st) && working(st) && Date.now() < until) {
+  while (isLive(st) && st.state === 'busy' && Date.now() < until) {
     await new Promise(r => setTimeout(r, 500))
     st = readStatus(name)
   }
-  const settled = !isLive(st) || !working(st)
+  const settled = !isLive(st) || st.state !== 'busy'
   process.stderr.write(`pi-session: ${name} timed out after ${flags.timeout}s; ${settled ? 'its run was aborted' : 'abort sent, but it is still busy'}.\n`)
+  reportDeclined(name, st)
   // An unfinished run's reply is not its answer, even if an older one would pass the check.
   if (st?.findingsSeq && st.findingsSeq === st.acceptedSeq) noFindings(name, 'the run did not finish', 2)
   const reply = lastReply(name)
@@ -836,7 +824,7 @@ async function run(name, flags, rest, extra) {
       if (Date.now() > deadline) fail(`still starting after ${flags.timeout}s.`, 2)
       await sleep(100)
     }
-    await wait(name, cmd.id, flags, { holdsPi: true, deadline })
+    await wait(name, cmd.id, flags, { deadline })
   } catch (err) {
     if (!(err instanceof Leave)) throw err
     code = err.code
@@ -870,23 +858,10 @@ function status(name, flags) {
   if (!rows.length) return process.stdout.write(`No pi sessions in ${ROOT}.\n`)
   for (const r of rows) {
     process.stdout.write(`${r.name}  ${r.shown}  ${r.model ?? '-'}  ${r.cwd ?? '-'}  active ${ago(r.lastActivity)} ago${r.sandboxed === false ? '  UNSANDBOXED' : ''}\n`)
-    const detail = r.dialog ? `asks (${r.dialog.method} ${r.dialog.id}): ${r.dialog.title}` : r.error ? `error: ${r.error}` : r.lastTool ? `→ ${r.lastTool}` : r.lastReply ? `last: ${r.lastReply}` : ''
+    const detail = r.error ? `error: ${r.error}` : r.lastTool ? `→ ${r.lastTool}` : r.lastReply ? `last: ${r.lastReply}` : ''
     if (detail) process.stdout.write(`  ${oneLine(detail, 160)}\n`)
+    if (r.declined?.length) process.stdout.write(`  declined ${r.declined.length} extension question${r.declined.length === 1 ? '' : 's'} in its last run: see read ${r.name}\n`)
   }
-}
-
-async function answer(name, reqId, flags, rest) {
-  const st = await needLive(name)
-  if (!reqId) fail('name the request id.')
-  const d = st.dialog
-  if (!d || d.id !== reqId) fail(`${name} has no open dialog ${reqId}${d ? ` (open: ${d.id})` : ''}.`)
-  const value = rest.join(' ')
-  const res = { type: 'extension_ui_response', id: reqId }
-  if (flags.cancel) res.cancelled = true
-  else if (d.method === 'confirm') res.confirmed = /^(y|yes|true|1)$/i.test(value)
-  else res.value = value
-  toPipe(name, res)
-  process.stdout.write('answered\n')
 }
 
 // Deletes pi's copy of a conversation and returns its path, or throws saying why
@@ -965,9 +940,6 @@ switch (cmd) {
   case 'status':
   case 'list':
     status(rest[0] ? needName(rest[0]) : undefined, flags)
-    break
-  case 'answer':
-    await answer(needName(rest[0]), rest[1], flags, rest.slice(2))
     break
   case 'abort':
     await needLive(needName(rest[0]))

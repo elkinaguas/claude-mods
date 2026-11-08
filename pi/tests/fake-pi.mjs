@@ -48,6 +48,8 @@ process.stdin.on('data', chunk => {
   while ((i = buf.indexOf('\n')) >= 0) {
     const cmd = JSON.parse(buf.slice(0, i))
     buf = buf.slice(i + 1)
+    // Replies to what was asked, not to pi-session's note on a first prompt.
+    if (typeof cmd.message === 'string') cmd.message = cmd.message.split('\n\n[Session note:')[0]
     if (cmd.type === 'get_state') {
       out({ id: cmd.id, type: 'response', command: 'get_state', success: true, data: { model: { provider: process.env.FAKE_PI_PROVIDER || 'opencode-go', id: 'echo' }, sessionFile: 'FAKE_PI_SESSION_FILE' in process.env ? process.env.FAKE_PI_SESSION_FILE || null : '/tmp/fake.jsonl', isStreaming: false } })
     } else if (cmd.type === 'prompt' && /\breject\b/.test(cmd.message)) {

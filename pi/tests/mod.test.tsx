@@ -302,7 +302,8 @@ test("Claude's instructions cover run, and status over old task output after a r
   const text = sections.find(s => s.id === 'pi:sessions')?.text ?? ''
   expect(text).toMatch(/`run <name> --model <provider>\/<id> .*--file <prompt file>`.* with run_in_background/)
   expect(text).toMatch(/`--keep` leaves the session running/)
-  expect(text).toMatch(/A question does not end it/)
+  expect(text).toMatch(/Sessions never stop for questions/)
+  expect(text).not.toMatch(/`answer|exit 3/)
   expect(text).toMatch(/`serve` and `run` refuse to start outside the sandbox/)
   expect(text).toMatch(/After a restart, use `status <name>`.*Never go by the output of a task from before the restart/)
   expect(text).toMatch(/add `--out FILE` to write it to a file/)
