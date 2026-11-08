@@ -85,10 +85,13 @@ pi-session wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]   # exit 
 pi-session read <name> [--last | --tail N | --since LINE]
 pi-session status [name] [--json]
 pi-session answer <name> <request-id> <value...> | --cancel
-pi-session abort | stop | forget <name>
+pi-session abort | stop <name>
+pi-session forget <name> [--purge]   # --purge also deletes pi's copy of the conversation, for good
 ```
 
-Each session keeps `status.json`, `transcript.md`, `last-reply.md`, `events.jsonl` (pi's raw event stream) and `stderr.log` in `~/.pi/agent/claude-sessions/<name>/` (`PI_SESSIONS_DIR` overrides it). pi keeps its own copy of the conversation under `~/.pi/agent/sessions/`, as session `claude-<name>-<id>`. Serving a session again reopens that conversation; after `forget`, the same name starts a new one. Prompts too long for one pipe write go through the session's `inbox/` folder.
+Each session keeps `status.json`, `transcript.md`, `last-reply.md`, `events.jsonl` (pi's raw event stream) and `stderr.log` in `~/.pi/agent/claude-sessions/<name>/` (`PI_SESSIONS_DIR` overrides it). pi keeps its own copy of the conversation under `~/.pi/agent/sessions/`, as session `claude-<name>-<id>`. Serving a session again reopens that conversation; `forget` deletes the session's folder and leaves pi's copy alone, and the same name then starts a new conversation. Prompts too long for one pipe write go through the session's `inbox/` folder.
+
+`forget --purge` also deletes pi's copy of the conversation, which can't be undone. Like `forget`, it refuses a running session. It takes the path pi reported, kept in `status.json`, and deletes it only if it is a plain file inside the real `~/.pi/agent/sessions`, reached by no link. It refuses a link, a folder, the sessions folder itself, anything outside it, or a `~/.pi/agent/sessions` that is itself a link. If pi never reported a path, or nothing is there, it says pi's copy was not found; it never searches for one. Any of these exits 1 and deletes nothing, so `status.json` still says where the copy was; plain `forget` then drops the session's folder and keeps whatever pi has. The panel's Forget button never purges.
 
 `run` is `serve`, `send` and `wait` in one call and one process, meant as one background Bash call. It goes through the same gate and sandbox checks as `serve`, refuses a session that is already running, and checks `--out` and the prompt before pi starts. Its output, `--out`, findings check, and exit codes 2 and 4 are `wait`'s. Then:
 
