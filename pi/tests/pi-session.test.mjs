@@ -830,3 +830,199 @@ test('a name served again after forget starts a new pi conversation', async () =
   await until(() => status('gamma').state === 'stopped')
   again.kill()
 })
+
+// forget --purge: everything stays inside this test's own HOME.
+const conversations = path.join(home, '.pi', 'agent', 'sessions')
+const conversation = (name, text = 'conversation') => {
+  const at = path.join(conversations, '--project--', `${name}.jsonl`)
+  fs.mkdirSync(path.dirname(at), { recursive: true })
+  fs.writeFileSync(at, text)
+  return at
+}
+// A stopped session whose pi reported this sessionFile (null: reported none).
+const stoppedWith = async (name, sessionFile) => {
+  const child = spawn('node', [SCRIPT, 'serve', name, '--cwd', root, '--model', 'opencode-go/echo'], { env: { ...env, FAKE_PI_SESSION_FILE: sessionFile ?? '' }, stdio: 'ignore' })
+  await until(() => fs.existsSync(path.join(root, name, 'status.json')) && status(name).state === 'idle')
+  assert.equal(status(name).sessionFile, sessionFile)
+  cli('stop', name)
+  await until(() => status(name).state === 'stopped')
+  child.kill()
+}
+const refusedPurge = (name, why) => {
+  const refused = cliFails('forget', name, '--purge')
+  assert.equal(refused.code, 1)
+  assert.match(refused.out, why)
+  assert.match(refused.out, /Nothing was deleted/)
+  assert.doesNotMatch(refused.out, /^forgot/m)
+  // The session's folder stays too, and plain forget still clears it.
+  assert.ok(fs.existsSync(path.join(root, name, 'status.json')))
+  assert.match(cli('forget', name), /^forgot /)
+}
+
+test("forget --purge deletes pi's copy and the session, and leaves other conversations", async () => {
+  const mine = conversation('purge-mine')
+  const other = conversation('purge-other')
+  await stoppedWith('purged', mine)
+  const real = fs.realpathSync(mine)
+  assert.equal(cli('forget', '--purge', 'purged'), `forgot purged and deleted pi's copy, ${real}\n`)
+  assert.ok(!fs.existsSync(mine))
+  assert.ok(!fs.existsSync(path.join(root, 'purged')))
+  assert.equal(fs.readFileSync(other, 'utf8'), 'conversation')
+  assert.ok(fs.statSync(path.dirname(mine)).isDirectory())
+})
+
+test("plain forget keeps pi's copy", async () => {
+  const mine = conversation('plain-kept')
+  await stoppedWith('plain', mine)
+  assert.equal(cli('forget', 'plain'), 'forgot plain\n')
+  assert.ok(!fs.existsSync(path.join(root, 'plain')))
+  assert.equal(fs.readFileSync(mine, 'utf8'), 'conversation')
+})
+
+test('forget --purge refuses a live session, and keeps its copy', async () => {
+  const mine = conversation('purge-live')
+  const child = spawn('node', [SCRIPT, 'serve', 'purge-live', '--cwd', root, '--model', 'opencode-go/echo'], { env: { ...env, FAKE_PI_SESSION_FILE: mine }, stdio: 'ignore' })
+  await until(() => fs.existsSync(path.join(root, 'purge-live', 'status.json')) && status('purge-live').state === 'idle')
+  assert.match(cliFails('forget', 'purge-live', '--purge').out, /running; stop it first/)
+  assert.ok(fs.existsSync(mine))
+  assert.equal(status('purge-live').state, 'idle')
+  cli('stop', 'purge-live')
+  await until(() => status('purge-live').state === 'stopped')
+  child.kill()
+  cli('forget', 'purge-live')
+})
+
+test('forget --purge refuses a link, and neither it nor what it points at is deleted', async () => {
+  const target = conversation('link-target')
+  const link = path.join(conversations, '--project--', 'link.jsonl')
+  fs.symlinkSync(target, link)
+  await stoppedWith('linked', link)
+  refusedPurge('linked', /is a link/)
+  assert.ok(fs.lstatSync(link).isSymbolicLink())
+  assert.equal(fs.readFileSync(target, 'utf8'), 'conversation')
+})
+
+test('forget --purge refuses a path outside the sessions folder, also dressed as inside', async () => {
+  const outside = path.join(home, '.pi', 'agent', 'auth-copy.json')
+  fs.writeFileSync(outside, 'keep me')
+  await stoppedWith('outside', outside)
+  refusedPurge('outside', /is outside/)
+
+  // A status file a sandboxed command rewrote, climbing out of the folder.
+  await stoppedWith('climbs', conversation('climbs'))
+  const statusFile = path.join(root, 'climbs', 'status.json')
+  fs.writeFileSync(statusFile, JSON.stringify({ ...status('climbs'), sessionFile: `${conversations}/../auth-copy.json` }))
+  refusedPurge('climbs', /is outside/)
+
+  // A sibling whose name only starts like the folder's.
+  const sibling = `${conversations}-old.jsonl`
+  fs.writeFileSync(sibling, 'keep me')
+  await stoppedWith('sibling', sibling)
+  refusedPurge('sibling', /is outside/)
+
+  // A file reached through a folder link planted inside the sessions folder.
+  const away = fs.mkdtempSync(path.join(home, 'away-'))
+  fs.writeFileSync(path.join(away, 'victim.jsonl'), 'keep me')
+  const through = path.join(conversations, 'through')
+  fs.symlinkSync(away, through)
+  await stoppedWith('through', path.join(through, 'victim.jsonl'))
+  refusedPurge('through', /is outside/)
+  // And one that leads back inside it: still not the path pi would report.
+  const inner = path.join(conversations, 'inner')
+  fs.symlinkSync(path.join(conversations, '--project--'), inner)
+  const reached = conversation('reached')
+  await stoppedWith('inner', path.join(inner, 'reached.jsonl'))
+  refusedPurge('inner', /goes through a link/)
+
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'keep me')
+  assert.equal(fs.readFileSync(sibling, 'utf8'), 'keep me')
+  assert.equal(fs.readFileSync(path.join(away, 'victim.jsonl'), 'utf8'), 'keep me')
+  assert.equal(fs.readFileSync(reached, 'utf8'), 'conversation')
+  fs.rmSync(through)
+  fs.rmSync(inner)
+})
+
+test('forget --purge refuses a folder, a pipe and the sessions folder itself', async () => {
+  const inside = conversation('in-folder')
+  await stoppedWith('folder', path.dirname(inside))
+  refusedPurge('folder', /not a plain file/)
+
+  await stoppedWith('whole', conversations)
+  refusedPurge('whole', /sessions folder itself/)
+
+  const pipe = path.join(conversations, 'a.pipe')
+  assert.equal(spawnSync('mkfifo', [pipe]).status, 0)
+  await stoppedWith('piped', pipe)
+  refusedPurge('piped', /not a plain file/)
+  assert.ok(fs.lstatSync(pipe).isFIFO())
+  fs.rmSync(pipe)
+
+  assert.equal(fs.readFileSync(inside, 'utf8'), 'conversation')
+})
+
+test('forget --purge refuses when the sessions folder itself is a link, as a planted one would be', async () => {
+  const victim = fs.mkdtempSync(path.join(home, 'victim-'))
+  fs.writeFileSync(path.join(victim, 'file.jsonl'), 'keep me')
+  await stoppedWith('swapped', conversation('swapped'))
+  const moved = `${conversations}.real`
+  fs.renameSync(conversations, moved)
+  fs.symlinkSync(victim, conversations)
+  try {
+    const statusFile = path.join(root, 'swapped', 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ ...status('swapped'), sessionFile: path.join(conversations, 'file.jsonl') }))
+    refusedPurge('swapped', /is not a real folder/)
+    assert.equal(fs.readFileSync(path.join(victim, 'file.jsonl'), 'utf8'), 'keep me')
+  } finally {
+    fs.rmSync(conversations)
+    fs.renameSync(moved, conversations)
+  }
+})
+
+test("forget --purge says pi's copy was not found when there is no path, or nothing there, and never guesses", async () => {
+  // Named like the session, so a search by session id would find it.
+  await stoppedWith('unreported', null)
+  const lookalike = conversation(status('unreported').sessionId)
+  refusedPurge('unreported', /pi's copy was not found: status\.json has no sessionFile/)
+  assert.equal(fs.readFileSync(lookalike, 'utf8'), 'conversation')
+
+  await stoppedWith('gone', path.join(conversations, '--project--', 'never-written.jsonl'))
+  refusedPurge('gone', /pi's copy was not found: nothing at/)
+
+  // A status file that is unreadable, or holds something that is no path.
+  await stoppedWith('garbled', null)
+  fs.writeFileSync(path.join(root, 'garbled', 'status.json'), 'not json')
+  refusedPurge('garbled', /no sessionFile/)
+  await stoppedWith('typed', null)
+  for (const sessionFile of [7, ['a'], 'relative/path.jsonl']) {
+    fs.writeFileSync(path.join(root, 'typed', 'status.json'), JSON.stringify({ state: 'stopped', sessionFile }))
+    const refused = cliFails('forget', 'typed', '--purge')
+    assert.match(refused.out, /not an absolute path/)
+    assert.ok(fs.existsSync(path.join(root, 'typed', 'status.json')))
+  }
+  cli('forget', 'typed')
+})
+
+test('forget --purge that cannot delete the file keeps the session too', { skip: process.getuid?.() === 0 }, async () => {
+  const mine = conversation('locked')
+  await stoppedWith('locked', mine)
+  fs.chmodSync(path.dirname(mine), 0o555)
+  try {
+    refusedPurge('locked', /EACCES/)
+    assert.ok(fs.existsSync(mine))
+  } finally {
+    fs.chmodSync(path.dirname(mine), 0o755)
+  }
+})
+
+test('--purge means nothing in the commands that do not take it, and forget takes nothing else', async () => {
+  const child = await serve('words-purge')
+  const id = cli('send', 'words-purge', 'mention', '--purge', 'here').trim()
+  assert.equal(cli('wait', 'words-purge', id, '--timeout', '5'), 'echo: mention --purge here\n')
+  cli('stop', 'words-purge')
+  await until(() => status('words-purge').state === 'stopped')
+  child.kill()
+  // A mistyped flag would otherwise lose the only record of where pi's copy is.
+  assert.match(cliFails('forget', 'words-purge', '--purg').out, /takes one name.*Nothing was deleted/)
+  assert.ok(fs.existsSync(path.join(root, 'words-purge', 'status.json')))
+  cli('forget', 'words-purge')
+})

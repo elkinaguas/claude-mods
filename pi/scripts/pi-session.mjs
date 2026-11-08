@@ -41,6 +41,8 @@ const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')
 const PIPE_TYPES = ['prompt', 'abort', 'extension_ui_response', '__stop']
 const GATE_NOTE = `The pi mod works only with an ${PROVIDER} API key, or a model at a host you trust (option trustedModelHosts).`
 const PI_HOME = path.join(os.homedir(), '.pi')
+// Where pi keeps its own copy of each conversation: all that forget --purge may delete.
+const PI_CONVERSATIONS = path.join(PI_HOME, 'agent', 'sessions')
 // `wait` exits with this when a findings prompt's reply fails its check.
 const BAD_FINDINGS = 4
 const SEVERITIES = ['critical', 'high', 'medium', 'low']
@@ -118,7 +120,10 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       Answer a dialog an extension opened (confirm takes yes or no).
   abort <name>     Stop pi's current run; the session stays.
   stop <name>      End the session; serve it again later to continue.
-  forget <name>    Delete a stopped session's files here (pi keeps its own copy).
+  forget <name> [--purge]
+      Delete a stopped session's files here; pi keeps its own copy. --purge also
+      deletes pi's copy, for good: only a plain file inside ~/.pi/agent/sessions,
+      reached by no link. If it can't, it says why and deletes nothing.
 
 Sessions live in ${ROOT}.`
 
@@ -244,7 +249,7 @@ const toPipe = (name, cmd) => {
   fs.closeSync(fd)
 }
 
-// Only the commands that take --out, --format or --keep read them, so a prompt can mention them.
+// Only the commands that take --out, --format, --keep or --purge read them, so a prompt can mention them.
 const parse = (argv, cmd) => {
   const flags = {}
   const rest = []
@@ -258,6 +263,7 @@ const parse = (argv, cmd) => {
     if (/^--(cwd|model|thinking|timeout|tail|since|file|trusted-hosts)$/.test(a) || (a === '--out' && (cmd === 'wait' || cmd === 'run')) || (a === '--format' && (cmd === 'send' || cmd === 'run')))
       flags[a.slice(2)] = argv[++i]
     else if (a === '--keep' && cmd === 'run') flags.keep = true
+    else if (a === '--purge' && cmd === 'forget') flags.purge = true
     else if (/^--(steer|last|json|cancel|abort|allow-unsandboxed)$/.test(a)) flags[a.slice(2)] = true
     else rest.push(a)
   }
@@ -883,12 +889,59 @@ async function answer(name, reqId, flags, rest) {
   process.stdout.write('answered\n')
 }
 
-async function forget(name) {
+// Deletes pi's copy of a conversation and returns its path, or throws saying why
+// it won't. Sandboxed commands can write status.json and everything in
+// ~/.pi/agent, so neither the path nor the folders on the way to it are taken on
+// trust, and this can't be undone: anything that isn't plainly a file in pi's
+// folder is refused.
+const deletePiCopy = sessionFile => {
+  if (sessionFile == null) throw new Error("pi's copy was not found: status.json has no sessionFile (pi never reported one)")
+  const shown = JSON.stringify(sessionFile)
+  if (typeof sessionFile !== 'string' || !path.isAbsolute(sessionFile)) throw new Error(`sessionFile ${shown} is not an absolute path`)
+  // A link here would make any folder of yours count as pi's.
+  if (!fs.lstatSync(PI_CONVERSATIONS, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${PI_CONVERSATIONS} is not a real folder`)
+  const base = fs.realpathSync.native(PI_CONVERSATIONS)
+  const named = path.resolve(sessionFile)
+  const st = fs.lstatSync(named, { throwIfNoEntry: false })
+  if (!st) throw new Error(`pi's copy was not found: nothing at ${shown}`)
+  if (st.isSymbolicLink()) throw new Error(`${shown} is a link`)
+  const real = fs.realpathSync.native(named)
+  if (real === base) throw new Error(`${shown} is the sessions folder itself`)
+  if (!within(real, base)) throw new Error(`${shown} is outside ${PI_CONVERSATIONS}`)
+  // Only a link above ~/.pi/agent/sessions may make the two differ.
+  if (named !== real && named !== path.join(path.resolve(PI_CONVERSATIONS), path.relative(base, real))) throw new Error(`${shown} goes through a link`)
+  // From inside the folder, so a folder swapped for a link after these checks
+  // can't redirect the delete; unlink never follows a link in the last step.
+  const back = process.cwd()
+  process.chdir(path.dirname(real))
+  try {
+    if (!within(process.cwd(), base)) throw new Error(`${shown} moved outside ${PI_CONVERSATIONS}`)
+    if (!fs.lstatSync(path.basename(real)).isFile()) throw new Error(`${shown} is not a plain file`)
+    fs.unlinkSync(path.basename(real))
+  } finally {
+    process.chdir(back)
+  }
+  return real
+}
+
+async function forget(name, flags, more) {
+  // A mistyped --purge would otherwise delete the only record of where pi's copy is.
+  if (more.length) fail(`forget takes one name and --purge, not ${more.join(' ')}. Nothing was deleted.`)
   const st = await settledStatus(name)
   if (isLive(st)) fail(`${name} is running; stop it first.`)
   if (!fs.existsSync(dir(name))) fail(`no session ${name}.`)
+  // pi's copy goes first: status.json is the only record of where it is, so a
+  // refusal leaves everything in place, to look at or to forget without --purge.
+  let purged
+  if (flags.purge) {
+    try {
+      purged = deletePiCopy(st?.sessionFile)
+    } catch (err) {
+      fail(`refusing to purge ${name}: ${err.message}. Nothing was deleted. To drop only the session's files here and keep whatever pi has: forget ${name}`)
+    }
+  }
   fs.rmSync(dir(name), { recursive: true, force: true })
-  process.stdout.write(`forgot ${name}\n`)
+  process.stdout.write(purged ? `forgot ${name} and deleted pi's copy, ${purged}\n` : `forgot ${name}\n`)
 }
 
 const [cmd, ...argv] = process.argv.slice(2)
@@ -927,7 +980,7 @@ switch (cmd) {
     process.stdout.write('stopping\n')
     break
   case 'forget':
-    await forget(needName(rest[0]))
+    await forget(needName(rest[0]), flags, rest.slice(1))
     break
   default:
     process.stdout.write(`${USAGE}\n`)
