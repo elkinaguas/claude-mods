@@ -102,6 +102,30 @@ test('a wait that times out with --abort stops the run', () => {
   assert.match(cli('read', 'alpha', '--tail', '5'), /settled \(aborted\)/)
 })
 
+test('a run records its start from agent_start, kept while pi asks, cleared when it settles', async () => {
+  assert.equal(status('alpha').runStartedAt, null)
+  const before = Date.now()
+  const id = cli('send', 'alpha', 'please ask me').trim()
+  await until(() => status('alpha').state === 'waiting')
+  const started = status('alpha').runStartedAt
+  assert.equal(typeof started, 'number')
+  assert.ok(started >= before && started <= Date.now())
+  cli('answer', 'alpha', 'd1', 'yes')
+  cli('wait', 'alpha', id, '--timeout', '5')
+  assert.equal(status('alpha').state, 'idle')
+  assert.equal(status('alpha').runStartedAt, null)
+
+  const slow = cli('send', 'alpha', 'slow: a long job').trim()
+  await until(() => status('alpha').state === 'busy')
+  const running = status('alpha').runStartedAt
+  assert.ok(running >= started)
+  // Pi's later events move lastActivity, not the run's start.
+  await until(() => status('alpha').lastTool?.startsWith('bash'))
+  assert.equal(status('alpha').runStartedAt, running)
+  cliFails('wait', 'alpha', slow, '--timeout', '1', '--abort')
+  assert.equal(status('alpha').runStartedAt, null)
+})
+
 test('serve refuses to run outside the sandbox unless allowed, and marks such a session', async () => {
   let out = ''
   try {

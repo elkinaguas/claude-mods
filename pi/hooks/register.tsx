@@ -36,9 +36,11 @@ const rank = (state: string) => {
   return i === -1 ? ATTENTION.length : i
 }
 
-const sessionsAtom = atom({ plugin: 'pi', key: 'sessions' } as const, [] as PiSession[], { shape: 'sessions-1' })
+const sessionsAtom = atom({ plugin: 'pi', key: 'sessions' } as const, [] as PiSession[], { shape: 'sessions-2' })
 const warningsAtom = atom({ plugin: 'pi', key: 'warnings' } as const, [] as string[])
 const selectedAtom = atom({ plugin: 'pi', key: 'selected' } as const, null as string | null)
+// Moved by the poll while the pane is on screen: reading it redraws the pane, so the card's age moves.
+const tickAtom = atom({ plugin: 'pi', key: 'tick' } as const, 0)
 
 let home = ''
 let cwd = ''
@@ -359,6 +361,7 @@ const toSession = (name: string, raw: Json, now: number): PiSession => {
     cwd: str(raw.cwd),
     model: str(raw.model),
     lastActivity: num(raw.lastActivity),
+    runStartedAt: num(raw.runStartedAt),
     lastTool: str(raw.lastTool),
     lastReply: str(raw.lastReply),
     dialog: str(dialog.id) ? { id: str(dialog.id)!, method: str(dialog.method) ?? '', title: str(dialog.title) ?? '' } : null,
@@ -380,7 +383,7 @@ async function load($: EngineInterface) {
       // A status.json mid-rename: the next poll reads it.
     }
   }
-  // Ages are drawn from lastActivity, so the list only changes with a session.
+  // Ages are worked out when drawing (the poll's tick redraws), so the list only changes with a session.
   const key = JSON.stringify(list)
   if (key !== seen) {
     seen = key
@@ -389,6 +392,13 @@ async function load($: EngineInterface) {
   const isLive = list.some(s => LIVE.includes(s.state))
   if (isLive && !wasLive && autoOpen) void $.ui.open({ id: PANE, title: TITLE }).catch(() => {})
   wasLive = isLive
+}
+
+// Every poll reads the sessions; only a pane on screen is redrawn for its age.
+async function poll($: EngineInterface) {
+  await load($).catch(() => {})
+  const panes = await $.ui.panes().catch(() => [])
+  if (panes.some(p => p.id === PANE && p.isShown)) await update($, tickAtom, n => n + 1)
 }
 
 const ago = (ms: number | null, now: number) => {
@@ -444,7 +454,7 @@ export const register: Register = (on, options) => {
       description: 'pi sessions: /pi opens the panel, /pi check checks the key-masking setup, /pi close',
     }).catch((err: unknown) => $.ui.log(`pi: /${COMMAND} not registered: ${String(err)}`))
     await load($).catch(() => {})
-    $.clock.every(POLL_MS, () => void load($).catch(() => {}))
+    $.clock.every(POLL_MS, () => void poll($).catch(() => {}))
     const problems = await check($).catch(() => [] as string[])
     if (problems.length) $.ui.toast(`pi: ${problems.length} setup problem${problems.length === 1 ? '' : 's'}; /pi check`)
     return next(e)
@@ -517,6 +527,7 @@ export const register: Register = (on, options) => {
     const list = await read($, sessionsAtom)
     const warnings = await read($, warningsAtom)
     const picked = await read($, selectedAtom)
+    await read($, tickAtom)
     const now = await $.clock.now()
     const cols = Math.max(20, e.props.bodyColumns ?? 60)
 
@@ -535,11 +546,13 @@ export const register: Register = (on, options) => {
         : s.lastTool
           ? `→ ${s.lastTool}`
           : null
+      // A busy session counts from the start of its run, the others from pi's last event.
+      const since = s.state === 'busy' && s.runStartedAt ? s.runStartedAt : s.lastActivity
       return (
         <Box flexDirection="column" key="card">
           <Text>
             <Text bold>{s.name}</Text> <Text color={STATE_COLOR[s.state] ?? 'white'}>{s.state}</Text>
-            <Text dimColor> {ago(s.lastActivity, now)}</Text>
+            <Text dimColor> {ago(since, now)}</Text>
           </Text>
           <Text dimColor>{clip(`${s.model ?? '-'}  ${short(s.cwd)}`, cols)}</Text>
           {s.sandboxed === false && <Text color="red" bold wrap="wrap">! runs outside the sandbox: pi holds your real provider key</Text>}
