@@ -17,7 +17,8 @@ import path from 'node:path'
 const ROOT = process.env.PI_SESSIONS_DIR || path.join(os.homedir(), '.pi', 'agent', 'claude-sessions')
 const PI = process.env.PI_SESSION_PI || 'pi'
 const NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/
-const LIVE = ['starting', 'idle', 'busy']
+// 'waiting': only a serve started before dialogs were declined still writes it.
+const LIVE = ['starting', 'idle', 'busy', 'waiting']
 const HEARTBEAT_MS = 5000
 // A serve whose heartbeat is older than this is gone (killed with Claude Code,
 // or the machine slept through it). Each sandboxed command has its own process
@@ -28,6 +29,11 @@ const PIPE_LINE = 4096
 // Dialogs an extension can open. Nobody is there to answer: serve declines them.
 const DIALOGS = ['select', 'confirm', 'input', 'editor']
 const MAX_DECLINED = 20
+// More in one run than any real work asks: an extension asking again each time
+// it hears no would otherwise never let the run end.
+const MAX_DECLINES_PER_RUN = 100
+// How long pi may take to report its state before serve gives up on it.
+const START_MS = Number(process.env.PI_SESSION_START_MS) || 120000
 // Sent once, with a conversation's first prompt. Starts with what the tests' fake pi strips.
 const WORK_NOTE = "\n\n[Session note: nobody can answer questions while you work. Don't stop to ask: make a reasonable choice, finish the work, and list open questions and assumptions in your final reply, unless this prompt asks for a fixed format.]"
 // Claude Code's Bash sandbox sets this in every command it wraps. Outside it,
@@ -115,7 +121,8 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       opens is declined at once, and wait names it on stderr. --out writes the
       reply to FILE and prints only its path and size; FILE can't be in ~/.pi.
       A findings reply comes as the JSON array alone. Exit 4 if it fails the
-      check: the error is reported, nothing is written, read --last has it.
+      check, or its run was aborted, wrote no reply, or settled along with a
+      later prompt: the error is reported, nothing is written, read --last has it.
   read <name> [--last | --tail N | --since LINE]
       Print the transcript (default: last 40 lines), or the last reply.
   status [name] [--json]
@@ -467,7 +474,8 @@ async function serve(name, flags, extra, first = null) {
     model: model ?? null,
     sandboxed: SANDBOXED,
     sessionId,
-    sessionFile: null,
+    // Kept until pi reports it again: forget --purge has no other record of it.
+    sessionFile: before?.sessionFile ?? null,
     startedAt: Date.now(),
     lastActivity: Date.now(),
     runStartedAt: null,
@@ -475,9 +483,12 @@ async function serve(name, flags, extra, first = null) {
     promptSeq: before?.promptSeq ?? 0,
     acceptedSeq: before?.promptSeq ?? 0,
     settledSeq: before?.promptSeq ?? 0,
-    // The newest prompt sent with --format findings: while it is the last one
-    // settled, last-reply.md is its reply and wait checks it.
-    findingsSeq: before?.findingsSeq ?? 0,
+    // The prompts sent with --format findings. wait takes last-reply.md for one
+    // only if it is the last settled, its run wasn't aborted, and it wrote a reply.
+    findingsSeqs: before?.findingsSeqs ?? [],
+    // What acceptedSeq was when last-reply.md was last written, and how the last run ended.
+    replySeq: before?.replySeq ?? 0,
+    lastRunAborted: before?.lastRunAborted ?? false,
     prompts: before?.prompts ?? {},
     turns: before?.turns ?? 0,
     lastTool: null,
@@ -545,7 +556,7 @@ async function serve(name, flags, extra, first = null) {
       if (st.promptSeq === 0) cmd.message += WORK_NOTE
       st.promptSeq += 1
       st.prompts[cmd.id] = st.promptSeq
-      if (cmd.format === 'findings') st.findingsSeq = st.promptSeq
+      if (cmd.format === 'findings') st.findingsSeqs = [...st.findingsSeqs, st.promptSeq].slice(-50)
       delete cmd.format
       const ids = Object.keys(st.prompts)
       if (ids.length > 50) delete st.prompts[ids[0]]
@@ -571,6 +582,18 @@ async function serve(name, flags, extra, first = null) {
     if (done && st.state !== 'busy') st.settledSeq = st.acceptedSeq
   }
 
+  // Ends a session pi can't go on in; serving it again reopens the conversation.
+  const giveUp = why => {
+    st.error = why
+    log(`! ${why}`)
+    save()
+    end()
+  }
+  setTimeout(() => {
+    if (st.state === 'starting' && !ending) giveUp(`pi did not report its state within ${Math.round(START_MS / 1000)}s`)
+  }, START_MS).unref()
+
+  let declines = 0
   let lastDeltaSave = 0
   onLines(pi.stdout, line => {
     if (finished) return
@@ -593,13 +616,15 @@ async function serve(name, flags, extra, first = null) {
             log(`! ${st.error}`)
             end()
           }
-          st.sessionFile = r.data?.sessionFile ?? null
+          st.sessionFile = r.data?.sessionFile ?? st.sessionFile
           if (st.state === 'starting') st.state = r.data?.isStreaming ? 'busy' : 'idle'
           // In the same step as going idle, so no reader sees this session idle with its prompt unsent.
           if (first && !ending) {
             takeCommand(first)
             session.taken = true
           }
+        } else if (r.id === 'pi-session-state') {
+          giveUp(`pi could not report its state: ${r.error}`)
         } else if (!r.success) {
           st.error = `${r.command}: ${r.error}`
           log(`! ${st.error}`)
@@ -615,7 +640,9 @@ async function serve(name, flags, extra, first = null) {
         st.state = 'busy'
         st.error = null
         st.runStartedAt = Date.now()
-        st.declined = []
+        // What an earlier run already reported; one asked since then is still news.
+        st.declined = st.declined.filter(d => !d.done)
+        declines = 0
         break
       case 'turn_end':
         st.turns += 1
@@ -631,6 +658,7 @@ async function serve(name, flags, extra, first = null) {
         if (text) {
           st.lastReply = oneLine(text, 300)
           fs.writeFileSync(file(name, 'last-reply.md'), `${text}\n`)
+          st.replySeq = st.acceptedSeq
           log(`\n## pi · ${clock()}\n${text}`)
         }
         if (msg.stopReason === 'error' || msg.errorMessage) {
@@ -650,9 +678,15 @@ async function serve(name, flags, extra, first = null) {
         if (DIALOGS.includes(r.method)) {
           // Like a subagent, a session finishes and reports instead of stopping
           // to ask. Declining approves nothing: a permission extension hears no.
+          if (ending) break
           const title = oneLine(String(r.title ?? r.message ?? ''), 200)
-          if (!ending) pi.stdin.write(`${JSON.stringify({ type: 'extension_ui_response', id: r.id, cancelled: true })}\n`)
-          if (st.declined.length < MAX_DECLINED) st.declined.push({ method: r.method, title })
+          declines += 1
+          if (declines > MAX_DECLINES_PER_RUN) {
+            giveUp(`an extension kept asking after ${MAX_DECLINES_PER_RUN} declined questions; last: ${title}`)
+            break
+          }
+          pi.stdin.write(`${JSON.stringify({ type: 'extension_ui_response', id: r.id, cancelled: true })}\n`)
+          if (st.declined.length < MAX_DECLINED) st.declined.push({ method: r.method, title, done: false })
           log(`! declined ${r.method} ${r.id}: ${title}`)
         }
         break
@@ -661,6 +695,8 @@ async function serve(name, flags, extra, first = null) {
         // Only prompts pi had accepted before settling are done; one still in
         // flight starts a new run.
         st.settledSeq = st.acceptedSeq
+        st.lastRunAborted = !!r.aborted
+        for (const d of st.declined) d.done = true
         st.lastTool = null
         st.runStartedAt = null
         log(`· settled${r.aborted ? ' (aborted)' : ''} · ${clock()}`)
@@ -744,24 +780,38 @@ const reportDeclined = (name, st) => {
   for (const d of st?.declined ?? []) process.stderr.write(`pi-session: ${name} declined a question from an extension (${d.method}): ${d.title}\n`)
 }
 
-async function wait(name, id, flags, { deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity } = {}) {
+const needOut = flags => {
+  if (!('out' in flags)) return
+  if (!flags.out) fail('--out names a file.')
+  prepareOut(flags.out)
+}
+
+const isFindings = (st, seq) => !!seq && (st?.findingsSeqs ?? []).includes(seq)
+
+// Why last-reply.md can't be taken as this findings prompt's reply, if so.
+const notItsReply = (st, seq) => {
+  if (st.error) return st.error
+  if (st.settledSeq !== seq) return "a later prompt settled with it, so its reply can't be told apart"
+  if (st.lastRunAborted) return 'its run was aborted'
+  if (st.replySeq !== seq) return 'pi wrote no reply to it'
+  return null
+}
+
+async function wait(name, id, flags, { outChecked = false, deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity } = {}) {
   if (id?.startsWith('--')) fail(`wait does not take ${id}.`)
-  if ('out' in flags) {
-    if (!flags.out) fail('--out names a file.')
-    prepareOut(flags.out)
-  }
+  if (!outChecked) needOut(flags)
   for (;;) {
     const st = await settledStatus(name)
     if (!st) fail(`no session ${name}.`)
     const target = id ? st.prompts?.[id] : st.promptSeq
     if (id && target == null && isLive(st)) {
       // The prompt may still be in the pipe: give serve a moment.
-    } else if (st.settledSeq >= (target ?? 0) && st.state !== 'busy' && st.state !== 'starting') {
+    } else if (st.settledSeq >= (target ?? 0) && st.state !== 'busy' && st.state !== 'starting' && st.state !== 'waiting') {
       reportDeclined(name, st)
       let reply = lastReply(name)
-      if (st.findingsSeq && st.findingsSeq === st.settledSeq) {
-        // An error means the reply there is an older one, not the answer to this prompt.
-        const checked = st.error ? { error: st.error } : checkFindings(reply)
+      if (isFindings(st, target)) {
+        const why = notItsReply(st, target)
+        const checked = why ? { error: why } : checkFindings(reply)
         if (checked.error) noFindings(name, checked.error, BAD_FINDINGS)
         reply = `${JSON.stringify(checked.findings, null, 2)}\n`
       } else if (st.error) process.stdout.write(`error: ${st.error}\n`)
@@ -772,7 +822,7 @@ async function wait(name, id, flags, { deadline = flags.timeout ? Date.now() + N
       fail(`${name} ${shownState(st)} before settling${st.error ? `: ${st.error}` : ''}.`)
     }
     if (Date.now() > deadline) {
-      if (flags.abort && isLive(st)) return abortAfterTimeout(name, flags)
+      if (flags.abort && isLive(st)) return abortAfterTimeout(name, flags, target)
       fail(`still ${st.state} after ${flags.timeout}s.`, 2)
     }
     await new Promise(r => setTimeout(r, 1000))
@@ -780,7 +830,7 @@ async function wait(name, id, flags, { deadline = flags.timeout ? Date.now() + N
 }
 
 // A capped wait: stop pi's run, then report what it had done by then.
-async function abortAfterTimeout(name, flags) {
+async function abortAfterTimeout(name, flags, target) {
   toPipe(name, { id: `a${Date.now().toString(36)}`, type: 'abort' })
   const until = Date.now() + 15000
   let st = readStatus(name)
@@ -792,7 +842,7 @@ async function abortAfterTimeout(name, flags) {
   process.stderr.write(`pi-session: ${name} timed out after ${flags.timeout}s; ${settled ? 'its run was aborted' : 'abort sent, but it is still busy'}.\n`)
   reportDeclined(name, st)
   // An unfinished run's reply is not its answer, even if an older one would pass the check.
-  if (st?.findingsSeq && st.findingsSeq === st.acceptedSeq) noFindings(name, 'the run did not finish', 2)
+  if (isFindings(st, target)) noFindings(name, 'the run did not finish', 2)
   const reply = lastReply(name)
   if (reply && flags.out) writeOut(flags.out, reply)
   else if (reply) process.stdout.write(`last reply before the abort:\n${reply}`)
@@ -805,10 +855,7 @@ async function abortAfterTimeout(name, flags) {
 async function run(name, flags, rest, extra) {
   needSandbox(flags)
   needFormat(flags)
-  if ('out' in flags) {
-    if (!flags.out) fail('--out names a file.')
-    prepareOut(flags.out)
-  }
+  needOut(flags)
   if (flags.file && !fs.statSync(flags.file, { throwIfNoEntry: false })?.isFile()) fail(`--file ${flags.file} is not a file.`)
   const cmd = promptCommand(flags, rest)
   const deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity
@@ -824,7 +871,7 @@ async function run(name, flags, rest, extra) {
       if (Date.now() > deadline) fail(`still starting after ${flags.timeout}s.`, 2)
       await sleep(100)
     }
-    await wait(name, cmd.id, flags, { deadline })
+    await wait(name, cmd.id, flags, { outChecked: true, deadline })
   } catch (err) {
     if (!(err instanceof Leave)) throw err
     code = err.code
@@ -860,7 +907,7 @@ function status(name, flags) {
     process.stdout.write(`${r.name}  ${r.shown}  ${r.model ?? '-'}  ${r.cwd ?? '-'}  active ${ago(r.lastActivity)} ago${r.sandboxed === false ? '  UNSANDBOXED' : ''}\n`)
     const detail = r.error ? `error: ${r.error}` : r.lastTool ? `→ ${r.lastTool}` : r.lastReply ? `last: ${r.lastReply}` : ''
     if (detail) process.stdout.write(`  ${oneLine(detail, 160)}\n`)
-    if (r.declined?.length) process.stdout.write(`  declined ${r.declined.length} extension question${r.declined.length === 1 ? '' : 's'} in its last run: see read ${r.name}\n`)
+    if (r.declined?.length) process.stdout.write(`  declined ${r.declined.length} extension question${r.declined.length === 1 ? '' : 's'}: see read ${r.name}\n`)
   }
 }
 

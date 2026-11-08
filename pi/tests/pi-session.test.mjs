@@ -84,9 +84,9 @@ test('a dialog is declined at once, the run goes on, and wait names it apart fro
   assert.equal(done.stdout, 'echo: please ask me (declined)\n')
   assert.match(done.stderr, /alpha declined a question from an extension \(confirm\): Proceed\?/)
   assert.equal(status('alpha').state, 'idle')
-  assert.deepEqual(status('alpha').declined, [{ method: 'confirm', title: 'Proceed?' }])
+  assert.deepEqual(status('alpha').declined.map(d => d.title), ['Proceed?'])
   assert.match(cli('read', 'alpha', '--tail', '8'), /! declined confirm d1: Proceed\?/)
-  assert.match(cli('status', 'alpha'), /declined 1 extension question in its last run/)
+  assert.match(cli('status', 'alpha'), /declined 1 extension question: see read alpha/)
   // The next run starts with a clean list.
   const next = cli('send', 'alpha', 'plain').trim()
   const after = spawnSync('node', [SCRIPT, 'wait', 'alpha', next, '--timeout', '5'], { env, encoding: 'utf8' })
@@ -667,6 +667,94 @@ test('--keep means nothing in the commands that do not take it', async () => {
   await until(() => status('words').state === 'stopped')
   live.kill()
   cli('forget', 'words')
+})
+
+test('a findings prompt aborted, or ending with no text, never passes off an older reply', async () => {
+  const good = cli('send', 'alpha', '--format', 'findings', scripted(fence([finding]))).trim()
+  cli('wait', 'alpha', good, '--timeout', '5')
+  const slow = cli('send', 'alpha', '--format', 'findings', 'slow: review').trim()
+  await until(() => status('alpha').state === 'busy' && status('alpha').lastTool?.startsWith('bash'))
+  cli('abort', 'alpha')
+  await until(() => status('alpha').state === 'idle')
+  const aborted = cliFails('wait', 'alpha', slow, '--timeout', '5')
+  assert.equal(aborted.code, 4)
+  assert.match(aborted.out, /no valid findings: its run was aborted/)
+  const silent = cli('send', 'alpha', '--format', 'findings', 'silent').trim()
+  const empty = cliFails('wait', 'alpha', silent, '--timeout', '5')
+  assert.equal(empty.code, 4)
+  assert.match(empty.out, /no valid findings: pi wrote no reply to it/)
+})
+
+test('a findings prompt with a later prompt behind it is refused, and writes nothing', () => {
+  const dest = path.join(fs.realpathSync(root), 'mixed-findings.json')
+  const findings = cli('send', 'alpha', '--format', 'findings', scripted(fence([finding]))).trim()
+  const plain = cli('send', 'alpha', 'a plain follow-up').trim()
+  assert.equal(cli('wait', 'alpha', plain, '--timeout', '5'), 'echo: a plain follow-up\n')
+  const mixed = cliFails('wait', 'alpha', findings, '--timeout', '5', '--out', dest)
+  assert.equal(mixed.code, 4)
+  assert.match(mixed.out, /no valid findings: a later prompt settled with it/)
+  assert.ok(!fs.existsSync(dest))
+  // Capped while the later prompt is queued: exit 2, and still nothing written.
+  const slow = cli('send', 'alpha', '--format', 'findings', 'slow: review').trim()
+  cli('send', 'alpha', 'queued behind it')
+  const capped = cliFails('wait', 'alpha', slow, '--timeout', '1', '--abort', '--out', dest)
+  assert.equal(capped.code, 2)
+  assert.match(capped.out, /no valid findings: the run did not finish/)
+  assert.ok(!fs.existsSync(dest))
+})
+
+test('an extension that keeps asking ends the session with the reason, instead of looping', async () => {
+  const end = await runOnce(['nagged', ...AT, 'nag'])
+  assert.equal(end.code, 1, end.err)
+  assert.match(end.err, /kept asking after 100 declined questions; last: Your name\?/)
+  assert.equal(status('nagged').state, 'stopped')
+  assert.ok(cli('read', 'nagged', '--tail', '500').match(/! declined/g).length <= 100)
+  assert.ok(status('nagged').declined.length <= 20)
+  cli('forget', 'nagged')
+})
+
+test('run ends with the reason when pi cannot report its state, or never does', async () => {
+  const failed = await runOnce(['nostate', ...AT, 'hi'], { ...env, FAKE_PI_STATE: 'fail' })
+  assert.equal(failed.code, 1, failed.err)
+  assert.match(failed.err, /pi could not report its state: bad config/)
+  cli('forget', 'nostate')
+  const silent = await runOnce(['nostate', ...AT, 'hi'], { ...env, FAKE_PI_STATE: 'silent', PI_SESSION_START_MS: '500' })
+  assert.equal(silent.code, 1, silent.err)
+  assert.match(silent.err, /pi did not report its state within/)
+  cli('forget', 'nostate')
+})
+
+test('a question declined as pi starts is still named when the first run ends, then not again', async () => {
+  const run = startRun(['startup', ...AT, '--keep', 'first'], { ...env, FAKE_PI_STARTUP_DIALOG: 'Trust this project?' })
+  await until(() => /echo: first/.test(run.seen.out))
+  assert.match(run.seen.err, /startup declined a question from an extension \(confirm\): Trust this project\?/)
+  const id = cli('send', 'startup', 'second').trim()
+  const next = spawnSync('node', [SCRIPT, 'wait', 'startup', id, '--timeout', '5'], { env, encoding: 'utf8' })
+  assert.equal(next.stderr, '')
+  cli('stop', 'startup')
+  await run.done
+  cli('forget', 'startup')
+})
+
+test("a failed restart keeps the path to pi's copy, so forget --purge can still find it", async () => {
+  const first = await runOnce(['kept-path', ...AT, 'hi'])
+  assert.equal(first.code, 0, first.err)
+  const known = status('kept-path').sessionFile
+  assert.ok(known)
+  const failed = await runOnce(['kept-path', ...AT, 'hi'], { ...env, PI_SESSION_PI: path.join(root, 'no-such-pi') })
+  assert.notEqual(failed.code, 0)
+  assert.equal(status('kept-path').state, 'failed')
+  assert.equal(status('kept-path').sessionFile, known)
+  cli('forget', 'kept-path')
+})
+
+test('a serve from before dialogs were declined, still waiting, counts as running', () => {
+  fs.mkdirSync(path.join(root, 'legacy'), { recursive: true })
+  const at = path.join(root, 'legacy', 'status.json')
+  fs.writeFileSync(at, JSON.stringify({ name: 'legacy', state: 'waiting', heartbeatAt: Date.now(), prompts: {}, promptSeq: 1, settledSeq: 1 }))
+  assert.match(cliFails('forget', 'legacy').out, /running/)
+  assert.equal(cliFails('wait', 'legacy', '--timeout', '1').code, 2)
+  fs.rmSync(path.join(root, 'legacy'), { recursive: true })
 })
 
 test('a question does not hold up run: it is declined, the reply comes, and the session stops', async () => {

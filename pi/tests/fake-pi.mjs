@@ -9,7 +9,10 @@ const out = r => process.stdout.write(`${JSON.stringify(r)}\n`)
 let busy = false
 let pendingDialog = null
 let slow = null
+let nags = 0
 const queue = []
+// FAKE_PI_STARTUP_DIALOG: an extension asks as pi starts. FAKE_PI_STATE: get_state fails ("fail") or gets no reply ("silent").
+if (process.env.FAKE_PI_STARTUP_DIALOG) out({ type: 'extension_ui_request', id: 's1', method: 'confirm', title: process.env.FAKE_PI_STARTUP_DIALOG })
 
 const run = msg => {
   busy = true
@@ -20,6 +23,20 @@ const run = msg => {
   if (/\bslow\b/.test(msg)) {
     out({ type: 'tool_execution_start', toolCallId: 't2', toolName: 'bash', args: { command: 'npm test -- --watch' } })
     slow = setTimeout(() => finish(msg), 600000)
+    return
+  }
+  if (/\bsilent\b/.test(msg)) {
+    // A run that ends with no reply text.
+    out({ type: 'turn_end', message: {}, toolResults: [] })
+    out({ type: 'agent_end', messages: [], willRetry: false })
+    busy = false
+    out({ type: 'agent_settled', aborted: false })
+    return
+  }
+  if (/\bnag\b/.test(msg)) {
+    // An extension that asks again each time it hears no.
+    nags = 0
+    out({ type: 'extension_ui_request', id: 'n0', method: 'input', title: 'Your name?' })
     return
   }
   if (/\bask\b/.test(msg)) {
@@ -50,7 +67,14 @@ process.stdin.on('data', chunk => {
     buf = buf.slice(i + 1)
     // Replies to what was asked, not to pi-session's note on a first prompt.
     if (typeof cmd.message === 'string') cmd.message = cmd.message.split('\n\n[Session note:')[0]
-    if (cmd.type === 'get_state') {
+    if (cmd.type === 'get_state' && process.env.FAKE_PI_STATE === 'silent') {
+      // No reply.
+    } else if (cmd.type === 'get_state' && process.env.FAKE_PI_STATE === 'fail') {
+      out({ id: cmd.id, type: 'response', command: 'get_state', success: false, error: 'bad config' })
+    } else if (cmd.type === 'extension_ui_response' && /^n\d+$/.test(cmd.id)) {
+      nags += 1
+      out({ type: 'extension_ui_request', id: `n${nags}`, method: 'input', title: 'Your name?' })
+    } else if (cmd.type === 'get_state') {
       out({ id: cmd.id, type: 'response', command: 'get_state', success: true, data: { model: { provider: process.env.FAKE_PI_PROVIDER || 'opencode-go', id: 'echo' }, sessionFile: 'FAKE_PI_SESSION_FILE' in process.env ? process.env.FAKE_PI_SESSION_FILE || null : '/tmp/fake.jsonl', isStreaming: false } })
     } else if (cmd.type === 'prompt' && /\breject\b/.test(cmd.message)) {
       out({ id: cmd.id, type: 'response', command: 'prompt', success: false, error: 'no model selected' })
