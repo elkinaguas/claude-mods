@@ -79,8 +79,8 @@ Without the sandbox (with `allowUnsandboxed` on), Claude could read `models.json
 
 ```
 pi-session serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]   # --allow-unsandboxed, --trusted-hosts: added by the mod
-pi-session send <name> [--steer] <prompt...> | --file FILE | -
-pi-session wait <name> [ID] [--timeout SECONDS [--abort]]   # exit 3: pi asks; 2: timed out (--abort stops the run)
+pi-session send <name> [--steer] [--format findings] <prompt...> | --file FILE | -
+pi-session wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]   # exit 3: pi asks; 2: timed out (--abort stops the run); 4: bad findings
 pi-session read <name> [--last | --tail N | --since LINE]
 pi-session status [name] [--json]
 pi-session answer <name> <request-id> <value...> | --cancel
@@ -88,6 +88,16 @@ pi-session abort | stop | forget <name>
 ```
 
 Each session keeps `status.json`, `transcript.md`, `last-reply.md`, `events.jsonl` (pi's raw event stream) and `stderr.log` in `~/.pi/agent/claude-sessions/<name>/` (`PI_SESSIONS_DIR` overrides it). pi keeps its own copy of the conversation under `~/.pi/agent/sessions/`, as session `claude-<name>-<id>`. Serving a session again reopens that conversation; after `forget`, the same name starts a new one. Prompts too long for one pipe write go through the session's `inbox/` folder.
+
+`wait --out FILE` writes the reply to `FILE` and prints only its path and size, also after a timeout with `--abort`, which keeps long reports out of Claude's context. `FILE` must be somewhere sandboxed commands can write, such as the project or the scratchpad. Paths into `~/.pi` are refused, also through links and relative paths.
+
+`send --format findings` asks pi for one fenced JSON array, in a fixed schema so a script can merge reports from several models:
+
+```json
+[{ "file": "src/a.js", "line": 12, "severity": "high", "confidence": "medium", "title": "One line" }]
+```
+
+`severity` is `critical`, `high`, `medium` or `low`; `confidence` is `high`, `medium` or `low`; `line` is 1 for a finding about a whole file. No other keys are allowed. `wait` then checks the reply and gives the array alone. If the reply fails the check, or pi refused the prompt or hit an error, `wait` reports why and exits 4, without printing or writing the invalid reply. If a capped run is aborted, it exits 2 and writes no findings. `read --last` still shows the raw reply.
 
 ## Develop
 

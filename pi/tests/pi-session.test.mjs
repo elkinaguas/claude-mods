@@ -1,6 +1,6 @@
 // pi-session against a fake pi: node --test pi/tests/
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -124,6 +124,200 @@ test('a run records its start from agent_start, kept while pi asks, cleared when
   assert.equal(status('alpha').runStartedAt, running)
   cliFails('wait', 'alpha', slow, '--timeout', '1', '--abort')
   assert.equal(status('alpha').runStartedAt, null)
+})
+
+test('wait --out writes the reply to the file and prints only its path and size', () => {
+  const dest = path.join(fs.realpathSync(root), 'out', 'deep', 'report.md')
+  const secret = 'reply text that stays out of the output'
+  const id = cli('send', 'alpha', secret).trim()
+  const printed = cli('wait', 'alpha', id, '--timeout', '5', '--out', dest)
+  const text = `echo: ${secret}\n`
+  assert.equal(printed, `${dest} (${Buffer.byteLength(text)} bytes)\n`)
+  assert.equal(fs.readFileSync(dest, 'utf8'), text)
+  assert.deepEqual(fs.readdirSync(path.dirname(dest)), ['report.md'])
+  // An existing file is replaced, and a relative path resolves from here.
+  const again = cli('send', 'alpha', 'shorter').trim()
+  const relative = path.relative(process.cwd(), dest)
+  assert.equal(cli('wait', 'alpha', again, '--timeout', '5', '--out', relative), `${dest} (14 bytes)\n`)
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: shorter\n')
+  fs.rmSync(path.join(root, 'out'), { recursive: true })
+})
+
+test('a capped wait --out writes the last reply there too, and prints only its path and size', () => {
+  const dest = path.join(fs.realpathSync(root), 'capped.md')
+  const done = cli('send', 'alpha', 'before the cap').trim()
+  cli('wait', 'alpha', done, '--timeout', '5')
+  const id = cli('send', 'alpha', 'slow: a long job').trim()
+  const run = spawnSync('node', [SCRIPT, 'wait', 'alpha', id, '--timeout', '1', '--abort', '--out', dest], { env, encoding: 'utf8' })
+  assert.equal(run.status, 2)
+  assert.match(run.stderr, /timed out after 1s; its run was aborted/)
+  assert.equal(run.stdout, `${dest} (21 bytes)\n`)
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: before the cap\n')
+  fs.rmSync(dest)
+})
+
+test('wait --out refuses ~/.pi, through links and relative paths, before it waits', () => {
+  const realRoot = fs.realpathSync(root)
+  const piAgent = path.join(home, '.pi', 'agent')
+  const refused = (target, re) => {
+    // No such session: the refusal has to come first, and a wrong pass would say "no session".
+    const failed = cliFails('wait', 'nosuch', '--out', target)
+    assert.equal(failed.code, 1)
+    assert.match(failed.out, re)
+    assert.ok(!/no session/.test(failed.out), failed.out)
+  }
+  const inPi = /refusing --out .* is in ~\/\.pi/
+  refused(authFile, inPi)
+  refused(path.join(home, '.pi'), inPi)
+  refused(path.join(piAgent, 'new', 'folder', 'report.md'), inPi)
+  refused(path.relative(process.cwd(), authFile), inPi)
+  // A link to the file, a link to the folder with a new file beyond it, and a link to a link.
+  const links = path.join(realRoot, 'links')
+  fs.mkdirSync(links)
+  fs.symlinkSync(authFile, path.join(links, 'file.md'))
+  fs.symlinkSync(piAgent, path.join(links, 'dir'))
+  fs.symlinkSync(path.join(links, 'dir'), path.join(links, 'dir2'))
+  refused(path.join(links, 'file.md'), inPi)
+  refused(path.join(links, 'dir', 'report.md'), inPi)
+  refused(path.join(links, 'dir2', 'new', 'report.md'), inPi)
+  // A dangling link would write wherever it points, and may point into ~/.pi.
+  fs.symlinkSync(path.join(piAgent, 'not-yet.md'), path.join(links, 'dangling.md'))
+  refused(path.join(links, 'dangling.md'), /is a link to nothing/)
+  refused(path.join(links, 'dangling.md', 'report.md'), /is a link to nothing/)
+  // Not a plain file: a folder, or a pipe that would hang.
+  refused(links, /is not a plain file/)
+  assert.equal(spawnSync('mkfifo', [path.join(links, 'pipe')]).status, 0)
+  refused(path.join(links, 'pipe'), /is not a plain file/)
+  assert.ok(!fs.existsSync(path.join(piAgent, 'not-yet.md')))
+  assert.ok(!fs.existsSync(path.join(piAgent, 'new')))
+  assert.equal(fs.readFileSync(authFile, 'utf8'), goodAuth)
+  assert.match(cliFails('wait', 'nosuch', '--out').out, /--out names a file/)
+  // ~/.pi that is itself a link: where it really lives is refused too.
+  const otherHome = path.join(realRoot, 'other-home')
+  fs.mkdirSync(path.join(realRoot, 'dotfiles', 'pi'), { recursive: true })
+  fs.mkdirSync(otherHome)
+  fs.symlinkSync(path.join(realRoot, 'dotfiles', 'pi'), path.join(otherHome, '.pi'))
+  const viaLink = spawnSync('node', [SCRIPT, 'wait', 'nosuch', '--out', path.join(realRoot, 'dotfiles', 'pi', 'report.md')], { env: { ...env, HOME: otherHome }, encoding: 'utf8' })
+  assert.equal(viaLink.status, 1)
+  assert.match(viaLink.stderr, inPi)
+  fs.rmSync(otherHome, { recursive: true })
+  fs.rmSync(path.join(realRoot, 'dotfiles'), { recursive: true })
+  // A folder that can't be made fails at once as well.
+  const plain = path.join(links, 'plain')
+  fs.writeFileSync(plain, '')
+  assert.match(cliFails('wait', 'nosuch', '--out', path.join(plain, 'report.md')).out, /ENOTDIR/)
+  fs.rmSync(links, { recursive: true })
+})
+
+test('wait --out replaces a hard link instead of writing through it', () => {
+  const realRoot = fs.realpathSync(root)
+  const victim = path.join(realRoot, 'hard-victim')
+  const dest = path.join(realRoot, 'hard-dest.md')
+  fs.writeFileSync(victim, 'keep\n')
+  fs.linkSync(victim, dest)
+  const id = cli('send', 'alpha', 'hard').trim()
+  cli('wait', 'alpha', id, '--timeout', '5', '--out', dest)
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'keep\n')
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: hard\n')
+  fs.rmSync(victim)
+  fs.rmSync(dest)
+})
+
+const scripted = text => `reply=${encodeURIComponent(text)}`
+const finding = { file: 'src/a.js', line: 12, severity: 'high', confidence: 'medium', title: 'Off by one' }
+const fence = v => `\`\`\`json\n${typeof v === 'string' ? v : JSON.stringify(v, null, 2)}\n\`\`\``
+
+test('send --format findings adds the instruction, and pi never sees the flag', () => {
+  const id = cli('send', 'alpha', '--format', 'findings', `review it ${scripted(fence([]))}`).trim()
+  cli('wait', 'alpha', id, '--timeout', '5')
+  const transcript = cli('read', 'alpha', '--tail', '12')
+  assert.match(transcript, /review it reply=/)
+  assert.match(transcript, /fenced ```json code block holding a JSON array/)
+  for (const key of ['file', 'line', 'severity', 'confidence', 'title']) assert.ok(transcript.includes(`"${key}"`), key)
+  const events = fs.readFileSync(path.join(root, 'alpha', 'events.jsonl'), 'utf8')
+  assert.ok(!events.includes('"format"'))
+  assert.match(cliFails('send', 'alpha', '--format', 'yaml', 'hi').out, /--format takes findings, not yaml/)
+  assert.match(cliFails('send', 'alpha', 'hi', '--format').out, /--format takes findings/)
+})
+
+test('a valid findings reply comes back as the JSON array alone, also through --out', () => {
+  const both = [finding, { ...finding, line: 1, severity: 'critical', confidence: 'low' }]
+  const reply = `Here you go.\n\n${fence(both)}`
+  const id = cli('send', 'alpha', '--format', 'findings', scripted(reply)).trim()
+  const printed = cli('wait', 'alpha', id, '--timeout', '5')
+  assert.deepEqual(JSON.parse(printed), both)
+  // read --last keeps what pi really said.
+  assert.equal(cli('read', 'alpha', '--last'), `${reply}\n`)
+  const dest = path.join(fs.realpathSync(root), 'findings.json')
+  assert.equal(cli('wait', 'alpha', id, '--out', dest), `${dest} (${Buffer.byteLength(printed)} bytes)\n`)
+  assert.deepEqual(JSON.parse(fs.readFileSync(dest, 'utf8')), both)
+  fs.rmSync(dest)
+  // No findings is valid too, in a fence that names no language.
+  const none = cli('send', 'alpha', '--format', 'findings', scripted('```\n[]\n```')).trim()
+  assert.deepEqual(JSON.parse(cli('wait', 'alpha', none, '--timeout', '5')), [])
+})
+
+test('an invalid findings reply reports the error, exits 4, and neither prints nor writes it', () => {
+  const dest = path.join(fs.realpathSync(root), 'bad-findings.json')
+  const bad = (reply, re) => {
+    const id = cli('send', 'alpha', '--format', 'findings', scripted(reply)).trim()
+    const run = spawnSync('node', [SCRIPT, 'wait', 'alpha', id, '--timeout', '5', '--out', dest], { env, encoding: 'utf8' })
+    assert.equal(run.status, 4, run.stderr)
+    assert.equal(run.stdout, '')
+    assert.match(run.stderr, re)
+    assert.match(run.stderr, /read alpha --last/)
+    assert.ok(!fs.existsSync(dest))
+    const printed = spawnSync('node', [SCRIPT, 'wait', 'alpha', id, '--timeout', '5'], { env, encoding: 'utf8' })
+    assert.equal(printed.status, 4)
+    assert.equal(printed.stdout, '')
+    assert.ok(!printed.stderr.includes(reply))
+  }
+  bad('Nothing fenced here.', /expected one fenced JSON block, found 0/)
+  bad(`${fence([])}\nand\n${fence([])}`, /found 2/)
+  bad(fence('[{"file": "a", oops}]'), /the block is not JSON/)
+  bad(fence({ findings: [] }), /not a JSON array/)
+  bad(fence(['a string']), /finding 1 is not an object/)
+  bad(fence([finding, { ...finding, fix: 'do this' }]), /finding 2 has other keys \(fix\)/)
+  bad(fence([{ ...finding, file: '' }]), /file must be a path/)
+  bad(fence([{ ...finding, line: 0 }]), /line must be an integer/)
+  bad(fence([{ ...finding, line: '12' }]), /line must be an integer/)
+  bad(fence([{ ...finding, severity: 'urgent' }]), /severity must be one of/)
+  bad(fence([{ ...finding, confidence: 0.9 }]), /confidence must be one of/)
+  const { title: _title, ...untitled } = finding
+  bad(fence([untitled]), /title must be/)
+})
+
+test('a findings prompt pi refuses, or a capped run, never passes off an older reply as its findings', () => {
+  const good = cli('send', 'alpha', '--format', 'findings', scripted(fence([finding]))).trim()
+  cli('wait', 'alpha', good, '--timeout', '5')
+  const refused = cli('send', 'alpha', '--format', 'findings', 'please reject this').trim()
+  const failed = cliFails('wait', 'alpha', refused, '--timeout', '5')
+  assert.equal(failed.code, 4)
+  assert.match(failed.out, /no valid findings: prompt: no model selected/)
+  const clear = cli('send', 'alpha', '--format', 'findings', scripted(fence([finding]))).trim()
+  cli('wait', 'alpha', clear, '--timeout', '5')
+  const dest = path.join(fs.realpathSync(root), 'capped-findings.json')
+  const id = cli('send', 'alpha', '--format', 'findings', 'slow: review').trim()
+  const capped = cliFails('wait', 'alpha', id, '--timeout', '1', '--abort', '--out', dest)
+  assert.equal(capped.code, 2)
+  assert.match(capped.out, /no valid findings: the run did not finish/)
+  assert.ok(!fs.existsSync(dest))
+})
+
+test('only the findings prompt is checked: a plain prompt after it, or queued after it, is not', () => {
+  const a = cli('send', 'alpha', '--format', 'findings', scripted('not findings')).trim()
+  assert.equal(cliFails('wait', 'alpha', a, '--timeout', '5').code, 4)
+  const b = cli('send', 'alpha', 'plain again').trim()
+  assert.equal(cli('wait', 'alpha', b, '--timeout', '5'), 'echo: plain again\n')
+  cli('send', 'alpha', '--format', 'findings', scripted('not findings'))
+  const d = cli('send', 'alpha', 'plain queued').trim()
+  assert.equal(cli('wait', 'alpha', d, '--timeout', '5'), 'echo: plain queued\n')
+})
+
+test('--out and --format mean nothing in the commands that do not take them', () => {
+  const id = cli('send', 'alpha', 'the --out flag and').trim()
+  assert.equal(cli('wait', 'alpha', id, '--timeout', '5'), 'echo: the --out flag and\n')
+  assert.match(cliFails('wait', 'alpha', '--format', 'findings').out, /wait does not take --format/)
 })
 
 test('serve refuses to run outside the sandbox unless allowed, and marks such a session', async () => {

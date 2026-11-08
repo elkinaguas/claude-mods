@@ -2,7 +2,8 @@
 // A stand-in for `pi --mode rpc`: answers get_state, runs each prompt as one
 // turn (a tool call, then "echo: <prompt>"), and opens a confirm dialog when
 // the prompt says "ask", refuses a prompt that says "reject", and works for
-// ten minutes (until aborted) on one that says "slow". Enough of pi's protocol to test pi-session.
+// ten minutes (until aborted) on one that says "slow". One holding reply=<url-encoded text> gets
+// that text as its reply. Enough of pi's protocol to test pi-session.
 
 const out = r => process.stdout.write(`${JSON.stringify(r)}\n`)
 let busy = false
@@ -29,7 +30,9 @@ const run = msg => {
   finish(msg)
 }
 const finish = (msg, extra = '') => {
-  out({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: `echo: ${msg}${extra}` }] } })
+  const scripted = /\breply=(\S+)/.exec(msg)
+  const text = scripted ? decodeURIComponent(scripted[1]) : `echo: ${msg}${extra}`
+  out({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }] } })
   out({ type: 'turn_end', message: {}, toolResults: [] })
   out({ type: 'agent_end', messages: [], willRetry: false })
   if (queue.length) return run(queue.shift())
