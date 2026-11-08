@@ -195,7 +195,7 @@ export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUns
   if (runsExcluded(text, ['pi'])) return `pi: run pi only through pi-session (node <pi mod>/scripts/pi-session.mjs serve <name> --model <provider>/<id>). The pi mod works only with an opencode-go API key, or a model at a host you trust (option trustedModelHosts).`
   // The trusted hosts are the person's option; the mod passes them, never Claude.
   if (/--trusted-hosts/.test(text))
-    return 'pi: the trusted model hosts come from your option trustedModelHosts (/plugin configure pi@claude-mods); the mod passes them to serve itself, and a command may not.'
+    return 'pi: the trusted model hosts come from your option trustedModelHosts (/plugin configure pi@claude-mods); the mod passes them to serve and run itself, and a command may not.'
   if (ALLOW_RE.test(text) && !o.allowUnsandboxed)
     return 'pi: --allow-unsandboxed lets pi read your real key, and only you can allow it (/plugin configure pi@claude-mods, allowUnsandboxed). Run pi-session inside the sandbox instead.'
   if (!o.unsandboxed || !PI_RE.test(text)) return null
@@ -205,17 +205,17 @@ export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUns
 }
 
 /**
- * A Bash command with `--allow-unsandboxed` added to each pi-session serve in
- * it. The mod does this when the person turned allowUnsandboxed on, so the
- * choice is theirs and Claude never passes the flag itself. Inside the sandbox
- * the flag changes nothing.
+ * A Bash command with `--allow-unsandboxed` added to each pi-session serve or
+ * run in it (the two that start pi). The mod does this when the person turned
+ * allowUnsandboxed on, so the choice is theirs and Claude never passes the flag
+ * itself. Inside the sandbox the flag changes nothing.
  */
 export const withAllowFlag = (command: string): string =>
-  command.replace(/(pi-session(?:\.mjs)?["']?\s+serve)(?=\s|$)(?![^;&|\n]*--allow-unsandboxed)/g, '$1 --allow-unsandboxed')
+  command.replace(/(pi-session(?:\.mjs)?["']?\s+(?:serve|run))(?=\s|$)(?![^;&|\n]*--allow-unsandboxed)/g, '$1 --allow-unsandboxed')
 
-/** The same, adding `--trusted-hosts <list>` (the person's option, entries already validated) to each serve. */
+/** The same, adding `--trusted-hosts <list>` (the person's option, entries already validated) to each serve or run. */
 export const withTrustedHosts = (command: string, hosts: string[]): string =>
-  hosts.length ? command.replace(/(pi-session(?:\.mjs)?["']?\s+serve)(?=\s|$)/g, `$1 --trusted-hosts ${hosts.join(',')}`) : command
+  hosts.length ? command.replace(/(pi-session(?:\.mjs)?["']?\s+(?:serve|run))(?=\s|$)/g, `$1 --trusted-hosts ${hosts.join(',')}`) : command
 
 // Matches pi-session's host entry: host, host:port or host:*, with *. for subdomains and [v6].
 const HOST_ENTRY = /^(\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:]+\])(?::(\d{1,5}|\*))?$/i
@@ -416,14 +416,16 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
   node ${script($)} <command>
 
 - Start: run \`serve <name> --cwd <dir> --model <provider>/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused).
-- pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); the mod passes those hosts to serve itself` : ''}. serve refuses any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If it refuses, tell the person why; never try to get around the gate.
+- pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); the mod passes those hosts to serve and run itself` : ''}. serve and run refuse any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If they refuse, tell the person why; never try to get around the gate.
+- One-shot: \`run <name> --model <provider>/<id> [--cwd <dir>] --file <prompt file>\` (or a quoted prompt) with run_in_background starts the session, sends the prompt, prints pi's reply and stops the session, so you are notified when it is done. It takes wait's \`--timeout SECONDS --abort\`, \`--out FILE\` and exit codes, and \`--format findings\`. A question does not end it, since that would end pi: it prints the question and goes on once you \`answer\`. So you are not notified of a question: on a long run, also run \`wait <name>\` with run_in_background once \`status <name>\` shows it running (exit 3 when pi asks). \`--keep\` leaves the session running for follow-ups; the call then ends only when the session does, so the same \`wait <name>\` tells you when the reply is there.
 - Work: \`send <name> "<prompt>"\` prints a prompt id. While pi works a new prompt queues as a follow-up; \`--steer\` delivers it before pi's next model call instead.
 - Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply (exit 3: pi asks a question, answer with \`answer <name> <request-id> <value>\`). To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply.
 - Control: \`status\`, \`abort <name>\` (stop the current run), \`stop <name>\` (end the session), \`forget <name>\`.
-- After a Claude Code restart, \`serve <name>\` again reopens the conversation; work that was mid-run is lost, so ask pi to continue.
+- After a Claude Code restart, \`serve <name>\` again reopens the conversation (a killed \`run\` too); work that was mid-run is lost, so ask pi to continue.
+- After a restart, use \`status <name>\` for how a session stands, and \`read <name> --last\` for its last reply. Never go by the output of a task from before the restart: it is old, and those tasks are gone.
 - Names: letters, digits, . _ - (e.g. auth-fix). Several sessions can run at once; give each its own folder or git worktree when they edit code.
 - Never read ~/.pi or auth.json (the file tools are refused there). Session logs are read through the script.
-- \`serve\` refuses to start outside the sandbox. ${allowUnsandboxed ? 'The person has allowed pi without the sandbox (option allowUnsandboxed), so the mod lets serve start there by itself: run serve as usual, never add flags for it, and when the sandbox is off tell them pi holds their real key.' : 'Never try to get around that; tell the person the sandbox is off.'}`
+- \`serve\` and \`run\` refuse to start outside the sandbox. ${allowUnsandboxed ? 'The person has allowed pi without the sandbox (option allowUnsandboxed), so the mod lets them start there by itself: use them as usual, never add flags for it, and when the sandbox is off tell them pi holds their real key.' : 'Never try to get around that; tell the person the sandbox is off.'}`
 
 // Stop, abort and forget only write to a session's pipe or files, so the mod
 // runs them itself; serving again and answering go through Claude, so pi

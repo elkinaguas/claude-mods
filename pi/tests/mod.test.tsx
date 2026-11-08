@@ -216,6 +216,97 @@ test('with trustedModelHosts set, the mod adds them to serve', { options: { trus
   expect(seen.at(-1)).toBe('node /x/pi-session.mjs serve --trusted-hosts llm.corp.example.com corp --model corp/m')
 })
 
+test('run starts pi too: the flags are added to it as to serve, and only there', () => {
+  const run = 'node /x/pi-session.mjs run demo --model corp/m --file p.md'
+  expect(withAllowFlag(run)).toBe('node /x/pi-session.mjs run --allow-unsandboxed demo --model corp/m --file p.md')
+  expect(withAllowFlag('node "/x y/pi-session.mjs" run demo')).toBe('node "/x y/pi-session.mjs" run --allow-unsandboxed demo')
+  expect(withAllowFlag(`${run} --allow-unsandboxed`)).toBe(`${run} --allow-unsandboxed`)
+  expect(withTrustedHosts(run, ['llm.corp'])).toBe('node /x/pi-session.mjs run --trusted-hosts llm.corp demo --model corp/m --file p.md')
+  expect(withAllowFlag('node /x/pi-session.mjs serve a; node /x/pi-session.mjs run b')).toBe(
+    'node /x/pi-session.mjs serve --allow-unsandboxed a; node /x/pi-session.mjs run --allow-unsandboxed b',
+  )
+  for (const other of ['node /x/pi-session.mjs send demo "run it"', 'node /x/pi-session.mjs status', 'node /x/pi-session.mjs running', 'npm run test']) {
+    expect(withAllowFlag(other)).toBe(other)
+    expect(withTrustedHosts(other, ['llm.corp'])).toBe(other)
+  }
+})
+
+test('the guard treats run as it does serve', () => {
+  const on = { unsandboxed: false, allowUnsandboxed: false }
+  const off = { unsandboxed: true, allowUnsandboxed: false }
+  const allowed = { unsandboxed: true, allowUnsandboxed: true }
+  const run = 'node /x/pi-session.mjs run demo --model opencode-go/echo "hi"'
+  expect(bashRefusal(run, on)).toBe(null)
+  expect(bashRefusal(run, off)).toMatch(/outside the Bash sandbox/)
+  expect(bashRefusal(run, allowed)).toBe(null)
+  expect(bashRefusal(`${run} --trusted-hosts api.openai.com`, on)).toMatch(/come from your option trustedModelHosts/)
+  expect(bashRefusal(`${run} --trusted-hosts api.openai.com`, allowed)).toMatch(/come from your option trustedModelHosts/)
+  expect(bashRefusal(`${run} --allow-unsandboxed`, on)).toMatch(/only you can allow it/)
+  expect(bashRefusal(`${run} --allow-unsandboxed`, off)).toMatch(/only you can allow it/)
+  expect(bashRefusal(`SANDBOX_RUNTIME=1 ${run}`, on)).toMatch(/set by the sandbox itself/)
+  expect(bashRefusal(`PI_SESSION_PI=/bin/sh ${run}`, on)).toMatch(/PI_SESSION_PI is for the mod/)
+})
+
+test('a Bash run outside the sandbox is refused, and its flags from Claude are refused on the way in', async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  on('fs.read', (_, e) => {
+    if (e.path === '/home/u/.claude/settings.json') return { value: JSON.stringify(goodSettings) }
+    throw new Error('missing')
+  })
+  const seen: string[] = []
+  on('tool.call', (_, e) => {
+    seen.push(String((e as unknown as { command?: string }).command))
+    return { result: {} }
+  })
+  const bash = (command: string, more = {}) => $.tool.call({ tool: 'Bash', command, ...more } as never)
+  const run = 'node /x/pi-session.mjs run demo --model opencode-go/echo --file p.md'
+  expect((await bash(run, { dangerouslyDisableSandbox: true })).deny).toMatch(/outside the Bash sandbox/)
+  expect((await bash(`${run} --allow-unsandboxed`)).deny).toMatch(/only you can allow it/)
+  expect((await bash(`${run} --trusted-hosts api.openai.com`)).deny).toMatch(/come from your option trustedModelHosts/)
+  expect(seen).toEqual([])
+  // Inside the sandbox with no options set, it goes through untouched.
+  expect((await bash(run)).deny).toBe(undefined)
+  expect(seen).toEqual([run])
+})
+
+test('with allowUnsandboxed on, the mod itself lets run start outside the sandbox', { options: { allowUnsandboxed: true } }, async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  const seen: string[] = []
+  on('tool.call', (_, e) => {
+    seen.push(String((e as unknown as { command?: string }).command))
+    return { result: {} }
+  })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs run demo --file p.md', dangerouslyDisableSandbox: true } as never)
+  expect(ran.deny).toBe(undefined)
+  expect(seen.at(-1)).toBe('node /x/pi-session.mjs run --allow-unsandboxed demo --file p.md')
+})
+
+test('with trustedModelHosts set, the mod adds them to run', { options: { trustedModelHosts: 'llm.corp.example.com' } }, async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  on('fs.read', (_, e) => {
+    if (e.path === '/home/u/.claude/settings.json') return { value: JSON.stringify(goodSettings) }
+    throw new Error('missing')
+  })
+  const seen: string[] = []
+  on('tool.call', (_, e) => {
+    seen.push(String((e as unknown as { command?: string }).command))
+    return { result: {} }
+  })
+  expect((await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs run corp --model corp/m "hi"' } as never)).deny).toBe(undefined)
+  expect(seen.at(-1)).toBe('node /x/pi-session.mjs run --trusted-hosts llm.corp.example.com corp --model corp/m "hi"')
+})
+
+test("Claude's instructions cover run, and status over old task output after a restart", async ($, on) => {
+  on('prompt.compose', () => ({ sections: [] }))
+  const { sections } = await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] })
+  const text = sections.find(s => s.id === 'pi:sessions')?.text ?? ''
+  expect(text).toMatch(/`run <name> --model <provider>\/<id> .*--file <prompt file>`.* with run_in_background/)
+  expect(text).toMatch(/`--keep` leaves the session running/)
+  expect(text).toMatch(/A question does not end it/)
+  expect(text).toMatch(/`serve` and `run` refuse to start outside the sandbox/)
+  expect(text).toMatch(/After a restart, use `status <name>`.*Never go by the output of a task from before the restart/)
+})
+
 test('without the sandbox the check says so once, not the mask and TLS lines that only act inside it', () => {
   const off = JSON.stringify({ sandbox: { enabled: false } })
   const problems = settingsProblems(off, HOME)
