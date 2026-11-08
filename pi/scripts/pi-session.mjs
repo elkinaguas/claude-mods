@@ -39,6 +39,16 @@ const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')
 // What serve passes on from its pipe to pi; anything else (set_model, say) is refused.
 const PIPE_TYPES = ['prompt', 'abort', 'extension_ui_response', '__stop']
 const GATE_NOTE = `The pi mod works only with an ${PROVIDER} API key, or a model at a host you trust (option trustedModelHosts).`
+const PI_HOME = path.join(os.homedir(), '.pi')
+// `wait` exits with this when a findings prompt's reply fails its check.
+const BAD_FINDINGS = 4
+const SEVERITIES = ['critical', 'high', 'medium', 'low']
+const CONFIDENCES = ['high', 'medium', 'low']
+const FINDING_KEYS = ['file', 'line', 'severity', 'confidence', 'title']
+// What `send --format findings` adds to the prompt; checkFindings holds pi's reply to it.
+const FINDINGS_NOTE = `
+
+Give your findings as exactly one fenced \`\`\`json code block holding a JSON array, and write nothing outside the block. Each finding is an object with exactly these keys: "file" (string, the path), "line" (integer, 1 or higher; 1 when it concerns the whole file), "severity" (${SEVERITIES.map(v => `"${v}"`).join(', ')}), "confidence" (${CONFIDENCES.map(v => `"${v}"`).join(', ')}), "title" (string, one line). Add no other keys. With no findings, the block holds [].`
 
 /**
  * One trusted host entry: `host` (the URL scheme's default port only),
@@ -78,13 +88,18 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       outside Claude Code's sandbox unless --allow-unsandboxed (pi then reads
       your real key). The pi mod adds --allow-unsandboxed and
       --trusted-hosts itself, from your options; Claude never passes them.
-  send <name> [--steer] <prompt...> | --file FILE | -
+  send <name> [--steer] [--format findings] <prompt...> | --file FILE | -
       Send a prompt. Prints its id. While pi works it is queued as a
       follow-up, or with --steer delivered before pi's next model call.
-  wait <name> [ID] [--timeout SECONDS [--abort]]
+      --format findings asks pi for a fenced JSON array of objects with file,
+      line, severity, confidence and title, which wait then checks.
+  wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]
       Block until pi has settled (after prompt ID, or everything sent so far),
       then print its last reply. Exit 3 when pi waits on a dialog, 2 on
-      timeout; with --abort a timeout also stops pi's run.
+      timeout; with --abort a timeout also stops pi's run. --out writes the
+      reply to FILE and prints only its path and size; FILE can't be in ~/.pi.
+      A findings reply comes as the JSON array alone. Exit 4 if it fails the
+      check: the error is reported, nothing is written, read --last has it.
   read <name> [--last | --tail N | --since LINE]
       Print the transcript (default: last 40 lines), or the last reply.
   status [name] [--json]
@@ -205,7 +220,8 @@ const toPipe = (name, cmd) => {
   fs.closeSync(fd)
 }
 
-const parse = argv => {
+// Only the command that takes --out or --format reads it, so a prompt can mention them.
+const parse = (argv, cmd) => {
   const flags = {}
   const rest = []
   const extra = []
@@ -215,12 +231,105 @@ const parse = argv => {
       extra.push(...argv.slice(i + 1))
       break
     }
-    if (/^--(cwd|model|thinking|timeout|tail|since|file|trusted-hosts)$/.test(a)) flags[a.slice(2)] = argv[++i]
+    if (/^--(cwd|model|thinking|timeout|tail|since|file|trusted-hosts)$/.test(a) || (a === '--out' && cmd === 'wait') || (a === '--format' && cmd === 'send'))
+      flags[a.slice(2)] = argv[++i]
     else if (/^--(steer|last|json|cancel|abort|allow-unsandboxed)$/.test(a)) flags[a.slice(2)] = true
     else rest.push(a)
   }
   return { flags, rest, extra }
 }
+
+// The real path of p, through the real path of its nearest existing parent.
+// Throws on a dangling link: a write would land wherever it points.
+const realTarget = p => {
+  const tail = []
+  for (let at = path.resolve(p); ; at = path.dirname(at)) {
+    try {
+      return path.join(fs.realpathSync.native(at), ...tail)
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw new Error(`can't resolve ${at} (${err.code})`)
+    }
+    if (fs.lstatSync(at, { throwIfNoEntry: false })) throw new Error(`${at} is a link to nothing`)
+    tail.unshift(path.basename(at))
+  }
+}
+const within = (p, base) => p === base || p.startsWith(`${base}${path.sep}`)
+
+// Where --out may write: resolved, so no link or relative path reaches ~/.pi
+// (auth.json and the session files pi-session and its panel trust are there).
+const outTarget = p => {
+  let real
+  const homes = [PI_HOME]
+  try {
+    real = realTarget(p)
+  } catch (err) {
+    fail(`refusing --out ${p}: ${err.message}.`)
+  }
+  try {
+    homes.push(realTarget(PI_HOME))
+  } catch {
+    // A dangling ~/.pi: the path as named is all there is to compare.
+  }
+  if (homes.some(h => within(real, h))) fail(`refusing --out ${p}: ${real} is in ~/.pi. Write it in the project or the scratchpad.`)
+  const st = fs.lstatSync(real, { throwIfNoEntry: false })
+  if (st && !st.isFile()) fail(`refusing --out ${p}: ${real} is not a plain file.`)
+  return real
+}
+
+// Checked before the wait starts, so a bad FILE fails at once, not after a long run.
+const prepareOut = p => {
+  const parent = path.dirname(outTarget(p))
+  try {
+    fs.mkdirSync(parent, { recursive: true })
+    fs.accessSync(parent, fs.constants.W_OK)
+  } catch (err) {
+    fail(`can't write --out ${p} (${err.code}): use a folder sandboxed commands can write, such as the project or the scratchpad.`)
+  }
+}
+
+// Replaces FILE by rename, so the write can't go through a link or a hard link
+// planted since the check, and FILE never holds half a reply.
+const writeOut = (p, text) => {
+  const real = outTarget(p)
+  const tmp = `${real}.${process.pid}.tmp`
+  try {
+    fs.writeFileSync(tmp, text, { flag: 'wx' })
+    fs.renameSync(tmp, real)
+  } catch (err) {
+    fs.rmSync(tmp, { force: true })
+    fail(`could not write --out ${p} (${err.code}). The reply is still there: read --last.`)
+  }
+  process.stdout.write(`${real} (${Buffer.byteLength(text)} bytes)\n`)
+}
+
+// A reply to `send --format findings`: { findings } when it holds one fenced
+// block with an array of the fixed schema, or { error } saying what is wrong.
+const checkFindings = reply => {
+  const blocks = [...reply.matchAll(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$/gim)]
+  if (blocks.length !== 1) return { error: `expected one fenced JSON block, found ${blocks.length}` }
+  let findings
+  try {
+    findings = JSON.parse(blocks[0][1])
+  } catch (err) {
+    return { error: `the block is not JSON (${err.message})` }
+  }
+  if (!Array.isArray(findings)) return { error: 'the block is not a JSON array' }
+  for (const [i, f] of findings.entries()) {
+    const at = `finding ${i + 1}`
+    if (!f || typeof f !== 'object' || Array.isArray(f)) return { error: `${at} is not an object` }
+    const other = Object.keys(f).filter(k => !FINDING_KEYS.includes(k))
+    if (other.length) return { error: `${at} has other keys (${other.join(', ')})` }
+    if (typeof f.file !== 'string' || !f.file.trim()) return { error: `${at}: file must be a path` }
+    if (!Number.isInteger(f.line) || f.line < 1) return { error: `${at}: line must be an integer, 1 or higher` }
+    if (!SEVERITIES.includes(f.severity)) return { error: `${at}: severity must be one of ${SEVERITIES.join(', ')}` }
+    if (!CONFIDENCES.includes(f.confidence)) return { error: `${at}: confidence must be one of ${CONFIDENCES.join(', ')}` }
+    if (typeof f.title !== 'string' || !f.title.trim()) return { error: `${at}: title must be a line of text` }
+  }
+  return { findings }
+}
+const noFindings = (name, why, code) => fail(`${name} gave no valid findings: ${why}. Nothing was written; its raw reply: read ${name} --last.`, code)
+
+const lastReply = name => (fs.existsSync(file(name, 'last-reply.md')) ? fs.readFileSync(file(name, 'last-reply.md'), 'utf8') : '')
 
 // Tool arguments in one short line: the path, command or pattern when there is one.
 const argSummary = args => {
@@ -328,6 +437,9 @@ async function serve(name, flags, extra) {
     promptSeq: before?.promptSeq ?? 0,
     acceptedSeq: before?.promptSeq ?? 0,
     settledSeq: before?.promptSeq ?? 0,
+    // The newest prompt sent with --format findings: while it is the last one
+    // settled, last-reply.md is its reply and wait checks it.
+    findingsSeq: before?.findingsSeq ?? 0,
     prompts: before?.prompts ?? {},
     turns: before?.turns ?? 0,
     lastTool: null,
@@ -398,6 +510,8 @@ async function serve(name, flags, extra) {
     if (cmd.type === 'prompt') {
       st.promptSeq += 1
       st.prompts[cmd.id] = st.promptSeq
+      if (cmd.format === 'findings') st.findingsSeq = st.promptSeq
+      delete cmd.format
       const ids = Object.keys(st.prompts)
       if (ids.length > 50) delete st.prompts[ids[0]]
       log(`\n## you · ${cmd.id} · ${clock()}${cmd.streamingBehavior === 'steer' ? ' · steer' : ''}\n${cmd.message}`)
@@ -548,15 +662,17 @@ async function serve(name, flags, extra) {
 }
 
 async function send(name, flags, rest) {
+  if ('format' in flags && flags.format !== 'findings') fail(`--format takes findings${flags.format ? `, not ${flags.format}` : ''}.`)
   await needLive(name)
   let message = rest.join(' ')
   if (flags.file) message = fs.readFileSync(flags.file, 'utf8')
   else if (message === '-') message = fs.readFileSync(0, 'utf8')
   if (!message.trim()) fail('nothing to send.')
+  if (flags.format) message += FINDINGS_NOTE
   const id = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
   // Always says how to queue: pi refuses a plain prompt while it streams,
   // and our status can trail pi by a moment.
-  const cmd = { id, type: 'prompt', message, streamingBehavior: flags.steer ? 'steer' : 'followUp' }
+  const cmd = { id, type: 'prompt', message, streamingBehavior: flags.steer ? 'steer' : 'followUp', ...(flags.format ? { format: flags.format } : {}) }
   if (Buffer.byteLength(JSON.stringify(cmd)) + 1 > PIPE_LINE) {
     // Too long for one pipe write: serve reads it from the inbox instead.
     fs.mkdirSync(file(name, 'inbox'), { recursive: true })
@@ -569,6 +685,11 @@ async function send(name, flags, rest) {
 }
 
 async function wait(name, id, flags) {
+  if (id?.startsWith('--')) fail(`wait does not take ${id}.`)
+  if ('out' in flags) {
+    if (!flags.out) fail('--out names a file.')
+    prepareOut(flags.out)
+  }
   const deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity
   for (;;) {
     const st = await settledStatus(name)
@@ -582,15 +703,21 @@ async function wait(name, id, flags) {
       process.stdout.write(`Answer: pi-session answer ${name} ${st.dialog.id} <value>\n`)
       process.exit(3)
     } else if (st.settledSeq >= (target ?? 0) && st.state !== 'busy' && st.state !== 'starting') {
-      const reply = fs.existsSync(file(name, 'last-reply.md')) ? fs.readFileSync(file(name, 'last-reply.md'), 'utf8') : ''
-      if (st.error) process.stdout.write(`error: ${st.error}\n`)
-      process.stdout.write(reply || '(no reply text)\n')
+      let reply = lastReply(name)
+      if (st.findingsSeq && st.findingsSeq === st.settledSeq) {
+        // An error means the reply there is an older one, not the answer to this prompt.
+        const checked = st.error ? { error: st.error } : checkFindings(reply)
+        if (checked.error) noFindings(name, checked.error, BAD_FINDINGS)
+        reply = `${JSON.stringify(checked.findings, null, 2)}\n`
+      } else if (st.error) process.stdout.write(`error: ${st.error}\n`)
+      if (flags.out) writeOut(flags.out, reply)
+      else process.stdout.write(reply || '(no reply text)\n')
       process.exit(isLive(st) ? 0 : 1)
     } else if (!isLive(st)) {
       fail(`${name} ${shownState(st)} before settling${st.error ? `: ${st.error}` : ''}.`)
     }
     if (Date.now() > deadline) {
-      if (flags.abort && isLive(st)) return abortAfterTimeout(name, flags.timeout)
+      if (flags.abort && isLive(st)) return abortAfterTimeout(name, flags)
       fail(`still ${st.state} after ${flags.timeout}s.`, 2)
     }
     await new Promise(r => setTimeout(r, 1000))
@@ -598,7 +725,7 @@ async function wait(name, id, flags) {
 }
 
 // A capped wait: stop pi's run, then report what it had done by then.
-async function abortAfterTimeout(name, timeout) {
+async function abortAfterTimeout(name, flags) {
   toPipe(name, { id: `a${Date.now().toString(36)}`, type: 'abort' })
   const until = Date.now() + 15000
   let st = readStatus(name)
@@ -607,9 +734,12 @@ async function abortAfterTimeout(name, timeout) {
     st = readStatus(name)
   }
   const settled = !isLive(st) || st.state !== 'busy'
-  process.stderr.write(`pi-session: ${name} timed out after ${timeout}s; ${settled ? 'its run was aborted' : 'abort sent, but it is still busy'}.\n`)
-  const reply = fs.existsSync(file(name, 'last-reply.md')) ? fs.readFileSync(file(name, 'last-reply.md'), 'utf8') : ''
-  if (reply) process.stdout.write(`last reply before the abort:\n${reply}`)
+  process.stderr.write(`pi-session: ${name} timed out after ${flags.timeout}s; ${settled ? 'its run was aborted' : 'abort sent, but it is still busy'}.\n`)
+  // An unfinished run's reply is not its answer, even if an older one would pass the check.
+  if (st?.findingsSeq && st.findingsSeq === st.acceptedSeq) noFindings(name, 'the run did not finish', 2)
+  const reply = lastReply(name)
+  if (reply && flags.out) writeOut(flags.out, reply)
+  else if (reply) process.stdout.write(`last reply before the abort:\n${reply}`)
   process.exit(2)
 }
 
@@ -663,7 +793,7 @@ async function forget(name) {
 }
 
 const [cmd, ...argv] = process.argv.slice(2)
-const { flags, rest, extra } = parse(argv)
+const { flags, rest, extra } = parse(argv, cmd)
 switch (cmd) {
   case 'serve':
     await serve(needName(rest[0]), flags, extra)
