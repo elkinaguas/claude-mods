@@ -14,6 +14,8 @@ import {
   withTrustedHosts,
 } from '../hooks/register'
 
+declare const setTimeout: (fn: (value?: unknown) => void, ms: number) => unknown
+
 const HOME = '/home/u'
 
 const goodSettings = {
