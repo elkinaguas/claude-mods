@@ -17,11 +17,11 @@ Long-lived [pi](https://github.com/earendil-works/pi) coding-agent sessions run 
 >
 > Never print your key with a `!` command or paste it into a session: `!` output and pastes go into the conversation, where no guard can stop them.
 
-- **Sessions.** Ask Claude to start a pi session in a folder and give it work. Claude runs `scripts/pi-session.mjs` through the Bash tool: `serve` keeps one `pi --mode rpc` process running as a background task, `send` queues prompts (as follow-ups while pi works, or `--steer` to redirect it), `wait` returns pi's reply when it settles, `read` shows the transcript. Several sessions can run at once, each by name.
+- **Sessions.** Ask Claude to start a pi session in a folder and give it work. Claude runs `scripts/pi-session.mjs` through the Bash tool: `serve` keeps one `pi --mode rpc` process running as a background task, `send` queues prompts (as follow-ups while pi works, or `--steer` to redirect it), `wait` returns pi's reply when it settles, `read` shows the transcript. `run` does a one-shot job in a single background call: it starts the session, sends the prompt, prints the reply and stops. Several sessions can run at once, each by name.
 - **Panel.** `/pi` opens a panel beside the transcript: one tile per session, named and coloured by state (idle, busy, waiting on a question, failed, stopped, or lost when its process died with an earlier Claude Code session), with a count of each. Click a tile, or Tab to it and press Enter, to see that session's card: model, folder, current tool, error and last reply, with Abort, Stop and Forget (run by the mod) and Answer, Resume and Transcript (put in your prompt for Claude). Its age moves while the panel is on screen: how long the current run has been going for a busy session, the time since pi's last event for any other. The card starts on the session most likely to need you. The panel opens by itself when a session starts running (option `autoOpen`).
-- **Resume.** pi saves each conversation. After a restart, Claude serves the session again under the same name and the conversation reloads. Work that was mid-run is lost: ask pi to continue.
+- **Resume.** pi saves each conversation. After a restart, Claude serves the session again under the same name and the conversation reloads. Work that was mid-run is lost: ask pi to continue. Claude is told to go by `status`, not by the output of a task from before the restart.
 - **Guard.** Claude's file tools (Read, Edit, Write, Grep, Glob) are refused anywhere in `~/.pi`, including through links and searches of your home folder or above it, because they run outside the sandbox and would see the real key. When a Bash command would run outside the sandbox (the sandbox is off, the call asks to leave it, or it runs a command in `sandbox.excludedCommands`), it is refused if it names pi, `pi-session`, `~/.pi` or `auth.json`, also through quotes and globs such as `~/.p?/agent/auth*`. Matching text can't catch every spelling (a shell variable, say): only the sandbox truly hides the key. The settings are read again for each Bash call, so turning the sandbox off mid-session counts at once. No command may set `SANDBOX_RUNTIME` or `PI_SESSION_PI`, and `pi` itself runs only through `pi-session` (so `pi auth`, which prints keys, is refused too).
-- **Sandbox required.** `pi-session serve` refuses to start pi outside Claude Code's Bash sandbox (it checks for `SANDBOX_RUNTIME`, which the sandbox sets). To run pi without it anyway, turn on the option `allowUnsandboxed` yourself (`/plugin configure pi@claude-mods`): the mod then adds `--allow-unsandboxed` to every `serve` Claude runs. Claude never passes it itself, and the guard refuses it when the option is off. pi then reads your real key and Claude's unsandboxed commands could too, so use a separate key you can revoke. Such a session shows a red `!` on its tile and a warning on its card.
+- **Sandbox required.** `pi-session serve` and `run` refuse to start pi outside Claude Code's Bash sandbox (they check for `SANDBOX_RUNTIME`, which the sandbox sets). To run pi without it anyway, turn on the option `allowUnsandboxed` yourself (`/plugin configure pi@claude-mods`): the mod then adds `--allow-unsandboxed` to every `serve` and `run` Claude runs. Claude never passes it itself, and the guard refuses it when the option is off. pi then reads your real key and Claude's unsandboxed commands could too, so use a separate key you can revoke. Such a session shows a red `!` on its tile and a warning on its card.
 - **Setup check.** At session start and on `/pi check`, the mod checks the settings: the sandbox is on (managed, project-local, project and user settings, the first that sets it wins), `auth.json` is masked, no `Read(...)` rule overrides the mask, TLS termination is set, and its CA is readable and not about to expire (option `caWarnDays`, 30). It also names any session running outside the sandbox, and warns about `sandbox.excludedCommands` and `allowUnsandboxedCommands`, which let commands run outside it. A toast and the panel show what is wrong.
 
 ## Why the sandbox setup
@@ -55,7 +55,7 @@ Make the CA once with `openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj
 
 ## Trusted model hosts
 
-To run pi on a model your organisation hosts, such as an internal OpenAI-compatible endpoint, define it in pi's `~/.pi/agent/models.json` and list its host in the option `trustedModelHosts` (`/plugin configure pi@claude-mods`). Only you can set it: the mod passes the list to `serve` itself, and a command that passes `--trusted-hosts` is refused.
+To run pi on a model your organisation hosts, such as an internal OpenAI-compatible endpoint, define it in pi's `~/.pi/agent/models.json` and list its host in the option `trustedModelHosts` (`/plugin configure pi@claude-mods`). Only you can set it: the mod passes the list to `serve` and `run` itself, and a command that passes `--trusted-hosts` is refused.
 
 ```jsonc
 // ~/.pi/agent/models.json
@@ -79,6 +79,7 @@ Without the sandbox (with `allowUnsandboxed` on), Claude could read `models.json
 
 ```
 pi-session serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]   # --allow-unsandboxed, --trusted-hosts: added by the mod
+pi-session run <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL] [--format findings] [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
 pi-session send <name> [--steer] [--format findings] <prompt...> | --file FILE | -
 pi-session wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]   # exit 3: pi asks; 2: timed out (--abort stops the run); 4: bad findings
 pi-session read <name> [--last | --tail N | --since LINE]
@@ -88,6 +89,13 @@ pi-session abort | stop | forget <name>
 ```
 
 Each session keeps `status.json`, `transcript.md`, `last-reply.md`, `events.jsonl` (pi's raw event stream) and `stderr.log` in `~/.pi/agent/claude-sessions/<name>/` (`PI_SESSIONS_DIR` overrides it). pi keeps its own copy of the conversation under `~/.pi/agent/sessions/`, as session `claude-<name>-<id>`. Serving a session again reopens that conversation; after `forget`, the same name starts a new one. Prompts too long for one pipe write go through the session's `inbox/` folder.
+
+`run` is `serve`, `send` and `wait` in one call and one process, meant as one background Bash call. It goes through the same gate and sandbox checks as `serve`, refuses a session that is already running, and checks `--out` and the prompt before pi starts. Its output, `--out`, findings check, and exit codes 2 and 4 are `wait`'s. Then:
+
+- **After the reply** it stops the session, whatever the reply was, and exits. `--keep` leaves the session running for `send` and `wait`; the call then ends when the session does, with the reply's exit code if that was not 0.
+- **A question** does not end it, so `run` never exits 3: the process holds pi, and ending it would lose the question. It prints the question and goes on once it is answered with `answer`. Since no exit tells Claude, the question shows in `status`, the panel and the task's output, and a `wait <name>` beside the call exits 3 on it.
+- **A timeout** with `--abort` stops pi's run, as `wait` does, then the session. Without `--abort`, `wait` would leave pi working, but here that needs this process: it exits 2 and stops the session, also if a question is open. With `--keep` the session stays either way, and the code comes when it ends.
+- **A kill** (Claude Code restarting, say) takes pi and the waiter together. The session shows as lost; `serve` or `run` under the same name reopens the conversation.
 
 `wait --out FILE` writes the reply to `FILE` and prints only its path and size, also after a timeout with `--abort`, which keeps long reports out of Claude's context. `FILE` must be somewhere sandboxed commands can write, such as the project or the scratchpad. Paths into `~/.pi` are refused, also through links and relative paths.
 

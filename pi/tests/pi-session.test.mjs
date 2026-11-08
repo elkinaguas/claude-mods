@@ -491,6 +491,299 @@ test('serve passes only its own commands to pi: a model switch written to the pi
   assert.equal(status('alpha').model, 'opencode-go/echo')
 })
 
+// A `run` in the background: what it has printed so far, and its end.
+const startRun = (args, runEnv = env) => {
+  const child = spawn('node', [SCRIPT, 'run', ...args], { env: runEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+  const seen = { out: '', err: '' }
+  child.stdout.on('data', d => (seen.out += d))
+  child.stderr.on('data', d => (seen.err += d))
+  const done = new Promise(resolve => child.on('close', (code, signal) => resolve({ code, signal, ...seen })))
+  return { child, seen, done }
+}
+const AT = ['--cwd', root, '--model', 'opencode-go/echo']
+const runOnce = (args, runEnv) => startRun(args, runEnv).done
+const stillRunning = child => child.exitCode === null && child.signalCode === null
+const noSession = name => assert.ok(!fs.existsSync(path.join(root, name, 'status.json')), `${name} started`)
+
+test('run starts the session, sends the prompt, prints the reply, and stops it', async () => {
+  const run = await runOnce(['one', ...AT, 'hello', 'there'])
+  assert.equal(run.code, 0, run.err)
+  assert.equal(run.out, 'echo: hello there\n')
+  assert.equal(status('one').state, 'stopped')
+  assert.equal(status('one').model, 'opencode-go/echo')
+  assert.equal(status('one').sandboxed, true)
+  assert.ok(!fs.existsSync(path.join(root, 'one', 'in.fifo')))
+  assert.equal(cli('read', 'one', '--last'), 'echo: hello there\n')
+  // The same name again reopens that conversation, with the model it had.
+  const firstId = status('one').sessionId
+  const again = await runOnce(['one', 'more'])
+  assert.equal(again.code, 0, again.err)
+  assert.equal(again.out, 'echo: more\n')
+  assert.equal(status('one').sessionId, firstId)
+  cli('forget', 'one')
+})
+
+test('run takes its prompt from a file, however long', async () => {
+  const long = `start ${'x'.repeat(100000)} end`
+  const big = path.join(root, 'run-big.md')
+  fs.writeFileSync(big, long)
+  const run = await runOnce(['big', ...AT, '--file', big])
+  assert.equal(run.code, 0, run.err)
+  assert.equal(run.out, `echo: ${long}\n`)
+  fs.rmSync(big)
+  cli('forget', 'big')
+})
+
+test('run: what is wrong with the call fails before pi starts', async () => {
+  const refused = async (args, re) => {
+    const run = await runOnce(['early', ...AT, ...args])
+    assert.equal(run.code, 1)
+    assert.match(run.err, re)
+    noSession('early')
+  }
+  await refused([], /nothing to send/)
+  await refused(['--file', path.join(root, 'no-such-prompt.md')], /is not a file/)
+  await refused(['--format', 'yaml', 'hi'], /--format takes findings, not yaml/)
+  await refused(['--out', authFile, 'hi'], /refusing --out .* is in ~\/\.pi/)
+  await refused(['hi', '--out'], /--out names a file/)
+  assert.equal(fs.readFileSync(authFile, 'utf8'), goodAuth)
+  fs.rmSync(path.join(root, 'early'), { recursive: true, force: true })
+  // A session that is already running is not taken over, and gets no prompt.
+  const live = await serve('taken')
+  const before = status('taken').promptSeq
+  const clash = await runOnce(['taken', ...AT, 'hi'])
+  assert.equal(clash.code, 1)
+  assert.match(clash.err, /taken is already running/)
+  assert.equal(status('taken').promptSeq, before)
+  assert.equal(status('taken').state, 'idle')
+  cli('stop', 'taken')
+  await until(() => status('taken').state === 'stopped')
+  live.kill()
+  cli('forget', 'taken')
+})
+
+test('run is held to the sandbox check, with the same way past it as serve', async () => {
+  const bare = await runOnce(['bare-run', ...AT, 'hi'], bareEnv)
+  assert.equal(bare.code, 1)
+  assert.match(bare.err, /not inside Claude Code's Bash sandbox/)
+  assert.ok(!fs.existsSync(path.join(root, 'bare-run')))
+  const allowed = await runOnce(['bare-run', '--allow-unsandboxed', ...AT, 'hi'], bareEnv)
+  assert.equal(allowed.code, 0, allowed.err)
+  assert.equal(status('bare-run').sandboxed, false)
+  cli('forget', 'bare-run')
+})
+
+test('run is held to the gate, and pi never gets the prompt when it fails', async () => {
+  const refused = async (args, auth = goodAuth) => {
+    fs.writeFileSync(authFile, auth)
+    try {
+      const run = await runOnce(['gated-run', '--cwd', root, ...args])
+      assert.equal(run.code, 1)
+      assert.equal(run.out, '')
+      return run.err
+    } finally {
+      fs.writeFileSync(authFile, goodAuth)
+      noSession('gated-run')
+    }
+  }
+  assert.match(await refused(['hi']), /name the model/)
+  assert.match(await refused(['--model', 'anthropic/claude-x', 'hi']), /is not an opencode-go model/)
+  assert.match(await refused(['--model', 'opencode-go/echo', 'hi', '--', '--provider', 'anthropic']), /extra pi arguments .* are off/)
+  assert.match(await refused(['--model', 'opencode-go/echo', 'hi'], JSON.stringify({ 'opencode-go': { type: 'oauth', refresh: 'r' } })), /no opencode-go API key/)
+  assert.match(await refused(['--model', 'opencode-go/echo', 'hi'], JSON.stringify({ 'opencode-go': { type: 'api_key', key: 'k' }, anthropic: { type: 'oauth' } })), /also holds anthropic/)
+  assert.match(await refused(['--model', 'corp/m', '--trusted-hosts', 'not a host!', 'hi']), /not a host, host:port or host:\*/)
+  fs.rmSync(path.join(root, 'gated-run'), { recursive: true, force: true })
+  // pi ending up on another provider ends the session before the prompt reaches it.
+  const other = await runOnce(['other-run', ...AT, 'a secret prompt'], { ...env, FAKE_PI_PROVIDER: 'anthropic' })
+  assert.equal(other.code, 1)
+  assert.equal(other.out, '')
+  assert.match(other.err, /before it took the prompt: pi runs anthropic\/echo, not opencode-go/)
+  assert.ok(!cli('read', 'other-run', '--tail', '50').includes('a secret prompt'))
+  assert.ok(!fs.readFileSync(path.join(root, 'other-run', 'events.jsonl'), 'utf8').includes('a secret prompt'))
+  cli('forget', 'other-run')
+})
+
+test('run takes a model at a trusted host through --trusted-hosts, as serve does', async () => {
+  const modelsFile = path.join(home, '.pi', 'agent', 'models.json')
+  fs.writeFileSync(modelsFile, JSON.stringify({ providers: { corp: { baseUrl: 'https://llm.corp.example.com/v1', apiKey: 'dummy', models: [{ id: 'm' }] } } }))
+  fs.writeFileSync(authFile, '{}')
+  try {
+    const args = ['corp-run', '--cwd', root, '--model', 'corp/m']
+    const without = await runOnce([...args, 'hi'], { ...env, FAKE_PI_PROVIDER: 'corp' })
+    assert.equal(without.code, 1)
+    assert.match(without.err, /defines corp with no base URL at a trusted host/)
+    const run = await runOnce([...args, '--trusted-hosts', 'llm.corp.example.com', 'hi'], { ...env, FAKE_PI_PROVIDER: 'corp' })
+    assert.equal(run.code, 0, run.err)
+    assert.equal(run.out, 'echo: hi\n')
+  } finally {
+    fs.rmSync(modelsFile, { force: true })
+    fs.writeFileSync(authFile, goodAuth)
+  }
+  cli('forget', 'corp-run')
+})
+
+test('run --keep prints the reply and leaves the session up for follow-ups', async () => {
+  const run = startRun(['kept', ...AT, '--keep', 'first'])
+  await until(() => run.seen.out === 'echo: first\n')
+  assert.equal(status('kept').state, 'idle')
+  assert.ok(stillRunning(run.child))
+  const id = cli('send', 'kept', 'second').trim()
+  assert.equal(cli('wait', 'kept', id, '--timeout', '5'), 'echo: second\n')
+  cli('stop', 'kept')
+  const end = await run.done
+  assert.equal(end.code, 0, end.err)
+  assert.equal(status('kept').state, 'stopped')
+  cli('forget', 'kept')
+})
+
+test('a wait started beside run --keep never takes the session for done before its prompt', async () => {
+  const run = startRun(['beside', ...AT, '--keep', 'slow: a long job'])
+  await until(() => fs.existsSync(path.join(root, 'beside', 'status.json')) && status('beside').state !== 'starting')
+  // Idle or busy from here, its prompt is already counted.
+  assert.equal(status('beside').settledSeq, status('beside').promptSeq - 1)
+  const capped = cliFails('wait', 'beside', '--timeout', '1')
+  assert.equal(capped.code, 2)
+  cli('stop', 'beside')
+  await run.done
+  cli('forget', 'beside')
+})
+
+test('--keep means nothing in the commands that do not take it', async () => {
+  const live = await serve('words')
+  const id = cli('send', 'words', 'the --keep flag').trim()
+  assert.equal(cli('wait', 'words', id, '--timeout', '5'), 'echo: the --keep flag\n')
+  cli('stop', 'words')
+  await until(() => status('words').state === 'stopped')
+  live.kill()
+  cli('forget', 'words')
+})
+
+test('a question does not end run: pi stays up, an answer goes on to the reply, then it stops', async () => {
+  const run = startRun(['asks', ...AT, 'please ask me'])
+  await until(() => /confirm d1\): Proceed\?/.test(run.seen.out))
+  assert.equal(status('asks').state, 'waiting')
+  // Past the wait's next polls: still up, and the question printed once.
+  await new Promise(r => setTimeout(r, 2500))
+  assert.ok(stillRunning(run.child))
+  assert.equal(status('asks').state, 'waiting')
+  assert.equal(run.seen.out.match(/pi asks/g).length, 1)
+  // A wait beside it gets the exit 3 run can't give.
+  const beside = cliFails('wait', 'asks', '--timeout', '5')
+  assert.equal(beside.code, 3)
+  assert.match(beside.out, /pi-session answer asks d1/)
+  cli('answer', 'asks', 'd1', 'yes')
+  const end = await run.done
+  assert.equal(end.code, 0, end.err)
+  assert.match(end.out, /echo: please ask me \(confirmed\)\n$/)
+  assert.equal(status('asks').state, 'stopped')
+  cli('forget', 'asks')
+})
+
+test('a question under a cap: --abort ends the run and exits 2; without it the session stops and exits 2', async () => {
+  const aborted = await runOnce(['asks-cap', ...AT, '--timeout', '1', '--abort', 'please ask me'])
+  assert.equal(aborted.code, 2, aborted.err)
+  assert.match(aborted.out, /pi asks/)
+  assert.match(aborted.err, /timed out after 1s; its run was aborted/)
+  assert.equal(status('asks-cap').state, 'stopped')
+  assert.match(cli('read', 'asks-cap', '--tail', '6'), /settled \(aborted\)/)
+  const capped = await runOnce(['asks-cap', '--timeout', '1', 'please ask me'])
+  assert.equal(capped.code, 2, capped.err)
+  assert.match(capped.err, /still waiting after 1s/)
+  assert.equal(status('asks-cap').state, 'stopped')
+  cli('forget', 'asks-cap')
+})
+
+test('run --timeout: exit 2, with --abort as wait does it, and the session stops', async () => {
+  const dest = path.join(fs.realpathSync(root), 'run-capped.md')
+  const first = await runOnce(['capped', ...AT, 'before the cap'])
+  assert.equal(first.code, 0, first.err)
+  const aborted = await runOnce(['capped', '--timeout', '1', '--abort', '--out', dest, 'slow: a long job'])
+  assert.equal(aborted.code, 2, aborted.err)
+  assert.match(aborted.err, /timed out after 1s; its run was aborted/)
+  assert.equal(aborted.out, `${dest} (21 bytes)\n`)
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: before the cap\n')
+  assert.equal(status('capped').state, 'stopped')
+  assert.match(cli('read', 'capped', '--tail', '6'), /settled \(aborted\)/)
+  fs.rmSync(dest)
+  const plain = await runOnce(['capped', '--timeout', '1', 'slow: a long job'])
+  assert.equal(plain.code, 2, plain.err)
+  assert.match(plain.err, /still busy after 1s/)
+  assert.equal(status('capped').state, 'stopped')
+  cli('forget', 'capped')
+})
+
+test('run --keep under a cap stays up, and reports the code when the session ends', async () => {
+  const run = startRun(['capped-keep', ...AT, '--keep', '--timeout', '1', 'slow: a long job'])
+  await until(() => /still busy after 1s/.test(run.seen.err), 8000)
+  assert.ok(stillRunning(run.child))
+  assert.equal(status('capped-keep').state, 'busy')
+  cli('stop', 'capped-keep')
+  assert.equal((await run.done).code, 2)
+  cli('forget', 'capped-keep')
+})
+
+test('run --out and findings go through the wait path: path and size, the array alone, exit 4', async () => {
+  const dest = path.join(fs.realpathSync(root), 'run-out', 'report.md')
+  const written = await runOnce(['outs', ...AT, '--out', dest, 'written'])
+  assert.equal(written.code, 0, written.err)
+  assert.equal(written.out, `${dest} (14 bytes)\n`)
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: written\n')
+  const good = await runOnce(['outs', '--format', 'findings', scripted(fence([finding]))])
+  assert.equal(good.code, 0, good.err)
+  assert.deepEqual(JSON.parse(good.out), [finding])
+  fs.rmSync(dest)
+  const bad = await runOnce(['outs', '--format', 'findings', '--out', dest, scripted('not findings')])
+  assert.equal(bad.code, 4)
+  assert.equal(bad.out, '')
+  assert.match(bad.err, /no valid findings: expected one fenced JSON block, found 0/)
+  assert.ok(!fs.existsSync(dest))
+  // Stopped all the same, with the raw reply kept.
+  assert.equal(status('outs').state, 'stopped')
+  assert.equal(cli('read', 'outs', '--last'), 'not findings\n')
+  fs.rmSync(path.dirname(dest), { recursive: true })
+  cli('forget', 'outs')
+})
+
+test('a prompt pi refuses ends run with the error, as it does wait', async () => {
+  const run = await runOnce(['refused', ...AT, 'please reject this'])
+  assert.equal(run.code, 0, run.err)
+  assert.match(run.out, /^error: prompt: no model selected\n/)
+  assert.equal(status('refused').state, 'stopped')
+  cli('forget', 'refused')
+})
+
+test('a run told to stop mid-run ends cleanly, and says it did not settle', async () => {
+  const run = startRun(['killed-soft', ...AT, 'slow: a long job'])
+  await until(() => fs.existsSync(path.join(root, 'killed-soft', 'status.json')) && status('killed-soft').state === 'busy')
+  run.child.kill('SIGTERM')
+  const end = await run.done
+  assert.equal(end.code, 1)
+  assert.match(end.err, /killed-soft stopped before settling/)
+  assert.equal(status('killed-soft').state, 'stopped')
+  cli('forget', 'killed-soft')
+})
+
+test('a run killed with Claude Code shows as lost, and serving the name again resumes it', async () => {
+  const run = startRun(['killed', ...AT, 'slow: a long job'])
+  await until(() => fs.existsSync(path.join(root, 'killed', 'status.json')) && status('killed').state === 'busy')
+  const { sessionId, promptSeq } = status('killed')
+  run.child.kill('SIGKILL')
+  await run.done
+  const file = path.join(root, 'killed', 'status.json')
+  fs.writeFileSync(file, JSON.stringify({ ...status('killed'), heartbeatAt: Date.now() - 60000 }))
+  assert.match(cli('status', 'killed'), /killed {2}lost/)
+  const again = spawn('node', [SCRIPT, 'serve', 'killed'], { env, stdio: 'ignore' })
+  await until(() => status('killed').state === 'idle', 12000)
+  assert.equal(status('killed').sessionId, sessionId)
+  assert.equal(status('killed').promptSeq, promptSeq)
+  const id = cli('send', 'killed', 'carry on').trim()
+  assert.equal(cli('wait', 'killed', id, '--timeout', '5'), 'echo: carry on\n')
+  cli('stop', 'killed')
+  await until(() => status('killed').state === 'stopped')
+  again.kill()
+  cli('forget', 'killed')
+})
+
 test('status lists sessions in one line each', () => {
   assert.match(cli('status'), /^alpha {2}idle {2}opencode-go\/echo/m)
 })

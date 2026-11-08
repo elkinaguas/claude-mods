@@ -4,8 +4,9 @@
 //
 // `serve` owns one pi process: it reads commands from a named pipe, forwards
 // them to pi's stdin, and turns pi's event stream into status.json (read by
-// the pi mod's panel), a readable transcript, and the last reply. Every other
-// subcommand talks to a running `serve` through the pipe or reads its files.
+// the pi mod's panel), a readable transcript, and the last reply. `run` is serve,
+// send and wait in one process. Every other subcommand talks to a running serve
+// through the pipe or reads its files.
 
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -93,6 +94,16 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       follow-up, or with --steer delivered before pi's next model call.
       --format findings asks pi for a fenced JSON array of objects with file,
       line, severity, confidence and title, which wait then checks.
+  run <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL] [--format findings]
+      [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
+      serve, send and wait in one call, run in the background: starts the
+      session under serve's checks, sends the prompt, prints the reply as wait
+      does and stops the session. Exit codes, --out and findings are wait's,
+      but a question does not end it (that would end pi, which lives in this
+      process): it prints the question and goes on once answered. A timeout
+      without --abort stops the session too. --keep leaves it running after
+      the reply for follow-ups; the call then ends when the session does, with
+      the reply's exit code if that was not 0. Resume a killed one with serve.
   wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]
       Block until pi has settled (after prompt ID, or everything sent so far),
       then print its last reply. Exit 3 when pi waits on a dialog, 2 on
@@ -111,9 +122,21 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
 
 Sessions live in ${ROOT}.`
 
+// Inside `run` this process also holds pi, so leaving means stopping it first:
+// run catches this at its one way out. Elsewhere leaving is just exiting.
+class Leave {
+  constructor(code) {
+    this.code = code
+  }
+}
+let holdingPi = false
+const leave = code => {
+  if (holdingPi) throw new Leave(code)
+  process.exit(code)
+}
 const fail = (msg, code = 1) => {
   process.stderr.write(`pi-session: ${msg}\n`)
-  process.exit(code)
+  leave(code)
 }
 const dir = name => path.join(ROOT, name)
 const file = (name, f) => path.join(dir(name), f)
@@ -193,6 +216,7 @@ const toPipe = (name, cmd) => {
     if (!fs.lstatSync(dir(name)).isDirectory()) fail(`${dir(name)} is not a folder; refusing to write to it.`)
     fd = fs.openSync(file(name, 'in.fifo'), fs.constants.O_WRONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW)
   } catch (err) {
+    if (err instanceof Leave) throw err
     if (err.code === 'ELOOP') fail(`${file(name, 'in.fifo')} is a link, not ${name}'s pipe; refusing to write through it.`)
     fail(`${name} is not listening (${err.code}). Serve it again.`)
   }
@@ -220,7 +244,7 @@ const toPipe = (name, cmd) => {
   fs.closeSync(fd)
 }
 
-// Only the command that takes --out or --format reads it, so a prompt can mention them.
+// Only the commands that take --out, --format or --keep read them, so a prompt can mention them.
 const parse = (argv, cmd) => {
   const flags = {}
   const rest = []
@@ -231,8 +255,9 @@ const parse = (argv, cmd) => {
       extra.push(...argv.slice(i + 1))
       break
     }
-    if (/^--(cwd|model|thinking|timeout|tail|since|file|trusted-hosts)$/.test(a) || (a === '--out' && cmd === 'wait') || (a === '--format' && cmd === 'send'))
+    if (/^--(cwd|model|thinking|timeout|tail|since|file|trusted-hosts)$/.test(a) || (a === '--out' && (cmd === 'wait' || cmd === 'run')) || (a === '--format' && (cmd === 'send' || cmd === 'run')))
       flags[a.slice(2)] = argv[++i]
+    else if (a === '--keep' && cmd === 'run') flags.keep = true
     else if (/^--(steer|last|json|cancel|abort|allow-unsandboxed)$/.test(a)) flags[a.slice(2)] = true
     else rest.push(a)
   }
@@ -397,9 +422,15 @@ function gate(model, extra, trustedList) {
     fail(`${AUTH} also holds ${others.join(', ')}. pi-session runs pi only while the ${PROVIDER} API key is the only login there, so no other provider's credentials are within reach. Log out of the others in pi first. ${GATE_NOTE}`)
 }
 
-async function serve(name, flags, extra) {
+const needSandbox = flags => {
   if (!SANDBOXED && !flags['allow-unsandboxed'])
     fail(`not inside Claude Code's Bash sandbox, so pi would read your real provider key. Run it from Claude's Bash tool with the sandbox on.`)
+}
+
+// Goes on running on its handles after it returns. `first` is run's prompt,
+// taken as soon as pi has passed the provider check; the returned session is for run.
+async function serve(name, flags, extra, first = null) {
+  needSandbox(flags)
   fs.mkdirSync(dir(name), { recursive: true })
   const before = await settledStatus(name)
   if (isLive(before)) fail(`${name} is already running.`)
@@ -479,14 +510,9 @@ async function serve(name, flags, extra) {
   }
 
   let finished = false
-  onLines(pipeIn, line => {
-    if (finished) return
-    let cmd
-    try {
-      cmd = JSON.parse(line)
-    } catch {
-      return
-    }
+  let ended
+  const session = { taken: false, over: false, stop: end, ended: new Promise(r => (ended = r)) }
+  const takeCommand = cmd => {
     if (!PIPE_TYPES.includes(cmd?.type)) {
       // A model or provider switch would get past the gate; only our own commands go to pi.
       log(`! refused a ${String(cmd?.type)} command: only prompts, answers, abort and stop reach pi. ${GATE_NOTE}`)
@@ -525,6 +551,16 @@ async function serve(name, flags, extra) {
     if (cmd.type === 'abort') log(`  abort requested · ${clock()}`)
     save()
     pi.stdin.write(`${JSON.stringify(cmd)}\n`)
+  }
+  onLines(pipeIn, line => {
+    if (finished) return
+    let cmd
+    try {
+      cmd = JSON.parse(line)
+    } catch {
+      return
+    }
+    takeCommand(cmd)
   })
 
   const accept = (id, done) => {
@@ -556,6 +592,11 @@ async function serve(name, flags, extra) {
           }
           st.sessionFile = r.data?.sessionFile ?? null
           if (st.state === 'starting') st.state = r.data?.isStreaming ? 'busy' : 'idle'
+          // In the same step as going idle, so no reader sees this session idle with its prompt unsent.
+          if (first && !ending) {
+            takeCommand(first)
+            session.taken = true
+          }
         } else if (!r.success) {
           st.error = `${r.command}: ${r.error}`
           log(`! ${st.error}`)
@@ -650,6 +691,8 @@ async function serve(name, flags, extra) {
     transcript.end()
     events.end()
     process.exitCode = code ?? 1
+    session.over = true
+    ended()
   }
   pi.stdin.on('error', () => {})
   pi.on('error', err => finish('failed', 127, `could not start ${PI}: ${err.message}`))
@@ -659,11 +702,15 @@ async function serve(name, flags, extra) {
     else finish('failed', code ?? 1, st.error ?? `pi exited (${signal ?? code}); see ${file(name, 'stderr.log')}`)
   })
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, end)
+  return session
 }
 
-async function send(name, flags, rest) {
+const needFormat = flags => {
   if ('format' in flags && flags.format !== 'findings') fail(`--format takes findings${flags.format ? `, not ${flags.format}` : ''}.`)
-  await needLive(name)
+}
+
+// The prompt command send and run hand to serve.
+const promptCommand = (flags, rest) => {
   let message = rest.join(' ')
   if (flags.file) message = fs.readFileSync(flags.file, 'utf8')
   else if (message === '-') message = fs.readFileSync(0, 'utf8')
@@ -672,11 +719,18 @@ async function send(name, flags, rest) {
   const id = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
   // Always says how to queue: pi refuses a plain prompt while it streams,
   // and our status can trail pi by a moment.
-  const cmd = { id, type: 'prompt', message, streamingBehavior: flags.steer ? 'steer' : 'followUp', ...(flags.format ? { format: flags.format } : {}) }
+  return { id, type: 'prompt', message, streamingBehavior: flags.steer ? 'steer' : 'followUp', ...(flags.format ? { format: flags.format } : {}) }
+}
+
+async function send(name, flags, rest) {
+  needFormat(flags)
+  await needLive(name)
+  const cmd = promptCommand(flags, rest)
+  const { id } = cmd
   if (Buffer.byteLength(JSON.stringify(cmd)) + 1 > PIPE_LINE) {
     // Too long for one pipe write: serve reads it from the inbox instead.
     fs.mkdirSync(file(name, 'inbox'), { recursive: true })
-    fs.writeFileSync(file(name, `inbox/${id}.md`), message)
+    fs.writeFileSync(file(name, `inbox/${id}.md`), cmd.message)
     delete cmd.message
     cmd.messageFile = `${id}.md`
   }
@@ -684,13 +738,15 @@ async function send(name, flags, rest) {
   process.stdout.write(`${id}\n`)
 }
 
-async function wait(name, id, flags) {
+// With holdsPi (run) this process is what keeps pi alive, so a question can't
+// end it as exit 3 would: it is printed once, and the wait goes on after the answer.
+async function wait(name, id, flags, { holdsPi = false, deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity } = {}) {
   if (id?.startsWith('--')) fail(`wait does not take ${id}.`)
   if ('out' in flags) {
     if (!flags.out) fail('--out names a file.')
     prepareOut(flags.out)
   }
-  const deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity
+  let asked = null
   for (;;) {
     const st = await settledStatus(name)
     if (!st) fail(`no session ${name}.`)
@@ -698,10 +754,13 @@ async function wait(name, id, flags) {
     if (id && target == null && isLive(st)) {
       // The prompt may still be in the pipe: give serve a moment.
     } else if (st.state === 'waiting' && st.dialog) {
-      process.stdout.write(`pi asks (${st.dialog.method} ${st.dialog.id}): ${st.dialog.title}\n`)
-      if (st.dialog.options) process.stdout.write(`options: ${st.dialog.options.join(' | ')}\n`)
-      process.stdout.write(`Answer: pi-session answer ${name} ${st.dialog.id} <value>\n`)
-      process.exit(3)
+      if (asked !== st.dialog.id) {
+        process.stdout.write(`pi asks (${st.dialog.method} ${st.dialog.id}): ${st.dialog.title}\n`)
+        if (st.dialog.options) process.stdout.write(`options: ${st.dialog.options.join(' | ')}\n`)
+        process.stdout.write(`Answer: pi-session answer ${name} ${st.dialog.id} <value>\n`)
+      }
+      asked = st.dialog.id
+      if (!holdsPi) leave(3)
     } else if (st.settledSeq >= (target ?? 0) && st.state !== 'busy' && st.state !== 'starting') {
       let reply = lastReply(name)
       if (st.findingsSeq && st.findingsSeq === st.settledSeq) {
@@ -712,10 +771,11 @@ async function wait(name, id, flags) {
       } else if (st.error) process.stdout.write(`error: ${st.error}\n`)
       if (flags.out) writeOut(flags.out, reply)
       else process.stdout.write(reply || '(no reply text)\n')
-      process.exit(isLive(st) ? 0 : 1)
+      leave(isLive(st) ? 0 : 1)
     } else if (!isLive(st)) {
       fail(`${name} ${shownState(st)} before settling${st.error ? `: ${st.error}` : ''}.`)
     }
+    if (st.state !== 'waiting') asked = null
     if (Date.now() > deadline) {
       if (flags.abort && isLive(st)) return abortAfterTimeout(name, flags)
       fail(`still ${st.state} after ${flags.timeout}s.`, 2)
@@ -729,18 +789,57 @@ async function abortAfterTimeout(name, flags) {
   toPipe(name, { id: `a${Date.now().toString(36)}`, type: 'abort' })
   const until = Date.now() + 15000
   let st = readStatus(name)
-  while (isLive(st) && st.state === 'busy' && Date.now() < until) {
+  // A run's question ends with the run; one asked outside a run (dialog.inRun false) stays.
+  const working = s => s.state === 'busy' || (s.state === 'waiting' && s.dialog?.inRun !== false)
+  while (isLive(st) && working(st) && Date.now() < until) {
     await new Promise(r => setTimeout(r, 500))
     st = readStatus(name)
   }
-  const settled = !isLive(st) || st.state !== 'busy'
+  const settled = !isLive(st) || !working(st)
   process.stderr.write(`pi-session: ${name} timed out after ${flags.timeout}s; ${settled ? 'its run was aborted' : 'abort sent, but it is still busy'}.\n`)
   // An unfinished run's reply is not its answer, even if an older one would pass the check.
   if (st?.findingsSeq && st.findingsSeq === st.acceptedSeq) noFindings(name, 'the run did not finish', 2)
   const reply = lastReply(name)
   if (reply && flags.out) writeOut(flags.out, reply)
   else if (reply) process.stdout.write(`last reply before the abort:\n${reply}`)
-  process.exit(2)
+  leave(2)
+}
+
+// serve, send and wait in one call and one process, so a kill takes pi and the
+// waiter together; serving the name again resumes it. What can be wrong with
+// the call fails before pi starts.
+async function run(name, flags, rest, extra) {
+  needSandbox(flags)
+  needFormat(flags)
+  if ('out' in flags) {
+    if (!flags.out) fail('--out names a file.')
+    prepareOut(flags.out)
+  }
+  if (flags.file && !fs.statSync(flags.file, { throwIfNoEntry: false })?.isFile()) fail(`--file ${flags.file} is not a file.`)
+  const cmd = promptCommand(flags, rest)
+  const deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity
+  const session = await serve(name, flags, extra, cmd)
+  holdingPi = true
+  let code = 0
+  try {
+    while (!session.taken) {
+      if (session.over) {
+        const st = readStatus(name)
+        fail(`${name} ${shownState(st)} before it took the prompt${st?.error ? `: ${st.error}` : ''}.`)
+      }
+      if (Date.now() > deadline) fail(`still starting after ${flags.timeout}s.`, 2)
+      await sleep(100)
+    }
+    await wait(name, cmd.id, flags, { holdsPi: true, deadline })
+  } catch (err) {
+    if (!(err instanceof Leave)) throw err
+    code = err.code
+  }
+  holdingPi = false
+  if (!flags.keep) session.stop()
+  await session.ended
+  // After serve's own exit code: the reply's result is what this call reports.
+  if (code || !flags.keep) process.exitCode = code
 }
 
 function read(name, flags) {
@@ -797,6 +896,9 @@ const { flags, rest, extra } = parse(argv, cmd)
 switch (cmd) {
   case 'serve':
     await serve(needName(rest[0]), flags, extra)
+    break
+  case 'run':
+    await run(needName(rest[0]), flags, rest.slice(1), extra)
     break
   case 'send':
     await send(needName(rest[0]), flags, rest.slice(1))
