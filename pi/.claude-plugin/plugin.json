@@ -1,6 +1,6 @@
 {
   "name": "pi",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Long-lived pi coding-agent sessions from Claude Code: a sandboxed session runner, a panel, a guard on ~/.pi and a check of the key-masking setup",
   "author": {
     "name": "Elkin Aguas"
