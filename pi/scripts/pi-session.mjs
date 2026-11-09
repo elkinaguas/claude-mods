@@ -43,10 +43,19 @@ const UNSANDBOXED_NOTE = "\n\n[Session note: nobody can answer questions while y
 const SANDBOXED = !!process.env.SANDBOX_RUNTIME
 // The gate: the mod runs pi only on opencode-go, with an API key that is the
 // only login in pi's auth.json, or on a model whose provider models.json
-// points at a host the person trusts (option trustedModelHosts, passed by the
-// mod as --trusted-hosts). So pi-session can't be used to reach any other
-// provider's credentials (a Claude subscription login, say).
+// points at a host the person trusts (option trustedModelHosts, read from the
+// options file). So pi-session can't be used to reach any other provider's
+// credentials (a Claude subscription login, say).
 const PROVIDER = 'opencode-go'
+// The person's options allowUnsandboxed and trustedModelHosts, written by the
+// pi mod, never by Claude: sandboxed commands can't write under ~/.claude/plugins,
+// and the mod refuses file-tool writes there. Found from the account's home
+// folder, not $HOME, so a command can't point it elsewhere. PI_SESSION_OPTIONS
+// is for the mod's tests, and the mod refuses a command that sets it.
+const OPTIONS_FILE = process.env.PI_SESSION_OPTIONS || path.join(os.userInfo().homedir, '.claude', 'plugins', 'data', 'pi', 'options.json')
+// The mod rewrites the file every minute while Claude Code runs; an older one
+// is from a mod since turned off, so its options no longer hold.
+const OPTIONS_MAX_AGE_MS = 15 * 60 * 1000
 const AUTH = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
 const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')
 // What serve passes on from its pipe to pi; anything else (set_model, say) is refused.
@@ -100,9 +109,9 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       Run pi for this session until stopped. Run it in the background.
       Serving a stopped session again reopens its conversation. PROVIDER is
       opencode-go, or one models.json points at a trusted host. Refused
-      outside Claude Code's sandbox unless --allow-unsandboxed (pi then reads
-      your real key). The pi mod adds --allow-unsandboxed and
-      --trusted-hosts itself, from your options; Claude never passes them.
+      outside Claude Code's sandbox unless your option allowUnsandboxed is on
+      (pi then reads your real key). Both options come from the file the pi
+      mod writes, never from the command line.
   send <name> [--steer] [--format findings] <prompt...> | --file FILE | -
       Send a prompt. Prints its id. While pi works it is queued as a
       follow-up, or with --steer delivered before pi's next model call.
@@ -270,11 +279,13 @@ const parse = (argv, cmd) => {
       extra.push(...argv.slice(i + 1))
       break
     }
-    if (/^--(cwd|model|thinking|timeout|tail|since|file|trusted-hosts)$/.test(a) || (a === '--out' && (cmd === 'wait' || cmd === 'run')) || (a === '--format' && (cmd === 'send' || cmd === 'run')))
+    if (a === '--trusted-hosts' || a === '--allow-unsandboxed')
+      fail(`${a} is gone: pi-session reads your options allowUnsandboxed and trustedModelHosts from the file the pi mod writes (${OPTIONS_FILE}). Set them with /plugin configure pi@claude-mods.`)
+    if (/^--(cwd|model|thinking|timeout|tail|since|file)$/.test(a) || (a === '--out' && (cmd === 'wait' || cmd === 'run')) || (a === '--format' && (cmd === 'send' || cmd === 'run')))
       flags[a.slice(2)] = argv[++i]
     else if (a === '--keep' && cmd === 'run') flags.keep = true
     else if (a === '--purge' && cmd === 'forget') flags.purge = true
-    else if (/^--(steer|last|json|abort|allow-unsandboxed)$/.test(a)) flags[a.slice(2)] = true
+    else if (/^--(steer|last|json|abort)$/.test(a)) flags[a.slice(2)] = true
     else rest.push(a)
   }
   return { flags, rest, extra }
@@ -423,10 +434,12 @@ const readAuth = () => {
 // host with no login in auth.json. Either way every provider models.json
 // defines must be on a trusted host, so no other service's key sits there.
 // Reads only names, types and base URLs, never a key or a token.
-function gate(model, extra, trustedList) {
+function gate(model, extra, trustedList, optionsWhy = null) {
   if (extra.length) fail(`extra pi arguments (${extra.join(' ')}) are off. ${GATE_NOTE}`)
   const entries = (trustedList ?? '').split(',').filter(Boolean).map(parseHostEntry)
-  if (entries.some(e => !e)) fail(`--trusted-hosts holds an entry that is not a host, host:port or host:*. ${GATE_NOTE}`)
+  if (entries.some(e => !e)) fail(`the trusted hosts hold an entry that is not a host, host:port or host:*. ${GATE_NOTE}`)
+  // Why no host is trusted, when the options file didn't count.
+  const NOTE = optionsWhy ? `${GATE_NOTE} Your trusted hosts count as none: ${optionsWhy}.` : GATE_NOTE
   if (!model) fail(`name the model: --model ${PROVIDER}/<id>, or <provider>/<id> for a provider at a trusted host. ${GATE_NOTE}`)
   const provider = model.split('/')[0]
   let models = {}
@@ -440,9 +453,9 @@ function gate(model, extra, trustedList) {
     .filter(([, p]) => !(p && typeof p.baseUrl === 'string' && trustedUrl(p.baseUrl, entries)))
     .map(([n]) => n)
   if (untrusted.length)
-    fail(`${MODELS} defines ${untrusted.join(', ')} with no base URL at a trusted host. pi-session runs pi only while every provider there is at a host you trust, so no other service's key is within reach. ${GATE_NOTE}`)
+    fail(`${MODELS} defines ${untrusted.join(', ')} with no base URL at a trusted host. pi-session runs pi only while every provider there is at a host you trust, so no other service's key is within reach. ${NOTE}`)
   if (provider !== PROVIDER) {
-    if (!entries.length) fail(`${model} is not an ${PROVIDER} model. ${GATE_NOTE}`)
+    if (!entries.length) fail(`${model} is not an ${PROVIDER} model. ${NOTE}`)
     if (!providers[provider]) fail(`${provider} is not defined in ${MODELS}, at a trusted host. ${GATE_NOTE}`)
     const auth = readAuth()
     if (auth === null) fail(`${AUTH} does not parse. ${GATE_NOTE}`)
@@ -460,15 +473,40 @@ function gate(model, extra, trustedList) {
     fail(`${AUTH} also holds ${others.join(', ')}. pi-session runs pi only while the ${PROVIDER} API key is the only login there, so no other provider's credentials are within reach. Log out of the others in pi first. ${GATE_NOTE}`)
 }
 
-const needSandbox = flags => {
-  if (!SANDBOXED && !flags['allow-unsandboxed'])
-    fail(`not inside Claude Code's Bash sandbox, so pi would read your real provider key. Run it from Claude's Bash tool with the sandbox on.`)
+// The person's options from the pi mod's file, or both off (with why) when it
+// is missing, not a plain file, not the expected JSON, or too old.
+const readOptions = () => {
+  const off = why => ({ allowUnsandboxed: false, trustedHosts: '', why })
+  let st
+  try {
+    st = fs.lstatSync(OPTIONS_FILE)
+  } catch {
+    return off(`the pi mod's options file was not found (${OPTIONS_FILE})`)
+  }
+  if (!st.isFile()) return off(`${OPTIONS_FILE} is not a plain file`)
+  let o
+  try {
+    o = JSON.parse(fs.readFileSync(OPTIONS_FILE, 'utf8'))
+  } catch {
+    return off(`${OPTIONS_FILE} could not be read`)
+  }
+  const hosts = o?.trustedModelHosts
+  if (typeof o !== 'object' || !o || typeof o.allowUnsandboxed !== 'boolean' || !Array.isArray(hosts) || !hosts.every(h => typeof h === 'string' && parseHostEntry(h)) || typeof o.writtenAt !== 'number')
+    return off(`${OPTIONS_FILE} is not what the pi mod writes`)
+  if (Date.now() - o.writtenAt > OPTIONS_MAX_AGE_MS) return off(`${OPTIONS_FILE} is old, so the pi mod is not running`)
+  return { allowUnsandboxed: o.allowUnsandboxed, trustedHosts: hosts.join(','), why: null }
+}
+
+const needSandbox = options => {
+  if (!SANDBOXED && !options.allowUnsandboxed)
+    fail(`not inside Claude Code's Bash sandbox, so pi would read your real provider key. Run it from Claude's Bash tool with the sandbox on${options.why ? `. Your option allowUnsandboxed counts as off: ${options.why}` : ''}.`)
 }
 
 // Goes on running on its handles after it returns. `first` is run's prompt,
 // taken as soon as pi has passed the provider check; the returned session is for run.
 async function serve(name, flags, extra, first = null) {
-  needSandbox(flags)
+  const options = readOptions()
+  needSandbox(options)
   fs.mkdirSync(dir(name), { recursive: true })
   const before = await settledStatus(name)
   if (isLive(before)) fail(`${name} is already running.`)
@@ -476,7 +514,7 @@ async function serve(name, flags, extra, first = null) {
   const cwd = path.resolve(flags.cwd ?? meta.cwd ?? process.cwd())
   const model = flags.model ?? meta.model
   const thinking = flags.thinking ?? meta.thinking
-  gate(model, extra, flags['trusted-hosts'])
+  gate(model, extra, options.trustedHosts, options.why)
   // pi's own session id: reopened when the session is served again, and new
   // for a new session, so a name used again after forget starts afresh.
   const sessionId = meta.sessionId ?? `claude-${name}-${Date.now().toString(36)}`
@@ -877,7 +915,7 @@ async function abortAfterTimeout(name, flags, target) {
 // waiter together; serving the name again resumes it. What can be wrong with
 // the call fails before pi starts.
 async function run(name, flags, rest, extra) {
-  needSandbox(flags)
+  needSandbox(readOptions())
   needFormat(flags)
   needOut(flags)
   if (flags.file && !fs.statSync(flags.file, { throwIfNoEntry: false })?.isFile()) fail(`--file ${flags.file} is not a file.`)

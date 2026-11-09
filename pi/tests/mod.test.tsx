@@ -10,8 +10,8 @@ import {
   sandboxEscapes,
   sandboxSetting,
   settingsProblems,
-  withAllowFlag,
-  withTrustedHosts,
+  optionsText,
+  writesOptions,
 } from '../hooks/register'
 
 declare const setTimeout: (fn: (value?: unknown) => void, ms: number) => unknown
@@ -90,17 +90,7 @@ test('a Bash call that asks to leave the sandbox is refused when it reaches pi',
   expect(allowed.deny).toBe(undefined)
 })
 
-test('the allow flag is added to every pi-session serve, once', () => {
-  expect(withAllowFlag('node /x/pi-session.mjs serve demo --cwd /w')).toBe('node /x/pi-session.mjs serve --allow-unsandboxed demo --cwd /w')
-  expect(withAllowFlag('node "/x y/pi-session.mjs" serve demo')).toBe('node "/x y/pi-session.mjs" serve --allow-unsandboxed demo')
-  expect(withAllowFlag('node /x/pi-session.mjs serve a; node /x/pi-session.mjs serve b')).toBe(
-    'node /x/pi-session.mjs serve --allow-unsandboxed a; node /x/pi-session.mjs serve --allow-unsandboxed b',
-  )
-  expect(withAllowFlag('node /x/pi-session.mjs serve demo --allow-unsandboxed')).toBe('node /x/pi-session.mjs serve demo --allow-unsandboxed')
-  expect(withAllowFlag('node /x/pi-session.mjs send demo "serve it"')).toBe('node /x/pi-session.mjs send demo "serve it"')
-})
-
-test('with allowUnsandboxed on, the mod itself lets serve start outside the sandbox', { options: { allowUnsandboxed: true } }, async ($, on) => {
+test('with allowUnsandboxed on, serve may start outside the sandbox, and the command is not changed', { options: { allowUnsandboxed: true } }, async ($, on) => {
   on('env.get', () => ({ value: HOME }))
   const seen: string[] = []
   on('tool.call', (_, e) => {
@@ -109,7 +99,7 @@ test('with allowUnsandboxed on, the mod itself lets serve start outside the sand
   })
   const ran = await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs serve demo', dangerouslyDisableSandbox: true } as never)
   expect(ran.deny).toBe(undefined)
-  expect(seen.at(-1)).toBe('node /x/pi-session.mjs serve --allow-unsandboxed demo')
+  expect(seen.at(-1)).toBe('node /x/pi-session.mjs serve demo')
   // auth.json stays out of reach even then.
   const cat = await $.tool.call({ tool: 'Bash', command: 'cat ~/.pi/agent/auth.json', dangerouslyDisableSandbox: true } as never)
   expect(cat.deny).toMatch(/names auth\.json/)
@@ -187,23 +177,66 @@ test('Bash: other spellings of the key file, SANDBOX_RUNTIME and excluded comman
   expect(bashRefusal('PI_SESSION_PI=/bin/sh node /x/pi-session.mjs serve x', on)).toMatch(/PI_SESSION_PI is for the mod/)
 })
 
-test('trusted model hosts: parsed from the option, passed to serve by the mod only', () => {
+test('trusted model hosts: parsed from the option, valid entries only', () => {
   expect(parseTrustedHosts('llm.corp.example.com, *.corp.example.com:8443 localhost:* [::1]:8080 bad/host')).toEqual({
     valid: ['llm.corp.example.com', '*.corp.example.com:8443', 'localhost:*', '[::1]:8080'],
     invalid: ['bad/host'],
   })
   expect(parseTrustedHosts(undefined)).toEqual({ valid: [], invalid: [] })
-  expect(withTrustedHosts('node /x/pi-session.mjs serve demo --model corp/m', ['llm.corp', 'localhost:*'])).toBe(
-    'node /x/pi-session.mjs serve --trusted-hosts llm.corp,localhost:* demo --model corp/m',
-  )
-  expect(withTrustedHosts('node /x/pi-session.mjs status', ['llm.corp'])).toBe('node /x/pi-session.mjs status')
-  expect(withTrustedHosts('node /x/pi-session.mjs serve demo', [])).toBe('node /x/pi-session.mjs serve demo')
-  expect(bashRefusal('node /x/pi-session.mjs serve demo --trusted-hosts api.openai.com', { unsandboxed: false, allowUnsandboxed: false })).toMatch(
-    /come from your option trustedModelHosts/,
-  )
 })
 
-test('with trustedModelHosts set, the mod adds them to serve', { options: { trustedModelHosts: 'llm.corp.example.com' } }, async ($, on) => {
+test('the mod writes the options file pi-session reads when a session starts', { options: { trustedModelHosts: 'llm.corp.example.com bad/host', allowUnsandboxed: true } }, async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  const writes: { path: string; text: string }[] = []
+  on('fs.write', (_, e) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
+  on('fs.read', () => {
+    throw new Error('missing')
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.now', () => ({ value: 0 }))
+  on('clock.every', () => ({ value: undefined }))
+  on('command.register', () => ({ value: { command: 'pi' } }))
+  on('ui.toast', () => ({ value: undefined }))
+  const before = Date.now()
+  await $.session.start({ cwd: '/home/u/proj', surface: 'terminal', isInteractive: true })
+  const options = writes.filter(w => w.path === '/home/u/.claude/plugins/data/pi/options.json')
+  expect(options.length).toBe(1)
+  const o = JSON.parse(options[0]!.text)
+  expect(o.allowUnsandboxed).toBe(true)
+  expect(o.trustedModelHosts).toEqual(['llm.corp.example.com'])
+  expect(o.writtenAt >= before && o.writtenAt <= Date.now()).toBe(true)
+  expect(JSON.parse(optionsText({ allowUnsandboxed: false, trustedHosts: [] }, 5))).toEqual({ allowUnsandboxed: false, trustedModelHosts: [], writtenAt: 5 })
+})
+
+test("Claude's file tools can't write the options file, also through a link; reading it is fine", async ($, on) => {
+  on('env.get', () => ({ value: HOME }))
+  const real: Record<string, string> = { '/home/u/proj/opts.json': '/home/u/.claude/plugins/data/pi/options.json' }
+  on('fs.stat', (_, e) => ({ value: { kind: 'file', size: 1, mtimeMs: 0, isLink: e.path in real, realPath: real[e.path] ?? e.path } }))
+  on('tool.call', () => ({ result: {} }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.read', () => {
+    throw new Error('missing')
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.now', () => ({ value: 0 }))
+  on('clock.every', () => ({ value: undefined }))
+  on('command.register', () => ({ value: { command: 'pi' } }))
+  on('ui.toast', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/home/u/proj', surface: 'terminal', isInteractive: true })
+  const file = '/home/u/.claude/plugins/data/pi/options.json'
+  expect((await $.tool.call({ tool: 'Write', file_path: file, content: '{}' } as never)).deny).toMatch(/only the mod writes/)
+  expect((await $.tool.call({ tool: 'Edit', file_path: '~/.claude/plugins/data/pi/options.json', old_string: 'a', new_string: 'b' } as never)).deny).toMatch(/only the mod writes/)
+  expect((await $.tool.call({ tool: 'Write', file_path: 'opts.json', content: '{}' } as never)).deny).toMatch(/a link to .*options\.json\) is the pi mod's options file/)
+  expect((await $.tool.call({ tool: 'Read', file_path: file } as never)).deny).toBe(undefined)
+  expect(writesOptions('Write', { file_path: '/home/u/.claude/plugins/data/pix/x' }, '/w', HOME)).toBe(null)
+})
+
+test('the mod never rewrites a Bash command, whatever its options, so auto mode runs what it reviewed', { options: { trustedModelHosts: 'llm.corp', allowUnsandboxed: true } }, async ($, on) => {
   on('env.get', () => ({ value: HOME }))
   on('fs.read', (_, e) => {
     if (e.path === '/home/u/.claude/settings.json') return { value: JSON.stringify(goodSettings) }
@@ -214,50 +247,15 @@ test('with trustedModelHosts set, the mod adds them to serve', { options: { trus
     seen.push(String((e as unknown as { command?: string }).command))
     return { result: {} }
   })
-  expect((await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs serve corp --model corp/m' } as never)).deny).toBe(undefined)
-  expect(seen.at(-1)).toBe('node /x/pi-session.mjs serve --trusted-hosts llm.corp.example.com corp --model corp/m')
-})
-
-test('run starts pi too: the flags are added to it as to serve, and only there', () => {
-  const run = 'node /x/pi-session.mjs run demo --model corp/m --file p.md'
-  expect(withAllowFlag(run)).toBe('node /x/pi-session.mjs run --allow-unsandboxed demo --model corp/m --file p.md')
-  expect(withAllowFlag('node "/x y/pi-session.mjs" run demo')).toBe('node "/x y/pi-session.mjs" run --allow-unsandboxed demo')
-  expect(withAllowFlag(`${run} --allow-unsandboxed`)).toBe(`${run} --allow-unsandboxed`)
-  expect(withTrustedHosts(run, ['llm.corp'])).toBe('node /x/pi-session.mjs run --trusted-hosts llm.corp demo --model corp/m --file p.md')
-  expect(withAllowFlag('node /x/pi-session.mjs serve a; node /x/pi-session.mjs run b')).toBe(
-    'node /x/pi-session.mjs serve --allow-unsandboxed a; node /x/pi-session.mjs run --allow-unsandboxed b',
-  )
-  for (const other of ['node /x/pi-session.mjs send demo "run it"', 'node /x/pi-session.mjs status', 'node /x/pi-session.mjs running', 'npm run test']) {
-    expect(withAllowFlag(other)).toBe(other)
-    expect(withTrustedHosts(other, ['llm.corp'])).toBe(other)
-  }
-})
-
-test('the flags go only on a command that runs pi-session, never into text that mentions it', () => {
-  const hosts = ['llm.corp']
-  for (const mention of [
-    'git commit -m "pi: pi-session run now stops the session"',
-    `git commit -m 'see; node /x/pi-session.mjs run demo'`,
-    'echo "node /x/pi-session.mjs serve demo"',
-    `grep 'pi-session run ' README.md`,
-    'grep -n pi-session run README.md',
-    'node /x/pi-session.mjs send s "compare with pi-session run output"',
-    'git commit -m "first\n\nnode /x/pi-session.mjs run demo"',
+  for (const command of [
+    'node /x/pi-session.mjs serve corp --model corp/m',
+    'node /x/pi-session.mjs run demo --model corp/m --file p.md',
+    'cat > notes.md <<EOF\nnode /x/pi-session.mjs run demo\nEOF',
+    'timeout 900 node /x/pi-session.mjs run demo "hi"',
+    'git commit -m "pi: pi-session run --trusted-hosts is gone"',
   ]) {
-    expect(withTrustedHosts(mention, hosts)).toBe(mention)
-    expect(withAllowFlag(mention)).toBe(mention)
-  }
-  // Real invocations, also after another command, with variables or a wrapper.
-  const added = ' --trusted-hosts llm.corp'
-  for (const [before, after] of [
-    ['cd /w && node /x/pi-session.mjs run demo', `cd /w && node /x/pi-session.mjs run${added} demo`],
-    ['A=1 node --no-warnings "/x y/pi-session.mjs" serve demo', `A=1 node --no-warnings "/x y/pi-session.mjs" serve${added} demo`],
-    ['nohup /usr/bin/node /x/pi-session.mjs serve demo', `nohup /usr/bin/node /x/pi-session.mjs serve${added} demo`],
-    ['pi-session run demo', `pi-session run${added} demo`],
-    ['x=$(node /x/pi-session.mjs run demo)', `x=$(node /x/pi-session.mjs run${added} demo)`],
-    ['git log "a;b"; node /x/pi-session.mjs run demo', `git log "a;b"; node /x/pi-session.mjs run${added} demo`],
-  ] as const) {
-    expect(withTrustedHosts(before, hosts)).toBe(after)
+    expect((await $.tool.call({ tool: 'Bash', command } as never)).deny).toBe(undefined)
+    expect(seen.at(-1)).toBe(command)
   }
 })
 
@@ -269,15 +267,17 @@ test('the guard treats run as it does serve', () => {
   expect(bashRefusal(run, on)).toBe(null)
   expect(bashRefusal(run, off)).toMatch(/outside the Bash sandbox/)
   expect(bashRefusal(run, allowed)).toBe(null)
-  expect(bashRefusal(`${run} --trusted-hosts api.openai.com`, on)).toMatch(/come from your option trustedModelHosts/)
-  expect(bashRefusal(`${run} --trusted-hosts api.openai.com`, allowed)).toMatch(/come from your option trustedModelHosts/)
-  expect(bashRefusal(`${run} --allow-unsandboxed`, on)).toMatch(/only you can allow it/)
-  expect(bashRefusal(`${run} --allow-unsandboxed`, off)).toMatch(/only you can allow it/)
+  // pi-session refuses the old flags itself, so the guard no longer reads them.
+  expect(bashRefusal(`${run} --trusted-hosts api.openai.com`, on)).toBe(null)
+  expect(bashRefusal(`PI_SESSION_OPTIONS=/tmp/o.json ${run}`, on)).toMatch(/PI_SESSION_OPTIONS is for the mod/)
+  expect(bashRefusal('echo {} > ~/.claude/plugins/data/pi/options.json', allowed)).toMatch(/names the pi mod's options file/)
+  expect(bashRefusal('cp x ~/.claude/plugins/data/p?/options.json', off)).toMatch(/names the pi mod's options file/)
+  expect(bashRefusal('cat ~/.claude/plugins/data/pi/options.json', on)).toBe(null)
   expect(bashRefusal(`SANDBOX_RUNTIME=1 ${run}`, on)).toMatch(/set by the sandbox itself/)
   expect(bashRefusal(`PI_SESSION_PI=/bin/sh ${run}`, on)).toMatch(/PI_SESSION_PI is for the mod/)
 })
 
-test('a Bash run outside the sandbox is refused, and its flags from Claude are refused on the way in', async ($, on) => {
+test('a Bash run outside the sandbox is refused, and other commands go through unchanged', async ($, on) => {
   on('env.get', () => ({ value: HOME }))
   on('fs.read', (_, e) => {
     if (e.path === '/home/u/.claude/settings.json') return { value: JSON.stringify(goodSettings) }
@@ -291,15 +291,13 @@ test('a Bash run outside the sandbox is refused, and its flags from Claude are r
   const bash = (command: string, more = {}) => $.tool.call({ tool: 'Bash', command, ...more } as never)
   const run = 'node /x/pi-session.mjs run demo --model opencode-go/echo --file p.md'
   expect((await bash(run, { dangerouslyDisableSandbox: true })).deny).toMatch(/outside the Bash sandbox/)
-  expect((await bash(`${run} --allow-unsandboxed`)).deny).toMatch(/only you can allow it/)
-  expect((await bash(`${run} --trusted-hosts api.openai.com`)).deny).toMatch(/come from your option trustedModelHosts/)
   expect(seen).toEqual([])
   // Inside the sandbox with no options set, it goes through untouched.
   expect((await bash(run)).deny).toBe(undefined)
   expect(seen).toEqual([run])
 })
 
-test('with allowUnsandboxed on, the mod itself lets run start outside the sandbox', { options: { allowUnsandboxed: true } }, async ($, on) => {
+test('with allowUnsandboxed on, run may start outside the sandbox, and the command is not changed', { options: { allowUnsandboxed: true } }, async ($, on) => {
   on('env.get', () => ({ value: HOME }))
   const seen: string[] = []
   on('tool.call', (_, e) => {
@@ -308,22 +306,7 @@ test('with allowUnsandboxed on, the mod itself lets run start outside the sandbo
   })
   const ran = await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs run demo --file p.md', dangerouslyDisableSandbox: true } as never)
   expect(ran.deny).toBe(undefined)
-  expect(seen.at(-1)).toBe('node /x/pi-session.mjs run --allow-unsandboxed demo --file p.md')
-})
-
-test('with trustedModelHosts set, the mod adds them to run', { options: { trustedModelHosts: 'llm.corp.example.com' } }, async ($, on) => {
-  on('env.get', () => ({ value: HOME }))
-  on('fs.read', (_, e) => {
-    if (e.path === '/home/u/.claude/settings.json') return { value: JSON.stringify(goodSettings) }
-    throw new Error('missing')
-  })
-  const seen: string[] = []
-  on('tool.call', (_, e) => {
-    seen.push(String((e as unknown as { command?: string }).command))
-    return { result: {} }
-  })
-  expect((await $.tool.call({ tool: 'Bash', command: 'node /x/pi-session.mjs run corp --model corp/m "hi"' } as never)).deny).toBe(undefined)
-  expect(seen.at(-1)).toBe('node /x/pi-session.mjs run --trusted-hosts llm.corp.example.com corp --model corp/m "hi"')
+  expect(seen.at(-1)).toBe('node /x/pi-session.mjs run demo --file p.md')
 })
 
 test("Claude's instructions cover run, and status over old task output after a restart", async ($, on) => {
@@ -404,8 +387,7 @@ test('unsandboxed, Bash commands that reach pi or its key are refused', () => {
   expect(bashRefusal('ls pi/tests', off)).toBe(null)
   // Sandboxed, pi-session runs; its way past the sandbox is the person's to allow.
   expect(bashRefusal('node /x/pi-session.mjs serve demo', on)).toBe(null)
-  expect(bashRefusal('node /x/pi-session.mjs serve demo --allow-unsandboxed', off)).toMatch(/only you can allow it/)
-  expect(bashRefusal('node /x/pi-session.mjs serve demo --allow-unsandboxed', allowed)).toBe(null)
+  expect(bashRefusal('node /x/pi-session.mjs serve demo', allowed)).toBe(null)
   expect(bashRefusal('cat ~/.pi/agent/auth.json', allowed)).toMatch(/names auth\.json/)
 })
 
