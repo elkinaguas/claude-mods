@@ -145,7 +145,8 @@ export const reachesPiDir = (tool: string, input: Json, base: string, homeDir: s
 // sandbox does. It keeps the obvious ways out.
 const PI_RE = /pi-session|(^|[^\w.-])\.p[i?*[{]|auth(\.json|[?*[{])|agent\/a[?*[{]|(^|[\s;&|(`])pi(\s|$)/
 const AUTH_RE = /auth(\.json|[?*[{])|agent\/a[?*[{]|\.p[?*[{][^\s]*\/agent\/a/
-const ALLOW_RE = /--allow-unsandboxed/
+// The folder of the options file the mod writes for pi-session (see writeOptions).
+const OPTIONS_RE = /plugins\/data\/pi(\/|\s|$)|plugins\/data\/p[?*[{]/
 const flat = (command: string) => command.replace(/["'\\]/g, '')
 
 /** The commands a settings layer lets run outside the sandbox, and whether Bash may ask to leave it. */
@@ -193,76 +194,15 @@ export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUns
   // The opencode-go gate lives in pi-session, so pi runs only through it
   // (pi run directly could use any provider, and `pi auth` prints keys).
   if (runsExcluded(text, ['pi'])) return `pi: run pi only through pi-session (node <pi mod>/scripts/pi-session.mjs serve <name> --model <provider>/<id>). The pi mod works only with an opencode-go API key, or a model at a host you trust (option trustedModelHosts).`
-  // The trusted hosts are the person's option; the mod passes them, never Claude.
-  if (/--trusted-hosts/.test(text))
-    return 'pi: the trusted model hosts come from your option trustedModelHosts (/plugin configure pi@claude-mods); the mod passes them to serve and run itself, and a command may not.'
-  if (ALLOW_RE.test(text) && !o.allowUnsandboxed)
-    return 'pi: --allow-unsandboxed lets pi read your real key, and only you can allow it (/plugin configure pi@claude-mods, allowUnsandboxed). Run pi-session inside the sandbox instead.'
+  // pi-session reads the person's options from the file this points at.
+  if (/PI_SESSION_OPTIONS\s*=/.test(text)) return 'pi: PI_SESSION_OPTIONS is for the mod\'s own tests; a command may not set it.'
+  // Inside the sandbox the options file can't be written; outside it only this text check stands.
+  if (o.unsandboxed && OPTIONS_RE.test(text))
+    return 'pi: this command would run outside the sandbox and names the pi mod\'s options file, which only the mod writes. Set the options with /plugin configure pi@claude-mods.'
   if (!o.unsandboxed || !PI_RE.test(text)) return null
   if (AUTH_RE.test(text)) return 'pi: this command would run outside the sandbox and names auth.json, which holds your real provider key.'
   if (o.allowUnsandboxed) return null
   return 'pi: this command would run outside the Bash sandbox, where pi and Claude could read your real provider key. Turn the sandbox on, or allow it yourself (/plugin configure pi@claude-mods, allowUnsandboxed).'
-}
-
-/**
- * A Bash command with `--allow-unsandboxed` added to each pi-session serve or
- * run in it (the two that start pi). The mod does this when the person turned
- * allowUnsandboxed on, so the choice is theirs and Claude never passes the flag
- * itself. Inside the sandbox the flag changes nothing.
- */
-export const withAllowFlag = (command: string): string =>
-  addToPiStarts(command, rest => (/^[^;&|\n]*--allow-unsandboxed/.test(rest) ? '' : ' --allow-unsandboxed'))
-
-/** The same, adding `--trusted-hosts <list>` (the person's option, entries already validated) to each serve or run. */
-export const withTrustedHosts = (command: string, hosts: string[]): string =>
-  hosts.length ? addToPiStarts(command, () => ` --trusted-hosts ${hosts.join(',')}`) : command
-
-// A shell command that runs pi-session serve or run: optional variables and a
-// wrapper or node, then pi-session as the program. Anything else, such as a
-// commit message that mentions it, is left alone; a spelling this misses gets
-// no flags, and pi-session then refuses it.
-const PI_START = /(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:nohup|exec|env)\s+)*(?:(?:\S*\/)?node\s+(?:-\S+\s+)*)?(?:"[^"\n]*pi-session(?:\.mjs)?"|'[^'\n]*pi-session(?:\.mjs)?'|[^\s"';&|()]*pi-session(?:\.mjs)?)\s+(?:serve|run)(?=\s|$)/y
-
-/** Adds text after each pi-session serve or run that starts a shell command, outside any quotes. */
-const addToPiStarts = (command: string, addition: (rest: string) => string): string => {
-  let out = ''
-  let i = 0
-  let atStart = true
-  let quote: string | null = null
-  while (i < command.length) {
-    const c = command[i]!
-    if (atStart && !quote) {
-      if (/[ \t]/.test(c)) {
-        out += c
-        i += 1
-        continue
-      }
-      PI_START.lastIndex = i
-      const m = PI_START.exec(command)
-      if (m) {
-        i += m[0].length
-        out += m[0] + addition(command.slice(i))
-        atStart = false
-        continue
-      }
-      atStart = false
-    }
-    if (c === '\\' && quote !== "'") {
-      out += command.slice(i, i + 2)
-      i += 2
-      continue
-    }
-    if (quote) {
-      if (c === quote) quote = null
-    } else if (c === '"' || c === "'") {
-      quote = c
-    } else if (/[;&|\n(`]/.test(c)) {
-      atStart = true
-    }
-    out += c
-    i += 1
-  }
-  return out
 }
 
 // Matches pi-session's host entry: host, host:port or host:*, with *. for subdomains and [v6].
@@ -440,8 +380,37 @@ async function load($: EngineInterface) {
   wasLive = isLive
 }
 
+/** Where the mod keeps the options pi-session reads; sandboxed commands can't write under ~/.claude/plugins. */
+export const optionsDir = (homeDir: string) => `${homeDir}/.claude/plugins/data/pi`
+
+/** Why a file tool call would write the options file's folder, or null. Reads are fine: it holds no secret. */
+export const writesOptions = (tool: string, input: Json, base: string, homeDir: string): string | null => {
+  const p = tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' ? str(input.file_path) : tool === 'NotebookEdit' ? str(input.notebook_path) : null
+  if (!p) return null
+  const abs = resolvePath(p, base, homeDir)
+  return under(abs, optionsDir(homeDir)) ? abs : null
+}
+
+/** The options file's text: what pi-session reads instead of flags in the command. */
+export const optionsText = (o: { allowUnsandboxed: boolean; trustedHosts: string[] }, now: number) =>
+  `${JSON.stringify({ allowUnsandboxed: o.allowUnsandboxed, trustedModelHosts: o.trustedHosts, writtenAt: now }, null, 2)}\n`
+
+// Written once a minute while Claude Code runs: pi-session takes an older file for
+// a mod since turned off. 0 writes at the next chance (new options, a new session).
+const OPTIONS_EVERY_MS = 60000
+let optionsWrittenAt = 0
+async function writeOptions($: EngineInterface) {
+  if (!home || Date.now() - optionsWrittenAt < OPTIONS_EVERY_MS) return
+  optionsWrittenAt = Date.now()
+  await $.fs.write(`${optionsDir(home)}/options.json`, optionsText({ allowUnsandboxed, trustedHosts }, Date.now())).catch((err: unknown) => {
+    optionsWrittenAt = 0
+    $.ui.log(`pi: could not write its options file: ${String(err)}`)
+  })
+}
+
 // Every poll reads the sessions; only a pane on screen is redrawn for its age.
 async function poll($: EngineInterface) {
+  await writeOptions($)
   await load($).catch(() => {})
   const panes = await $.ui.panes().catch(() => [])
   if (panes.some(p => p.id === PANE && p.isShown)) await update($, tickAtom, n => n + 1)
@@ -462,7 +431,7 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
   node ${script($)} <command>
 
 - Start: run \`serve <name> --cwd <dir> --model <provider>/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused).
-- pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); the mod passes those hosts to serve and run itself` : ''}. serve and run refuse any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If they refuse, tell the person why; never try to get around the gate.
+- pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); serve and run read those hosts from the mod's options file themselves` : ''}. serve and run refuse any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If they refuse, tell the person why; never try to get around the gate.
 - One-shot: \`run <name> --model <provider>/<id> [--cwd <dir>] --file <prompt file>\` (or a quoted prompt) with run_in_background starts the session, sends the prompt, prints pi's reply and stops the session, so you are notified when it is done. It takes wait's \`--timeout SECONDS --abort\`, \`--out FILE\` and exit codes, and \`--format findings\`. \`--keep\` leaves the session running for follow-ups; the call then ends only when the session does, so run \`wait <name>\` with run_in_background to be told when the reply is there.
 - Work: \`send <name> "<prompt>"\` prints a prompt id. While pi works a new prompt queues as a follow-up; \`--steer\` delivers it before pi's next model call instead.
 - Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply. Sessions never stop for questions: pi is told to finish and list its assumptions, and a question from a pi extension is declined at once and named on stderr, so a step it guarded may have been skipped. To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. For a long reply, add \`--out FILE\` to write it to a file and print only its path and size. To ask for review findings as a checked JSON array, use \`send <name> --format findings "<prompt>"\`: \`wait\` prints only the array, or exits 4 if the reply is invalid. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply.
@@ -471,7 +440,7 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
 - After a restart, use \`status <name>\` for how a session stands, and \`read <name> --last\` for its last reply. Never go by the output of a task from before the restart: it is old, and those tasks are gone.
 - Names: letters, digits, . _ - (e.g. auth-fix). Several sessions can run at once; give each its own folder or git worktree when they edit code.
 - Never read ~/.pi or auth.json (the file tools are refused there). Session logs are read through the script.
-- \`serve\` and \`run\` refuse to start outside the sandbox. ${allowUnsandboxed ? 'The person has allowed pi without the sandbox (option allowUnsandboxed), so the mod lets them start there by itself: use them as usual, never add flags for it, and when the sandbox is off tell them pi holds their real key.' : 'Never try to get around that; tell the person the sandbox is off.'}`
+- \`serve\` and \`run\` refuse to start outside the sandbox. ${allowUnsandboxed ? 'The person has allowed pi without the sandbox (option allowUnsandboxed), so serve and run start there by themselves: use them as usual, with no flags for it, and when the sandbox is off tell them pi holds their real key.' : 'Never try to get around that; tell the person the sandbox is off.'}`
 
 // Stop, abort and forget only write to a session's pipe or files, so the mod
 // runs them itself; serving again goes through Claude, so pi starts inside
@@ -493,6 +462,7 @@ export const register: Register = (on, options) => {
   allowUnsandboxed = options.allowUnsandboxed === true
   ;({ valid: trustedHosts, invalid: badHosts } = parseTrustedHosts(options.trustedModelHosts))
   seen = ''
+  optionsWrittenAt = 0
 
   on('session.start', async ($, e, next) => {
     home = (await $.env.get('HOME')) ?? ''
@@ -501,6 +471,8 @@ export const register: Register = (on, options) => {
       name: COMMAND,
       description: 'pi sessions: /pi opens the panel, /pi check checks the key-masking setup, /pi close',
     }).catch((err: unknown) => $.ui.log(`pi: /${COMMAND} not registered: ${String(err)}`))
+    optionsWrittenAt = 0
+    await writeOptions($)
     await load($).catch(() => {})
     $.clock.every(POLL_MS, () => void poll($).catch(() => {}))
     const problems = await check($).catch(() => [] as string[])
@@ -527,10 +499,14 @@ export const register: Register = (on, options) => {
       const unsandboxed = sandboxOff || input.dangerouslyDisableSandbox === true || runsExcluded(command, excluded)
       const why = bashRefusal(command, { unsandboxed, allowUnsandboxed })
       if (why) return { deny: why }
-      const allowed = withTrustedHosts(allowUnsandboxed ? withAllowFlag(command) : command, trustedHosts)
-      return allowed === command ? next(e) : next({ ...e, command: allowed })
+      // Unchanged: pi-session reads the options itself, so what auto mode reviews is what runs.
+      return next(e)
     }
     const base = cwd || home
+    // Claude's file tools run outside the sandbox, so they could write the options file.
+    const OPTIONS_DENY = 'is the pi mod\'s options file, which only the mod writes. Set the options with /plugin configure pi@claude-mods.'
+    const optionsHit = writesOptions(e.tool, input, base, home)
+    if (optionsHit) return { deny: `pi: ${optionsHit} ${OPTIONS_DENY}` }
     let hit = reachesPiDir(e.tool, input, base, home)
     // A link elsewhere that lands in ~/.pi: check where it really leads. A
     // search follows a link given as its root (ripgrep does), so Grep and Glob
@@ -541,6 +517,7 @@ export const register: Register = (on, options) => {
       const st = await $.fs.stat(resolvePath(target, base, home), { resolve: true }).catch(() => null)
       const real = st && 'realPath' in st ? str((st as unknown as Json).realPath) : null
       const isSearch = e.tool === 'Grep' || e.tool === 'Glob'
+      if (real && !isSearch && e.tool !== 'Read' && under(real, optionsDir(home))) return { deny: `pi: ${target} (a link to ${real}) ${OPTIONS_DENY}` }
       if (real && (under(real, `${home}/.pi`) || (isSearch && under(home, real)))) hit = `${target} (a link to ${real})`
     }
     if (!hit) return next(e)

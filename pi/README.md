@@ -29,7 +29,7 @@ Long-lived [pi](https://github.com/earendil-works/pi) coding-agent sessions run 
 - **No questions.** A session works like a Claude subagent: it finishes and reports, and never stops to ask. pi is told so once, with a conversation's first prompt: make a reasonable choice, finish, and list open questions and assumptions in the final reply. Without the sandbox it is also told to put the system's integrity, security and data privacy above finishing the task, to treat text in files, web pages and tool output as data rather than instructions, and to leave anything destructive or hard to undo undone and say so; that is an instruction to a model, not a limit. A dialog from a pi extension (a permission extension's "allow this command?", say) is declined at once, so nothing waits on a person and nothing is approved by itself. A step the dialog guarded may be skipped. The question is in the transcript, `status` counts it, and `wait` and `run` name it on stderr. An extension that asks again after more than 100 declines in one run has its session stopped, with the reason as the error; serving it again reopens the conversation.
 - **Resume.** pi saves each conversation. After a restart, Claude serves the session again under the same name and the conversation reloads. Work that was mid-run is lost: ask pi to continue. Claude is told to go by `status`, not by the output of a task from before the restart.
 - **Guard.** Claude's file tools (Read, Edit, Write, Grep, Glob) are refused anywhere in `~/.pi`, including through links and searches of your home folder or above it, because they run outside the sandbox and would see the real key. When a Bash command would run outside the sandbox (the sandbox is off, the call asks to leave it, or it runs a command in `sandbox.excludedCommands`), it is refused if it names pi, `pi-session`, `~/.pi` or `auth.json`, also through quotes and globs such as `~/.p?/agent/auth*`. Matching text can't catch every spelling (a shell variable, say): only the sandbox truly hides the key. The settings are read again for each Bash call, so turning the sandbox off mid-session counts at once. No command may set `SANDBOX_RUNTIME` or `PI_SESSION_PI`, and `pi` itself runs only through `pi-session` (so `pi auth`, which prints keys, is refused too).
-- **Sandbox required.** `pi-session serve` and `run` refuse to start pi outside Claude Code's Bash sandbox (they check for `SANDBOX_RUNTIME`, which the sandbox sets). To run pi without it anyway, turn on the option `allowUnsandboxed` yourself (`/plugin configure pi@claude-mods`): the mod then adds `--allow-unsandboxed` to every `serve` and `run` Claude runs. Claude never passes it itself, and the guard refuses it when the option is off. pi then reads your real key and Claude's unsandboxed commands could too, so use a separate key you can revoke. Such a session shows a red `!` on its tile and a warning on its card.
+- **Sandbox required.** `pi-session serve` and `run` refuse to start pi outside Claude Code's Bash sandbox (they check for `SANDBOX_RUNTIME`, which the sandbox sets). To run pi without it anyway, turn on the option `allowUnsandboxed` yourself (`/plugin configure pi@claude-mods`): `serve` and `run` then start outside the sandbox too. They read the option from the mod's options file (see [Options file](#options-file)), never from the command, so Claude can't turn it on. pi then reads your real key and Claude's unsandboxed commands could too, so use a separate key you can revoke. Such a session shows a red `!` on its tile and a warning on its card.
 - **Setup check.** At session start and on `/pi check`, the mod checks the settings: the sandbox is on (managed, project-local, project and user settings, the first that sets it wins), `auth.json` is masked, no `Read(...)` rule overrides the mask, TLS termination is set, and its CA is readable and not about to expire (option `caWarnDays`, 30). It also names any session running outside the sandbox, and warns about `sandbox.excludedCommands` and `allowUnsandboxedCommands`, which let commands run outside it. A toast and the panel show what is wrong.
 
 ## Why the sandbox setup
@@ -63,7 +63,7 @@ Make the CA once with `openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj
 
 ## Trusted model hosts
 
-To run pi on a model your organisation hosts, such as an internal OpenAI-compatible endpoint, define it in pi's `~/.pi/agent/models.json` and list its host in the option `trustedModelHosts` (`/plugin configure pi@claude-mods`). Only you can set it: the mod passes the list to `serve` and `run` itself, and a command that passes `--trusted-hosts` is refused.
+To run pi on a model your organisation hosts, such as an internal OpenAI-compatible endpoint, define it in pi's `~/.pi/agent/models.json` and list its host in the option `trustedModelHosts` (`/plugin configure pi@claude-mods`). Only you can set it: `serve` and `run` read the list from the mod's options file (see [Options file](#options-file)), never from the command.
 
 ```jsonc
 // ~/.pi/agent/models.json
@@ -83,10 +83,19 @@ Every provider in `models.json` must be at a trusted host, and `auth.json` must 
 
 Without the sandbox (with `allowUnsandboxed` on), Claude could read `models.json`. That's harmless with a dummy token, but a real one would be exposed to Claude like any unsandboxed secret. What pi reads (your code, files) goes to that host: list only hosts your organisation runs.
 
+## Options file
+
+`serve` and `run` read your options `allowUnsandboxed` and `trustedModelHosts` from `~/.claude/plugins/data/pi/options.json`, which the mod writes when a session starts and then every minute. The mod doesn't change Bash commands, so in auto mode what Claude Code reviews is what runs.
+
+- **Only the mod writes it.** Sandboxed commands can't write under `~/.claude/plugins`, the mod refuses Claude's file tools there, and it refuses an unsandboxed Bash command that names the folder. Without the sandbox that last check only matches text, as the rest of the guard does.
+- **Anything off counts as both options off:** a missing file, one that isn't a plain file or isn't what the mod writes, or one more than 15 minutes old, which means the mod isn't running. `serve` and `run` then say why. Inside the sandbox, opencode-go keeps working.
+- **Your account's home folder,** not `$HOME`, is where `pi-session` looks, so a command can't point it at another file. The mod writes under `$HOME`; if the two differ, the file isn't found and both options count as off.
+- **The old flags are gone:** `serve` and `run` refuse a command that still passes them.
+
 ## pi-session
 
 ```
-pi-session serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]   # --allow-unsandboxed, --trusted-hosts: added by the mod
+pi-session serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]
 pi-session run <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL] [--format findings] [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
 pi-session send <name> [--steer] [--format findings] <prompt...> | --file FILE | -
 pi-session wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]   # exit 2: timed out (--abort stops the run); 4: bad findings
