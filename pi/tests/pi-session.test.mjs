@@ -97,6 +97,31 @@ test('a dialog is declined at once, the run goes on, and wait names it apart fro
   const after = spawnSync('node', [SCRIPT, 'wait', 'alpha', next, '--timeout', '5'], { env, encoding: 'utf8' })
   assert.equal(after.stderr, '')
   assert.deepEqual(status('alpha').declined, [])
+  assert.equal(status('alpha').declinedCount, 0)
+})
+
+test('status counts every declined question in a run, past the 20 the list keeps', () => {
+  const id = cli('send', 'alpha', 'nag=25').trim()
+  const done = spawnSync('node', [SCRIPT, 'wait', 'alpha', id, '--timeout', '5'], { env, encoding: 'utf8' })
+  assert.equal(done.status, 0, done.stderr)
+  assert.equal(done.stdout, 'echo: nag=25\n')
+  assert.equal(done.stderr.match(/declined a question from an extension \(input\): Your name\?/g).length, 20)
+  assert.match(done.stderr, /alpha declined 5 more: see read alpha\n$/)
+  assert.equal(status('alpha').declined.length, 20)
+  assert.equal(status('alpha').declinedCount, 25)
+  assert.match(cli('status', 'alpha'), /declined 25 extension questions: see read alpha/)
+  // An older status.json without the count still shows the list's length.
+  const st = status('alpha')
+  delete st.declinedCount
+  const old = path.join(root, 'old-status')
+  fs.mkdirSync(old)
+  fs.writeFileSync(path.join(old, 'status.json'), JSON.stringify({ ...st, name: 'old-status' }))
+  assert.match(cli('status', 'old-status'), /declined 20 extension questions: see read old-status/)
+  fs.rmSync(old, { recursive: true })
+  // The next run starts from zero again.
+  const next = cli('send', 'alpha', 'plain').trim()
+  cli('wait', 'alpha', next, '--timeout', '5')
+  assert.equal(status('alpha').declinedCount, 0)
   // Nothing is left to answer with.
   assert.equal(spawnSync('node', [SCRIPT, 'answer', 'alpha', 'd1', 'yes'], { env, encoding: 'utf8' }).status, 1)
 })

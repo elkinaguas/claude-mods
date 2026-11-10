@@ -3,13 +3,14 @@
 // turn (a tool call, then "echo: <prompt>"), and opens a confirm dialog when
 // the prompt says "ask", refuses a prompt that says "reject", and works for
 // ten minutes (until aborted) on one that says "slow". One holding reply=<url-encoded text> gets
-// that text as its reply. Enough of pi's protocol to test pi-session.
+// that text as its reply. "nag" asks again each time it hears no; "nag=<n>" asks n times, then replies. Enough of pi's protocol to test pi-session.
 
 const out = r => process.stdout.write(`${JSON.stringify(r)}\n`)
 let busy = false
 let pendingDialog = null
 let slow = null
 let nags = 0
+let nagging = null
 const queue = []
 // FAKE_PI_STARTUP_DIALOG: an extension asks as pi starts. FAKE_PI_STATE: get_state fails ("fail") or gets no reply ("silent").
 if (process.env.FAKE_PI_STARTUP_DIALOG) out({ type: 'extension_ui_request', id: 's1', method: 'confirm', title: process.env.FAKE_PI_STARTUP_DIALOG })
@@ -33,9 +34,11 @@ const run = msg => {
     out({ type: 'agent_settled', aborted: false })
     return
   }
-  if (/\bnag\b/.test(msg)) {
+  const nag = /\bnag(?:=(\d+))?\b/.exec(msg)
+  if (nag) {
     // An extension that asks again each time it hears no.
     nags = 0
+    nagging = { msg, times: nag[1] ? Number(nag[1]) : Infinity }
     out({ type: 'extension_ui_request', id: 'n0', method: 'input', title: 'Your name?' })
     return
   }
@@ -73,7 +76,8 @@ process.stdin.on('data', chunk => {
       out({ id: cmd.id, type: 'response', command: 'get_state', success: false, error: 'bad config' })
     } else if (cmd.type === 'extension_ui_response' && /^n\d+$/.test(cmd.id)) {
       nags += 1
-      out({ type: 'extension_ui_request', id: `n${nags}`, method: 'input', title: 'Your name?' })
+      if (nags >= nagging.times) finish(nagging.msg)
+      else out({ type: 'extension_ui_request', id: `n${nags}`, method: 'input', title: 'Your name?' })
     } else if (cmd.type === 'get_state') {
       out({ id: cmd.id, type: 'response', command: 'get_state', success: true, data: { model: { provider: process.env.FAKE_PI_PROVIDER || 'opencode-go', id: 'echo' }, sessionFile: 'FAKE_PI_SESSION_FILE' in process.env ? process.env.FAKE_PI_SESSION_FILE || null : '/tmp/fake.jsonl', isStreaming: false } })
     } else if (cmd.type === 'prompt' && /\breject\b/.test(cmd.message)) {

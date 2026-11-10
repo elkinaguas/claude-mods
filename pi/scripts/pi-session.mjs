@@ -556,6 +556,8 @@ async function serve(name, flags, extra, first = null) {
     lastTool: null,
     lastReply: before?.lastReply ?? null,
     declined: [],
+    // How many questions the list stands for: it is capped, this is not.
+    declinedCount: 0,
     error: null,
     exitCode: null,
   }
@@ -656,6 +658,8 @@ async function serve(name, flags, extra, first = null) {
   }, START_MS).unref()
 
   let declines = 0
+  // Declined since the last run settled: still news for the next one, as in the list.
+  let unreported = 0
   let lastDeltaSave = 0
   onLines(pi.stdout, line => {
     if (finished) return
@@ -704,6 +708,7 @@ async function serve(name, flags, extra, first = null) {
         st.runStartedAt = Date.now()
         // What an earlier run already reported; one asked since then is still news.
         st.declined = st.declined.filter(d => !d.done)
+        st.declinedCount = unreported
         declines = 0
         break
       case 'turn_end':
@@ -749,6 +754,8 @@ async function serve(name, flags, extra, first = null) {
           }
           pi.stdin.write(`${JSON.stringify({ type: 'extension_ui_response', id: r.id, cancelled: true })}\n`)
           if (st.declined.length < MAX_DECLINED) st.declined.push({ method: r.method, title, done: false })
+          st.declinedCount += 1
+          unreported += 1
           log(`! declined ${r.method} ${r.id}: ${title}`)
         }
         break
@@ -759,6 +766,7 @@ async function serve(name, flags, extra, first = null) {
         st.settledSeq = st.acceptedSeq
         st.lastRunAborted = !!r.aborted
         for (const d of st.declined) d.done = true
+        unreported = 0
         st.lastTool = null
         st.runStartedAt = null
         log(`· settled${r.aborted ? ' (aborted)' : ''} · ${clock()}`)
@@ -837,9 +845,14 @@ async function send(name, flags, rest) {
   process.stdout.write(`${id}\n`)
 }
 
+// A status.json from before declinedCount has only the list.
+const declinedCount = st => st?.declinedCount ?? st?.declined?.length ?? 0
+
 // On stderr, so stdout stays the reply alone (a findings array, or --out's path).
 const reportDeclined = (name, st) => {
   for (const d of st?.declined ?? []) process.stderr.write(`pi-session: ${name} declined a question from an extension (${d.method}): ${d.title}\n`)
+  const more = declinedCount(st) - (st?.declined?.length ?? 0)
+  if (more > 0) process.stderr.write(`pi-session: ${name} declined ${more} more: see read ${name}\n`)
 }
 
 const needOut = flags => {
@@ -979,7 +992,8 @@ function status(name, flags) {
     process.stdout.write(`${r.name}  ${r.shown}  ${r.model ?? '-'}  ${r.cwd ?? '-'}  active ${ago(r.lastActivity)} ago${r.sandboxed === false ? '  UNSANDBOXED' : ''}\n`)
     const detail = r.error ? `error: ${r.error}` : r.lastTool ? `→ ${r.lastTool}` : r.lastReply ? `last: ${r.lastReply}` : ''
     if (detail) process.stdout.write(`  ${oneLine(detail, 160)}\n`)
-    if (r.declined?.length) process.stdout.write(`  declined ${r.declined.length} extension question${r.declined.length === 1 ? '' : 's'}: see read ${r.name}\n`)
+    const declined = declinedCount(r)
+    if (declined) process.stdout.write(`  declined ${declined} extension question${declined === 1 ? '' : 's'}: see read ${r.name}\n`)
   }
 }
 
