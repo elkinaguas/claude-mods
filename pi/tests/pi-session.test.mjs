@@ -710,6 +710,87 @@ test('run takes a model at a trusted host from the options file, as serve does',
   cli('forget', 'corp-run')
 })
 
+const settingsFile = path.join(home, '.pi', 'agent', 'settings.json')
+const withSettings = async (settings, fn) => {
+  if (settings) fs.writeFileSync(settingsFile, JSON.stringify(settings))
+  try {
+    return await fn()
+  } finally {
+    fs.rmSync(settingsFile, { force: true })
+  }
+}
+
+test("without --model, run takes pi's default model from its settings and passes it to pi", async () => {
+  await withSettings({ defaultProvider: 'opencode-go', defaultModel: 'glm-5', defaultThinkingLevel: 'low' }, async () => {
+    const run = await runOnce(['default-run', '--cwd', root, 'hi'])
+    assert.equal(run.code, 0, run.err)
+    assert.equal(run.out, 'echo: hi\n')
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'default-run', 'meta.json'), 'utf8')).model, 'opencode-go/glm-5')
+    // Named to pi, so a project's own settings can't pick another one.
+    assert.match(fs.readFileSync(path.join(root, 'default-run', 'stderr.log'), 'utf8'), /fake-pi args: .*--model opencode-go\/glm-5/)
+    // An explicit --model still wins over the default.
+    const named = await runOnce(['named-run', ...AT, 'hi'])
+    assert.equal(named.code, 0, named.err)
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'named-run', 'meta.json'), 'utf8')).model, 'opencode-go/echo')
+  })
+  cli('forget', 'default-run')
+  cli('forget', 'named-run')
+})
+
+test("a default model the gate refuses is refused, saying it is pi's default, and nothing else is picked", async () => {
+  await withSettings({ defaultProvider: 'anthropic', defaultModel: 'claude-sonnet-4-5' }, async () => {
+    const msg = /pi's default model anthropic\/claude-sonnet-4-5 \(.*settings\.json\) is not allowed: anthropic\/claude-sonnet-4-5 is not an opencode-go model\..* Pass --model\./
+    assert.match(cliFails('serve', 'bad-default', '--cwd', root).out, msg)
+    const run = await runOnce(['bad-default', '--cwd', root, 'hi'])
+    assert.equal(run.code, 1)
+    assert.equal(run.out, '')
+    assert.match(run.err, msg)
+    noSession('bad-default')
+  })
+  fs.rmSync(path.join(root, 'bad-default'), { recursive: true, force: true })
+})
+
+test('with no default in the settings and no --model, the model must be named', async () => {
+  for (const settings of [null, {}, { defaultModel: 'glm-5' }, { defaultProvider: 'opencode-go' }, { defaultProvider: 'opencode-go', defaultModel: '' }])
+    await withSettings(settings, () => assert.match(cliFails('serve', 'no-default', '--cwd', root).out, /pi-session: name the model: --model opencode-go\/<id>/))
+  fs.writeFileSync(settingsFile, '{')
+  try {
+    assert.match(cliFails('serve', 'no-default', '--cwd', root).out, /name the model/)
+  } finally {
+    fs.rmSync(settingsFile, { force: true })
+  }
+  fs.rmSync(path.join(root, 'no-default'), { recursive: true, force: true })
+})
+
+test('models lists only the ids the gate allows, and keeps to the sandbox check', () => {
+  assert.equal(cli('models'), 'opencode-go/glm-5\nopencode-go/kimi-k2.5\n')
+  // A provider at a trusted host, with auth.json empty: only that one.
+  const modelsFile = path.join(home, '.pi', 'agent', 'models.json')
+  fs.writeFileSync(modelsFile, JSON.stringify({ providers: { corp: { baseUrl: 'https://llm.corp.example.com/v1', apiKey: 'dummy', models: [{ id: 'm' }] } } }))
+  fs.writeFileSync(authFile, '{}')
+  try {
+    assert.match(cliFails('models').out, /none of pi's 4 models is allowed\. anthropic\/claude-sonnet-4-5: .*defines corp with no base URL at a trusted host/)
+    setOptions({ trustedModelHosts: ['llm.corp.example.com'] })
+    assert.equal(cli('models'), 'corp/m\n')
+  } finally {
+    fs.rmSync(modelsFile, { force: true })
+    fs.writeFileSync(authFile, goodAuth)
+    clearOptions()
+  }
+  // Another login beside opencode-go's key: nothing is allowed.
+  fs.writeFileSync(authFile, JSON.stringify({ 'opencode-go': { type: 'api_key', key: 'k' }, anthropic: { type: 'oauth', refresh: 'r' } }))
+  try {
+    assert.match(cliFails('models').out, /none of pi's 4 models is allowed/)
+  } finally {
+    fs.writeFileSync(authFile, goodAuth)
+  }
+  const bare = spawnSync('node', [SCRIPT, 'models'], { env: bareEnv, encoding: 'utf8' })
+  assert.equal(bare.status, 1)
+  assert.equal(bare.stdout, '')
+  assert.match(bare.stderr, /not inside Claude Code's Bash sandbox/)
+  assert.match(cliFails('models', 'extra').out, /models takes no arguments/)
+})
+
 test('run --keep prints the reply and leaves the session up for follow-ups', async () => {
   const run = startRun(['kept', ...AT, '--keep', 'first'])
   await until(() => run.seen.out === 'echo: first\n')

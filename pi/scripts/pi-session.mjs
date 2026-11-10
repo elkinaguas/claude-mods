@@ -58,6 +58,10 @@ const OPTIONS_FILE = process.env.PI_SESSION_OPTIONS || path.join(os.userInfo().h
 const OPTIONS_MAX_AGE_MS = 15 * 60 * 1000
 const AUTH = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
 const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')
+// pi's own settings: defaultProvider and defaultModel name the model pi starts
+// on. serve and run take it when no --model is given, through the same gate,
+// and pass it to pi as --model, so a project's .pi/settings.json can't swap it.
+const SETTINGS = path.join(os.homedir(), '.pi', 'agent', 'settings.json')
 // What serve passes on from its pipe to pi; anything else (set_model, say) is refused.
 const PIPE_TYPES = ['prompt', 'abort', '__stop']
 const GATE_NOTE = `The pi mod works only with an ${PROVIDER} API key, or a model at a host you trust (option trustedModelHosts).`
@@ -105,10 +109,12 @@ const trustedUrl = (url, entries) => {
 
 const USAGE = `pi-session: long-lived pi sessions for Claude Code
 
-  serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]
+  serve <name> [--model PROVIDER/ID] [--cwd DIR] [--thinking LEVEL]
       Run pi for this session until stopped. Run it in the background.
       Serving a stopped session again reopens its conversation. PROVIDER is
-      opencode-go, or one models.json points at a trusted host. Refused
+      opencode-go, or one models.json points at a trusted host. Without
+      --model: the session's model, else pi's default (defaultProvider and
+      defaultModel in ~/.pi/agent/settings.json), held to the same gate. Refused
       outside Claude Code's sandbox unless your option allowUnsandboxed is on
       (pi then reads your real key). Both options come from the file the pi
       mod writes, never from the command line.
@@ -117,7 +123,7 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       follow-up, or with --steer delivered before pi's next model call.
       --format findings asks pi for a fenced JSON array of objects with file,
       line, severity, confidence and title, which wait then checks.
-  run <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL] [--format findings]
+  run <name> [--model PROVIDER/ID] [--cwd DIR] [--thinking LEVEL] [--format findings]
       [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
       serve, send and wait in one call, run in the background: starts the
       session under serve's checks, sends the prompt, prints the reply as wait
@@ -137,6 +143,8 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
   read <name> [--last | --tail N | --since LINE]
       Print the transcript (default: last 40 lines), or the last reply.
   status [name] [--json]
+  models           List the model ids serve and run would allow: pi's
+                   --list-models, kept to what passes the gate.
   abort <name>     Stop pi's current run; the session stays.
   stop <name>      End the session; serve it again later to continue.
   forget <name> [--purge]
@@ -434,43 +442,51 @@ const readAuth = () => {
 // host with no login in auth.json. Either way every provider models.json
 // defines must be on a trusted host, so no other service's key sits there.
 // Reads only names, types and base URLs, never a key or a token.
-function gate(model, extra, trustedList, optionsWhy = null) {
+function gate(model, extra, trustedList, optionsWhy = null, fromDefault = false) {
   if (extra.length) fail(`extra pi arguments (${extra.join(' ')}) are off. ${GATE_NOTE}`)
+  const why = modelRefusal(model, trustedList, optionsWhy)
+  if (why && fromDefault) fail(`pi's default model ${model} (${SETTINGS}) is not allowed: ${why} Pass --model.`)
+  if (why) fail(why)
+}
+
+// Why the gate refuses this model, or null when it may run.
+function modelRefusal(model, trustedList, optionsWhy = null) {
   const entries = (trustedList ?? '').split(',').filter(Boolean).map(parseHostEntry)
-  if (entries.some(e => !e)) fail(`the trusted hosts hold an entry that is not a host, host:port or host:*. ${GATE_NOTE}`)
+  if (entries.some(e => !e)) return `the trusted hosts hold an entry that is not a host, host:port or host:*. ${GATE_NOTE}`
   // Why no host is trusted, when the options file didn't count.
   const NOTE = optionsWhy ? `${GATE_NOTE} Your trusted hosts count as none: ${optionsWhy}.` : GATE_NOTE
-  if (!model) fail(`name the model: --model ${PROVIDER}/<id>, or <provider>/<id> for a provider at a trusted host. ${GATE_NOTE}`)
+  if (!model) return `name the model: --model ${PROVIDER}/<id>, or <provider>/<id> for a provider at a trusted host. ${GATE_NOTE}`
   const provider = model.split('/')[0]
   let models = {}
   try {
     models = JSON.parse(fs.readFileSync(MODELS, 'utf8'))
   } catch (err) {
-    if (err.code !== 'ENOENT') fail(`could not read ${MODELS} (${err.code ?? 'not JSON'}). ${GATE_NOTE}`)
+    if (err.code !== 'ENOENT') return `could not read ${MODELS} (${err.code ?? 'not JSON'}). ${GATE_NOTE}`
   }
   const providers = models && typeof models.providers === 'object' && models.providers ? models.providers : {}
   const untrusted = Object.entries(providers)
     .filter(([, p]) => !(p && typeof p.baseUrl === 'string' && trustedUrl(p.baseUrl, entries)))
     .map(([n]) => n)
   if (untrusted.length)
-    fail(`${MODELS} defines ${untrusted.join(', ')} with no base URL at a trusted host. pi-session runs pi only while every provider there is at a host you trust, so no other service's key is within reach. ${NOTE}`)
+    return `${MODELS} defines ${untrusted.join(', ')} with no base URL at a trusted host. pi-session runs pi only while every provider there is at a host you trust, so no other service's key is within reach. ${NOTE}`
   if (provider !== PROVIDER) {
-    if (!entries.length) fail(`${model} is not an ${PROVIDER} model. ${NOTE}`)
-    if (!providers[provider]) fail(`${provider} is not defined in ${MODELS}, at a trusted host. ${GATE_NOTE}`)
+    if (!entries.length) return `${model} is not an ${PROVIDER} model. ${NOTE}`
+    if (!providers[provider]) return `${provider} is not defined in ${MODELS}, at a trusted host. ${GATE_NOTE}`
     const auth = readAuth()
-    if (auth === null) fail(`${AUTH} does not parse. ${GATE_NOTE}`)
+    if (auth === null) return `${AUTH} does not parse. ${GATE_NOTE}`
     const logins = Object.keys(auth)
     if (logins.length)
-      fail(`${AUTH} holds ${logins.join(', ')}. A model at a trusted host runs only while auth.json holds no login, so no other provider's credentials are within reach. ${GATE_NOTE}`)
-    return
+      return `${AUTH} holds ${logins.join(', ')}. A model at a trusted host runs only while auth.json holds no login, so no other provider's credentials are within reach. ${GATE_NOTE}`
+    return null
   }
   const auth = readAuth()
-  if (auth === null) fail(`could not read ${AUTH} (not JSON). Log in to ${PROVIDER} in pi with an API key first. ${GATE_NOTE}`)
+  if (auth === null) return `could not read ${AUTH} (not JSON). Log in to ${PROVIDER} in pi with an API key first. ${GATE_NOTE}`
   const entry = auth && typeof auth === 'object' ? auth[PROVIDER] : null
-  if (!entry || entry.type !== 'api_key') fail(`${AUTH} has no ${PROVIDER} API key${entry?.type ? ` (its login is ${entry.type})` : ''}. ${GATE_NOTE}`)
+  if (!entry || entry.type !== 'api_key') return `${AUTH} has no ${PROVIDER} API key${entry?.type ? ` (its login is ${entry.type})` : ''}. ${GATE_NOTE}`
   const others = Object.keys(auth).filter(n => n !== PROVIDER)
   if (others.length)
-    fail(`${AUTH} also holds ${others.join(', ')}. pi-session runs pi only while the ${PROVIDER} API key is the only login there, so no other provider's credentials are within reach. Log out of the others in pi first. ${GATE_NOTE}`)
+    return `${AUTH} also holds ${others.join(', ')}. pi-session runs pi only while the ${PROVIDER} API key is the only login there, so no other provider's credentials are within reach. Log out of the others in pi first. ${GATE_NOTE}`
+  return null
 }
 
 // The person's options from the pi mod's file, or both off (with why) when it
@@ -497,6 +513,50 @@ const readOptions = () => {
   return { allowUnsandboxed: o.allowUnsandboxed, trustedHosts: hosts.join(','), why: null }
 }
 
+// pi's default model as provider/id, from its settings, or null when they name none.
+const piDefaultModel = () => {
+  const s = readJson(SETTINGS, null)
+  const { defaultProvider: p, defaultModel: m } = s && typeof s === 'object' ? s : {}
+  return typeof p === 'string' && p.trim() && typeof m === 'string' && m.trim() ? `${p.trim()}/${m.trim()}` : null
+}
+
+// A .mjs stand-in (the tests' fake pi) runs through node: no exec bit needed.
+const piBin = () => (/\.m?js$/.test(PI) ? [process.execPath, [PI]] : [PI, []])
+
+// The provider/id pairs in `pi --list-models` output: a header row starting
+// provider, model, then one row per model, columns padded with spaces.
+const parseModelList = text => {
+  const lines = text.replace(/\x1b\[[0-9;]*m/g, '').split(/\r?\n/)
+  const head = lines.findIndex(l => /^provider\s+model(\s|$)/.test(l.trim()))
+  if (head < 0) return null
+  return lines
+    .slice(head + 1)
+    .map(l => l.trim().split(/\s+/))
+    .filter(t => t.length >= 2 && t[0] && t[1])
+    .map(([p, id]) => `${p}/${id}`)
+}
+
+// The ids serve and run would take: pi's own list, kept to what passes the gate.
+function models(more) {
+  if (more.length) fail(`models takes no arguments, not ${more.join(' ')}.`)
+  const options = readOptions()
+  needSandbox(options)
+  const [bin, pre] = piBin()
+  const got = spawnSync(bin, [...pre, '--list-models'], { encoding: 'utf8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] })
+  if (got.error) fail(`could not run pi --list-models (${got.error.message}).`)
+  const all = parseModelList(got.stdout ?? '')
+  if (got.status !== 0 || !all) {
+    const said = oneLine(`${got.stdout ?? ''} ${got.stderr ?? ''}`.trim(), 200)
+    fail(`pi --list-models gave no model list${said ? `: ${said}` : ''}.`)
+  }
+  const allowed = all.filter(m => !modelRefusal(m, options.trustedHosts, options.why))
+  if (!allowed.length) {
+    if (!all.length) fail(`pi lists no models. ${GATE_NOTE}`)
+    fail(`none of pi's ${all.length} models is allowed. ${all[0]}: ${modelRefusal(all[0], options.trustedHosts, options.why)}`)
+  }
+  process.stdout.write(`${allowed.join('\n')}\n`)
+}
+
 const needSandbox = options => {
   if (!SANDBOXED && !options.allowUnsandboxed)
     fail(`not inside Claude Code's Bash sandbox, so pi would read your real provider key. Run it from Claude's Bash tool with the sandbox on${options.why ? `. Your option allowUnsandboxed counts as off: ${options.why}` : ''}.`)
@@ -512,9 +572,10 @@ async function serve(name, flags, extra, first = null) {
   if (isLive(before)) fail(`${name} is already running.`)
   const meta = readJson(file(name, 'meta.json'), {})
   const cwd = path.resolve(flags.cwd ?? meta.cwd ?? process.cwd())
-  const model = flags.model ?? meta.model
+  const named = flags.model ?? meta.model
+  const model = named ?? piDefaultModel()
   const thinking = flags.thinking ?? meta.thinking
-  gate(model, extra, options.trustedHosts, options.why)
+  gate(model, extra, options.trustedHosts, options.why, !named && !!model)
   // pi's own session id: reopened when the session is served again, and new
   // for a new session, so a name used again after forget starts afresh.
   const sessionId = meta.sessionId ?? `claude-${name}-${Date.now().toString(36)}`
@@ -572,8 +633,7 @@ async function serve(name, flags, extra, first = null) {
   const log = text => transcript.write(`${text}\n`)
   log(`\n# served ${new Date().toISOString()} · ${cwd}${model ? ` · ${model}` : ''}${SANDBOXED ? '' : ' · UNSANDBOXED: pi holds the real key'}`)
 
-  // A .mjs stand-in (the tests' fake pi) runs through node: no exec bit needed.
-  const [bin, pre] = /\.m?js$/.test(PI) ? [process.execPath, [PI]] : [PI, []]
+  const [bin, pre] = piBin()
   const pi = spawn(bin, [...pre, ...args], { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
   const stderr = fs.createWriteStream(file(name, 'stderr.log'), { flags: 'a' })
   pi.stderr.pipe(stderr)
@@ -1086,6 +1146,9 @@ switch (cmd) {
     break
   case 'forget':
     await forget(needName(rest[0]), flags, rest.slice(1))
+    break
+  case 'models':
+    models([...rest, ...extra])
     break
   default:
     process.stdout.write(`${USAGE}\n`)

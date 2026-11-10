@@ -322,6 +322,8 @@ test("Claude's instructions cover run, and status over old task output after a r
   expect(text).toMatch(/add `--out FILE` to write it to a file/)
   expect(text).toMatch(/`send <name> --format findings "<prompt>"`.*exits 4/)
   expect(text).not.toMatch(/--purge/)
+  expect(text).toMatch(/`--model` may be left out when pi's own default model .* passes the gate/)
+  expect(text).toMatch(/`models` lists the model ids the gate allows/)
 })
 
 test('without the sandbox the check says so once, not the mask and TLS lines that only act inside it', () => {

@@ -95,15 +95,18 @@ Without the sandbox (with `allowUnsandboxed` on), Claude could read `models.json
 ## pi-session
 
 ```
-pi-session serve <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL]
-pi-session run <name> --model PROVIDER/ID [--cwd DIR] [--thinking LEVEL] [--format findings] [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
+pi-session serve <name> [--model PROVIDER/ID] [--cwd DIR] [--thinking LEVEL]
+pi-session run <name> [--model PROVIDER/ID] [--cwd DIR] [--thinking LEVEL] [--format findings] [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
 pi-session send <name> [--steer] [--format findings] <prompt...> | --file FILE | -
 pi-session wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]   # exit 2: timed out (--abort stops the run); 4: bad findings
 pi-session read <name> [--last | --tail N | --since LINE]
 pi-session status [name] [--json]
+pi-session models   # the model ids the gate allows, from pi's own --list-models
 pi-session abort | stop <name>
 pi-session forget <name> [--purge]   # --purge also deletes pi's copy of the conversation, for good
 ```
+
+Without `--model`, `serve` and `run` take the session's last model, else pi's default: `defaultProvider` and `defaultModel` in `~/.pi/agent/settings.json`. It goes through the same gate as a named model, and pi gets it as `--model`, so a project's `.pi/settings.json` can't swap it. A default the gate refuses is refused with the reason, never replaced by another model: pass `--model`.
 
 Each session keeps `status.json`, `transcript.md`, `last-reply.md`, `events.jsonl` (pi's raw event stream) and `stderr.log` in `~/.pi/agent/claude-sessions/<name>/` (`PI_SESSIONS_DIR` overrides it). pi keeps its own copy of the conversation under `~/.pi/agent/sessions/`, as session `claude-<name>-<id>`. Serving a session again reopens that conversation; `forget` deletes the session's folder and leaves pi's copy alone, and the same name then starts a new conversation. Prompts too long for one pipe write go through the session's `inbox/` folder.
 
