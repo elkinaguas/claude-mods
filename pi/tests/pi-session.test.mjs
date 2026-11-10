@@ -584,6 +584,41 @@ test('run: what is wrong with the call fails before pi starts', async () => {
   cli('forget', 'taken')
 })
 
+// A cap that is not a positive number of seconds would never fire, so wait and run could hang.
+const BAD_TIMEOUTS = [['5m', /--timeout takes a positive number of seconds, not '5m'\./], ['0', /not '0'/], ['-3', /not '-3'/], ['', /not ''/]]
+
+test('wait refuses a --timeout that is not a positive number of seconds', () => {
+  for (const [value, re] of BAD_TIMEOUTS) {
+    const bad = cliFails('wait', 'alpha', '--timeout', value)
+    assert.equal(bad.code, 1)
+    assert.match(bad.out, re)
+  }
+  const missing = cliFails('wait', 'alpha', '--timeout')
+  assert.equal(missing.code, 1)
+  assert.match(missing.out, /--timeout takes a positive number of seconds\.\n/)
+  // Refused before the session is looked at.
+  assert.match(cliFails('wait', 'no-such-session', '--timeout', '5m').out, /not '5m'/)
+  const id = cli('send', 'alpha', 'decimal cap').trim()
+  assert.equal(cli('wait', 'alpha', id, '--timeout', '1.5'), 'echo: decimal cap\n')
+})
+
+test('run refuses a --timeout that is not a positive number of seconds, before pi starts', async () => {
+  for (const [value, re] of BAD_TIMEOUTS) {
+    const run = await runOnce(['capped', ...AT, '--timeout', value, 'hi'])
+    assert.equal(run.code, 1)
+    assert.match(run.err, re)
+    noSession('capped')
+  }
+  const missing = await runOnce(['capped', ...AT, 'hi', '--timeout'])
+  assert.equal(missing.code, 1)
+  assert.match(missing.err, /--timeout takes a positive number of seconds\.\n/)
+  noSession('capped')
+  const run = await runOnce(['capped', ...AT, '--timeout', '5', 'hi'])
+  assert.equal(run.code, 0, run.err)
+  assert.equal(run.out, 'echo: hi\n')
+  cli('forget', 'capped')
+})
+
 test('run is held to the sandbox check, with the same way past it as serve: the option', async () => {
   const bare = await runOnce(['bare-run', ...AT, 'hi'], bareEnv)
   assert.equal(bare.code, 1)

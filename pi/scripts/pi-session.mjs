@@ -859,7 +859,17 @@ const notItsReply = (st, seq) => {
   return null
 }
 
-async function wait(name, id, flags, { outChecked = false, deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity } = {}) {
+// When a capped wait or run gives up. A cap that isn't a positive number of
+// seconds would never fire, so it is refused before anything starts.
+const deadlineFrom = flags => {
+  if (!('timeout' in flags)) return Infinity
+  const t = flags.timeout
+  if (!/^(\d+\.?\d*|\.\d+)$/.test(t ?? '') || !(Number(t) > 0))
+    fail(`--timeout takes a positive number of seconds${t == null ? '' : `, not '${t}'`}.`)
+  return Date.now() + Number(t) * 1000
+}
+
+async function wait(name, id, flags, { outChecked = false, deadline = deadlineFrom(flags) } = {}) {
   if (id?.startsWith('--')) fail(`wait does not take ${id}.`)
   if (!outChecked) needOut(flags)
   for (;;) {
@@ -920,7 +930,7 @@ async function run(name, flags, rest, extra) {
   needOut(flags)
   if (flags.file && !fs.statSync(flags.file, { throwIfNoEntry: false })?.isFile()) fail(`--file ${flags.file} is not a file.`)
   const cmd = promptCommand(flags, rest)
-  const deadline = flags.timeout ? Date.now() + Number(flags.timeout) * 1000 : Infinity
+  const deadline = deadlineFrom(flags)
   const session = await serve(name, flags, extra, cmd)
   holdingPi = true
   let code = 0
