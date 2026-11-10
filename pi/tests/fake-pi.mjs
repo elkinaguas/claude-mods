@@ -6,6 +6,22 @@
 // that text as its reply. "nag" asks again each time it hears no; "nag=<n>" asks n times, then replies. Enough of pi's protocol to test pi-session.
 
 const out = r => process.stdout.write(`${JSON.stringify(r)}\n`)
+// --list-models: a table laid out as pi's own (columns padded to the widest
+// cell, two spaces apart, sorted by provider then id), then exit.
+if (process.argv.includes('--list-models')) {
+  const rows = [
+    ['provider', 'model', 'context', 'max-out', 'thinking', 'images'],
+    ['anthropic', 'claude-sonnet-4-5', '200K', '64K', 'yes', 'yes'],
+    ['corp', 'm', '128K', '16K', 'no', 'no'],
+    ['opencode-go', 'glm-5', '200K', '128K', 'yes', 'no'],
+    ['opencode-go', 'kimi-k2.5', '256K', '64K', 'yes', 'yes'],
+  ]
+  const widths = rows[0].map((_, i) => Math.max(...rows.map(r => r[i].length)))
+  for (const r of rows) process.stdout.write(`${r.map((c, i) => c.padEnd(widths[i])).join('  ')}\n`)
+  process.exit(0)
+}
+// What serve passed, for the tests to check (stderr goes to the session's stderr.log).
+process.stderr.write(`fake-pi args: ${process.argv.slice(2).join(' ')}\n`)
 let busy = false
 let pendingDialog = null
 let slow = null
