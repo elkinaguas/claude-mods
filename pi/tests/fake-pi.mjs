@@ -4,7 +4,7 @@
 // the prompt says "ask", refuses a prompt that says "reject", and works for
 // ten minutes (until aborted) on one that says "slow" ("stream": after
 // streaming part of a reply). Replies stream in as message_update deltas. One holding reply=<url-encoded text> gets
-// that text as its reply. "nag" asks again each time it hears no; "nag=<n>" asks n times, then replies. Enough of pi's protocol to test pi-session.
+// that text as its reply, one holding lines=<n> a reply of n lines. "nag" asks again each time it hears no; "nag=<n>" asks n times, then replies. Enough of pi's protocol to test pi-session.
 
 const out = r => process.stdout.write(`${JSON.stringify(r)}\n`)
 // What the read tool "gives back": file contents, which the live tail must never show.
@@ -81,7 +81,15 @@ const run = msg => {
 }
 const finish = (msg, extra = '') => {
   const scripted = /\breply=(\S+)/.exec(msg)
-  const text = scripted ? decodeURIComponent(scripted[1]) : `echo: ${msg}${extra}`
+  // "lines=<n>[:<w>[!]]": a reply of n lines `row <i>`, each padded with w
+  // three-byte €s (with !, lone surrogates, six bytes each once in JSON).
+  const rows = /\blines=(\d+)(?::(\d+)(!?))?/.exec(msg)
+  const pad = rows?.[2] ? ` ${(rows[3] ? '\ud800' : '€').repeat(Number(rows[2]))}` : ''
+  const text = scripted
+    ? decodeURIComponent(scripted[1])
+    : rows
+      ? Array.from({ length: Number(rows[1]) }, (_, i) => `row ${i}${pad}`).join('\n')
+      : `echo: ${msg}${extra}`
   const message = { role: 'assistant', content: [{ type: 'text', text }] }
   // pi's Usage shape (packages/ai). "nousage": a provider that reports none; "free": no prices for the model.
   if (!/\bnousage\b/.test(msg)) {

@@ -73,8 +73,13 @@ const BAD_FINDINGS = 4
 // The live tail (read --live, the panel's Live view): pi's last lines of tool
 // calls and reply text, the one streaming now included, never what a tool gave
 // back. Rewritten at most every LIVE_WRITE_MS, however fast pi's deltas come.
-const LIVE_LINES = 20
+// live.json keeps the last LIVE_LINES (the panel scrolls back through them)
+// and stays under LIVE_MAX_BYTES, the most the panel reads; read --live prints
+// the last LIVE_SHOWN.
+const LIVE_LINES = 200
+const LIVE_SHOWN = 20
 const LIVE_WIDTH = 400
+const LIVE_MAX_BYTES = 256 * 1024
 const LIVE_WRITE_MS = 300
 const SEVERITIES = ['critical', 'high', 'medium', 'low']
 const CONFIDENCES = ['high', 'medium', 'low']
@@ -146,10 +151,11 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       A findings reply comes as the JSON array alone. Exit 4 if it fails the
       check, or its run was aborted, wrote no reply, or settled along with a
       later prompt: the error is reported, nothing is written, read --last has it.
-  read <name> [--last | --live | --tail N | --since LINE]
+  read <name> [--last | --live [--tail N] | --tail N | --since LINE]
       Print the transcript (default: last 40 lines), or the last reply.
-      --live prints the last 20 lines of tool calls and reply text, the reply
-      pi is writing now included, and never what a tool gave back.
+      --live prints the last 20 lines of tool calls and reply text (--tail N:
+      up to 200), the reply pi is writing now included, and never what a tool
+      gave back.
   status [name] [--json]
   models           List the model ids serve and run would allow: pi's
                    --list-models, kept to what passes the gate.
@@ -782,21 +788,41 @@ async function serve(name, flags, extra, first = null) {
   let unreported = 0
   let lastDeltaSave = 0
   // The live tail: finished lines, and the reply pi is streaming now.
+  // `dropped` counts the finished lines let go from its front, so every line
+  // keeps its number and the panel holds its place as lines come and go.
   const tail = []
+  let dropped = 0
   let streaming = ''
   let liveAt = 0
   let liveTimer = null
   let liveWritten = ''
+  const trimTail = () => {
+    const k = Math.max(0, tail.length - LIVE_LINES)
+    tail.splice(0, k)
+    dropped += k
+  }
   const writeLive = () => {
     clearTimeout(liveTimer)
     liveTimer = null
     liveAt = Date.now()
-    const lines = [...tail, ...liveLines(streaming)].slice(-LIVE_LINES)
+    const all = [...tail, ...liveLines(streaming)]
+    // The last LIVE_LINES, fewer when they would pass the panel's limit (each
+    // line as writeJson lays it out: its JSON, an indent, a comma, a newline).
+    let cut = all.length
+    for (let bytes = 1024; cut > 0 && all.length - cut < LIVE_LINES; cut--) {
+      bytes += Buffer.byteLength(JSON.stringify(all[cut - 1])) + 6
+      if (bytes > LIVE_MAX_BYTES) break
+    }
+    const lines = all.slice(cut)
+    // `first` is the number of lines[0]; its first `done` lines are finished,
+    // the rest is the reply streaming now.
+    const first = dropped + cut
+    const done = Math.max(0, tail.length - cut)
     // Thinking deltas, say, change nothing here: no write.
-    const key = JSON.stringify([!!streaming, lines])
+    const key = JSON.stringify([!!streaming, first, lines])
     if (key === liveWritten) return
     try {
-      writeJson(file(name, 'live.json'), { updatedAt: liveAt, streaming: !!streaming, lines })
+      writeJson(file(name, 'live.json'), { updatedAt: liveAt, streaming: !!streaming, first, done, lines })
       liveWritten = key
     } catch {
       // A view only: the next write tries again.
@@ -811,7 +837,7 @@ async function serve(name, flags, extra, first = null) {
   }
   const addLive = lines => {
     tail.push(...lines)
-    tail.splice(0, Math.max(0, tail.length - LIVE_LINES))
+    trimTail()
     live()
   }
   onLines(pi.stdout, line => {
@@ -930,7 +956,7 @@ async function serve(name, flags, extra, first = null) {
         // An aborted reply never gets its message_end: keep what had streamed.
         if (streaming) tail.push(...liveLines(streaming))
         streaming = ''
-        tail.splice(0, Math.max(0, tail.length - LIVE_LINES))
+        trimTail()
         writeLive()
         break
       case 'message_update':
@@ -1138,7 +1164,8 @@ function read(name, flags) {
   if (flags.live) {
     if (!fs.existsSync(dir(name))) fail(`no session ${name}.`)
     const lv = readJson(file(name, 'live.json'), null)
-    const lines = Array.isArray(lv?.lines) ? lv.lines.filter(l => typeof l === 'string').slice(-LIVE_LINES) : []
+    const n = Math.min(LIVE_LINES, Math.max(1, Math.floor(Number(flags.tail ?? LIVE_SHOWN)) || LIVE_SHOWN))
+    const lines = Array.isArray(lv?.lines) ? lv.lines.filter(l => typeof l === 'string').slice(-n) : []
     return process.stdout.write(lines.length ? `${lines.join('\n')}\n` : '(nothing yet)\n')
   }
   if (flags.last) {

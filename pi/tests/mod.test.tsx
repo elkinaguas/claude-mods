@@ -10,7 +10,9 @@ import {
   sandboxEscapes,
   sandboxSetting,
   settingsProblems,
+  keepPlace,
   liveRows,
+  liveWindow,
   optionsText,
   usageLine,
   writesOptions,
@@ -658,12 +660,141 @@ test('a live.json that is a link shows nothing', async ($, on) => {
   await ui.unmount()
 })
 
-test('live rows: tool calls cut to the width, reply text wrapped at spaces, control characters gone, the last 20', () => {
+test('live rows: tool calls cut to the width, reply text wrapped at spaces, control characters gone, a long line its end', () => {
   expect(liveRows(['→ read a.ts', 'one two three four'], 10)).toEqual(['→ read a.ts'.slice(0, 9) + '…', 'one two', 'three four'])
   expect(liveRows(['abcdefghijklmnop'], 10)).toEqual(['abcdefghij', 'klmnop'])
   expect(liveRows(['red \u001b[31mtext'], 40)).toEqual(['red  [31mtext'])
   const many = Array.from({ length: 30 }, (_, i) => `line ${i}`)
-  expect(liveRows(many, 40)).toEqual(many.slice(-20))
+  expect(liveRows(many, 40)).toEqual(many)
+  // One line takes at most a view's 20 rows, from its end.
+  const huge = liveRows(['x'.repeat(5000)], 10)
+  expect(huge.length).toBe(20)
+})
+
+const numbered = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => `line ${from + i}`)
+
+test('the live window shows 20 rows, offset rows up from the end, with what is above and below', () => {
+  const rows = numbered(0, 50)
+  expect(liveWindow(rows, 0)).toEqual({ rows: numbered(30, 50), older: 30, newer: 0, offset: 0, max: 30 })
+  expect(liveWindow(rows, 5)).toEqual({ rows: numbered(25, 45), older: 25, newer: 5, offset: 5, max: 30 })
+  // Clamped to the top; a tail that fits never scrolls.
+  expect(liveWindow(rows, 99)).toMatchObject({ rows: numbered(0, 20), older: 0, newer: 30, offset: 30 })
+  expect(liveWindow(numbered(0, 5), 3)).toEqual({ rows: numbered(0, 5), older: 0, newer: 0, offset: 0, max: 0 })
+})
+
+test('a scrolled-up view keeps its place as lines come, also once old ones drop off the front', () => {
+  const cur = { lines: numbered(0, 50), first: 0, done: 50, offset: 4 }
+  // Three more lines: three rows more from the end.
+  expect(keepPlace(cur, { lines: numbered(0, 53), first: 0, done: 53 }, 60)).toBe(7)
+  // At the 200-line cap the front drops as lines come: still three.
+  const full = { lines: numbered(100, 300), first: 100, done: 200, offset: 4 }
+  expect(keepPlace(full, { lines: numbered(103, 303), first: 103, done: 200 }, 60)).toBe(7)
+  // The reply streaming now grows a line, then finishes as two lines.
+  const streaming = { lines: [...numbered(0, 30), 'partial'], first: 0, done: 30, offset: 2 }
+  expect(keepPlace(streaming, { lines: [...numbered(0, 30), 'partial', 'more'], first: 0, done: 30 }, 60)).toBe(3)
+  expect(keepPlace(streaming, { lines: [...numbered(0, 30), 'partial', 'more'], first: 0, done: 32 }, 60)).toBe(3)
+  // Following the end stays following; a new serve (numbered afresh) goes back to the end.
+  expect(keepPlace({ ...cur, offset: 0 }, { lines: numbered(0, 53), first: 0, done: 53 }, 60)).toBe(0)
+  expect(keepPlace(full, { lines: numbered(0, 30), first: 0, done: 30 }, 60)).toBe(0)
+  // Held to the top of what is kept.
+  expect(keepPlace({ ...full, offset: 179 }, { lines: numbered(150, 350), first: 150, done: 200 }, 60)).toBe(180)
+})
+
+const liveFile = (lines: string[], first = 0, done = lines.length) => JSON.stringify({ updatedAt: T0, streaming: done < lines.length, first, done, lines })
+const shownRows = async (ui: any) => (await texts(ui)).filter(t => /^line \d+$/.test(t))
+const scrollEvent = (by: number, contentRows: number, bodyRows: number, extra: object = {}) =>
+  ({ component: 'Pane', requestId: 'pi', offset: 0, by, bodyRows, contentRows, origin: { kind: 'person' }, ...extra }) as never
+
+test('scrolled up, the Live view pauses: new lines leave the rows shown alone until ↓ newer goes back to the end', async ($, on) => {
+  const session = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
+  const files = { 'live.json': liveFile(numbered(0, 50)) }
+  const { clock, tick } = await pollingPane($, on, session, T0, files)
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await pressLive(ui)
+  // Following: the last 20, with how many are above, and nothing below.
+  expect(await shownRows(ui)).toEqual(numbered(30, 50))
+  expect(await ui.find({ type: 'Text', text: '↑ 30 older' })).toBeDefined()
+  expect(await ui.find({ key: 'live-end' })).toBeUndefined()
+  expect(await ui.find({ key: 'live-down' })).toBeUndefined()
+  // k (▲) goes up a row and pauses.
+  await ui.press({ key: 'live-up' })
+  expect(await shownRows(ui)).toEqual(numbered(29, 49))
+  expect((await ui.find({ key: 'live-end' }))?.props.label).toBe('↓ 1 newer')
+  expect(await ui.find({ type: 'Text', text: /^live · .* · paused$/ })).toBeDefined()
+  // Lines come, older ones go: the same rows stay on screen.
+  files['live.json'] = liveFile(numbered(5, 58), 5)
+  await tick()
+  expect(await shownRows(ui)).toEqual(numbered(29, 49))
+  expect((await ui.find({ key: 'live-end' }))?.props.label).toBe('↓ 9 newer')
+  expect(await ui.find({ type: 'Text', text: '↑ 24 older' })).toBeDefined()
+  // j (▼) comes down a row; ↓ newer back to the end, which it follows again.
+  await ui.press({ key: 'live-down' })
+  expect(await shownRows(ui)).toEqual(numbered(30, 50))
+  await ui.press({ key: 'live-end' })
+  expect(await shownRows(ui)).toEqual(numbered(38, 58))
+  expect(await ui.find({ key: 'live-end' })).toBeUndefined()
+  files['live.json'] = liveFile(numbered(5, 60), 5)
+  await tick()
+  expect(await shownRows(ui)).toEqual(numbered(40, 60))
+  // Closed and opened again, it starts at the end.
+  await ui.press({ key: 'live-up' })
+  await pressLive(ui)
+  await pressLive(ui)
+  expect(await shownRows(ui)).toEqual(numbered(40, 60))
+  await ui.unmount()
+})
+
+test('the wheel over the Live view scrolls it, elsewhere the pane; scroll keys move it by rows, pages and to its ends', async ($, on) => {
+  const session = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
+  const files = { 'live.json': liveFile(numbered(0, 100)) }
+  // The engine beneath: what reaches it moves the pane.
+  const pane: number[] = []
+  on('ui.scroll', (_: unknown, e: { by: number }) => {
+    pane.push(e.by)
+    return {}
+  })
+  const { clock } = await pollingPane($, on, session, T0, files)
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // Closed, every move is the pane's.
+  expect(await $.ui.scroll(scrollEvent(-1, 40, 30, { pointer: { column: 2, row: 38 } }))).toEqual({})
+  expect(pane).toEqual([-1])
+  await pressLive(ui)
+  expect(await shownRows(ui)).toEqual(numbered(80, 100))
+  // The view is the tree's last rows: its bar, ↑ older, its 20 rows (and ↓ newer once scrolled), the last 22 of 40 here.
+  const over = { pointer: { column: 2, row: 30 } }
+  await $.ui.scroll(scrollEvent(-3, 40, 50, over))
+  expect(await shownRows(ui)).toEqual(numbered(77, 97))
+  // Over the tiles above it, the pane moves.
+  await $.ui.scroll(scrollEvent(-1, 41, 50, { pointer: { column: 2, row: 3 } }))
+  expect(await shownRows(ui)).toEqual(numbered(77, 97))
+  expect(pane).toEqual([-1, -1])
+  // Down over it comes back toward the end; at the end the pane moves.
+  await $.ui.scroll(scrollEvent(2, 41, 50, { pointer: { column: 2, row: 30 } }))
+  expect(await shownRows(ui)).toEqual(numbered(79, 99))
+  await $.ui.scroll(scrollEvent(1, 41, 50, { pointer: { column: 2, row: 30 } }))
+  await $.ui.scroll(scrollEvent(1, 40, 50, { pointer: { column: 2, row: 30 } }))
+  expect(await shownRows(ui)).toEqual(numbered(80, 100))
+  expect(pane).toEqual([-1, -1, 1])
+  // Keys (no pointer): an arrow a row, a page key 20 rows, Home the top, End the end.
+  await $.ui.scroll(scrollEvent(-1, 40, 50))
+  expect(await shownRows(ui)).toEqual(numbered(79, 99))
+  await $.ui.scroll(scrollEvent(-50, 41, 50))
+  expect(await shownRows(ui)).toEqual(numbered(59, 79))
+  await $.ui.scroll(scrollEvent(-41, 41, 50))
+  expect(await shownRows(ui)).toEqual(numbered(0, 20))
+  expect(await ui.find({ type: 'Text', text: /older$/ })).toBeUndefined()
+  // At the top, up again is the pane's.
+  await $.ui.scroll(scrollEvent(-1, 40, 50))
+  expect(pane).toEqual([-1, -1, 1, -1])
+  await $.ui.scroll(scrollEvent(40, 40, 50))
+  expect(await shownRows(ui)).toEqual(numbered(80, 100))
+  // Scrolled away above the view, the keys move the pane (the tree is 100 rows, 30 shown from the top).
+  await $.ui.scroll(scrollEvent(1, 100, 30, { offset: 1 }))
+  expect(pane).toEqual([-1, -1, 1, -1, 1])
+  expect(await shownRows(ui)).toEqual(numbered(80, 100))
+  await ui.unmount()
 })
 
 test('/pi check reports settings that do not parse instead of failing', async ($, on) => {
