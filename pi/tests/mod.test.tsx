@@ -181,6 +181,51 @@ test('Bash: other spellings of the key file, SANDBOX_RUNTIME and excluded comman
   expect(bashRefusal('PI_SESSION_PI=/bin/sh node /x/pi-session.mjs serve x', on)).toMatch(/PI_SESSION_PI is for the mod/)
 })
 
+test('Bash: a heredoc fed to cat or tee is data, one a shell or interpreter could run is checked', () => {
+  const on = { unsandboxed: false, allowUnsandboxed: false }
+  const off = { unsandboxed: true, allowUnsandboxed: false }
+  const body = 'Models:\npi --list-models\npi auth print anthropic\n'
+  // Written to a file, or printed: <<WORD, <<'WORD', <<"WORD", <<-WORD, several in one command.
+  for (const c of [
+    `cat > notes.md <<'EOF'\n${body}EOF`,
+    `cat <<"EOF" > notes.md\n${body}EOF`,
+    `cat > notes.md <<EOF\n${body}EOF\necho done`,
+    `tee -a notes.md <<-EOF\n\tpi --mode rpc\n\tEOF`,
+    `cat <<\\EOF\n${body}EOF`,
+    `cat > one.md <<'A' && cat > two.md <<'B'\n${body}A\n${body}B\n`,
+    `mkdir -p docs\ncat > docs/one.md <<'A'\n${body}A\ncat >> docs/two.md <<'B' 2>/dev/null\n${body}B`,
+  ])
+    expect(bashRefusal(c, on)).toBe(null)
+  expect(bashRefusal(`cat > notes.md <<'EOF'\nsee ~/.pi/agent\nEOF`, off)).toBe(null)
+  // Run as shell commands, or by an interpreter that could start pi itself.
+  for (const c of [
+    `bash <<'EOF'\n${body}EOF`,
+    `sh -s <<EOF\n${body}EOF`,
+    `cat <<'EOF' | bash\n${body}EOF`,
+    `{ cat <<'EOF'\n${body}EOF\n} | sh`,
+    `cat > run.sh <<'EOF'\n${body}EOF\nbash run.sh`,
+    `cat > run.sh <<'EOF'\n${body}EOF\nchmod +x run.sh && ./run.sh`,
+    `cat > /tmp/d/run <<'EOF'\n${body}EOF\n/tmp/d/*`,
+    `$(cat <<'EOF'\n${body}EOF\n)`,
+    `eval "$(cat <<'EOF'\n${body}EOF\n)"`,
+    `source /dev/stdin <<'EOF'\n${body}EOF`,
+    `cat() { bash; }; cat <<'EOF'\n${body}EOF`,
+    `cat <<'EOF' > >(bash)\n${body}EOF`,
+    `python3 <<'EOF'\nimport os; os.system("pi auth print anthropic")\nEOF`,
+    `python3 - <<'EOF'\nnew = """\npi --list-models\n"""\nEOF`,
+    // An unquoted delimiter runs $( ) in the body.
+    `cat > notes.md <<EOF\n$(pi auth print anthropic)\nEOF`,
+    // Unterminated: bash reads to the end, so everything stays checked.
+    `cat > notes.md <<'EOF'\n${body}`,
+    // Not a heredoc: a comment, or a line after the heredoc.
+    `cat # <<'EOF'\n${body}EOF`,
+    `cat > notes.md <<'EOF'\nhi\nEOF\npi auth print anthropic`,
+  ])
+    expect(bashRefusal(c, on)).toMatch(/run pi only through pi-session/)
+  // The refusal says what matched, and what to use instead.
+  expect(bashRefusal('ls && pi --list-models', on)).toMatch(/read as running pi at: pi --list-models\. If it only mentions pi in its text, use the Edit or Write tool/)
+})
+
 test('trusted model hosts: parsed from the option, valid entries only', () => {
   expect(parseTrustedHosts('llm.corp.example.com, *.corp.example.com:8443 localhost:* [::1]:8080 bad/host')).toEqual({
     valid: ['llm.corp.example.com', '*.corp.example.com:8443', 'localhost:*', '[::1]:8080'],
