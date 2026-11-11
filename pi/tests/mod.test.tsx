@@ -370,6 +370,7 @@ test("Claude's instructions cover run, and status over old task output after a r
   expect(text).toMatch(/After a restart, use `status <name>`.*Never go by the output of a task from before the restart/)
   expect(text).toMatch(/add `--out FILE` to write it to a file/)
   expect(text).toMatch(/`send <name> --format findings "<prompt>"`.*exits 4/)
+  expect(text).toMatch(/Cap review runs .*`--timeout 1800 --abort` \(30 minutes\); `run` has no default cap/)
   expect(text).not.toMatch(/--purge/)
   expect(text).toMatch(/`--model` may be left out when pi's own default model .* passes the gate/)
   expect(text).toMatch(/`models` lists the model ids the gate allows/)
