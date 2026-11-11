@@ -166,6 +166,171 @@ const AUTH_RE = /auth(\.json|[?*[{])|agent\/a[?*[{]|\.p[?*[{][^\s]*\/agent\/a/
 const OPTIONS_RE = /plugins\/data\/pi(\/|\s|$)|plugins\/data\/p[?*[{]/
 const flat = (command: string) => command.replace(/["'\\]/g, '')
 
+type Heredoc = { delim: string; quoted: boolean; op: number; bodyStart: number; end: number; body: string }
+
+/**
+ * The here-documents in a Bash command, in order, or null when one is left
+ * unterminated or the command can't be read (an unclosed quote, a delimiter
+ * with $ in it). Quotes and comments are skipped so `<<` in them is not one.
+ */
+const heredocs = (s: string): Heredoc[] | null => {
+  const found: Heredoc[] = []
+  let pending: { delim: string; quoted: boolean; dash: boolean; op: number }[] = []
+  // Past the closing quote that starts at s[from], with backslash escapes when `escapes`.
+  const close = (from: number, q: string, escapes: boolean): number => {
+    let j = from + 1
+    while (j < s.length && s[j] !== q) j += escapes && s[j] === '\\' ? 2 : 1
+    return j < s.length ? j + 1 : -1
+  }
+  let i = 0
+  let wordStart = true
+  while (i < s.length) {
+    const c = s[i]!
+    if (c === '\\') {
+      i += 2
+      wordStart = false
+      continue
+    }
+    if (c === "'" || c === '"' || (c === '$' && s[i + 1] === "'")) {
+      const j = c === '$' ? close(i + 1, "'", true) : close(i, c, c === '"')
+      if (j < 0) return null
+      i = j
+      wordStart = false
+      continue
+    }
+    if (c === '#' && wordStart) {
+      const j = s.indexOf('\n', i)
+      i = j < 0 ? s.length : j
+      continue
+    }
+    // A here-string (<<<) is a word on the line, not a heredoc.
+    if (s.startsWith('<<<', i)) {
+      i += 3
+      wordStart = true
+      continue
+    }
+    if (s.startsWith('<<', i)) {
+      let j = i + 2
+      const dash = s[j] === '-'
+      if (dash) j++
+      while (s[j] === ' ' || s[j] === '\t') j++
+      let delim = ''
+      let quoted = false
+      while (j < s.length && !/[\s;&|<>()]/.test(s[j]!)) {
+        const d = s[j]!
+        if (d === '$' || d === '`') return null
+        if (d === '\\') {
+          quoted = true
+          delim += s[j + 1] ?? ''
+          j += 2
+        } else if (d === "'" || d === '"') {
+          quoted = true
+          const k = s.indexOf(d, j + 1)
+          if (k < 0) return null
+          delim += s.slice(j + 1, k)
+          j = k + 1
+        } else {
+          delim += d
+          j++
+        }
+      }
+      if (!delim) return null
+      pending.push({ delim, quoted, dash, op: i })
+      i = j
+      wordStart = false
+      continue
+    }
+    if (c === '\n') {
+      i++
+      // The bodies follow the line, one after another, each up to its delimiter line.
+      for (const h of pending) {
+        const bodyStart = i
+        for (;;) {
+          const nl = s.indexOf('\n', i)
+          const line = s.slice(i, nl < 0 ? s.length : nl)
+          if ((h.dash ? line.replace(/^\t+/, '') : line) === h.delim) {
+            const end = nl < 0 ? s.length : nl + 1
+            found.push({ delim: h.delim, quoted: h.quoted, op: h.op, bodyStart, end, body: s.slice(bodyStart, i) })
+            i = end
+            break
+          }
+          // Bash would read to the end of input; keep checking all of it.
+          if (nl < 0) return null
+          i = nl + 1
+        }
+      }
+      pending = []
+      wordStart = true
+      continue
+    }
+    wordStart = /[\s;&|()<>]/.test(c)
+    i++
+  }
+  return pending.length ? null : found
+}
+
+// The first word of the simple command a heredoc operator at `op` belongs to.
+const commandWord = (s: string, op: number): string => {
+  const before = s.slice(0, op)
+  const start = Math.max(...[';', '&', '|', '\n', '(', ')', '{', '}', '`'].map(x => before.lastIndexOf(x))) + 1
+  return before.slice(start).trim().split(/\s+/)[0] ?? ''
+}
+
+// Commands that only copy their input and cannot run it. Not interpreters
+// (python3, node, perl...): their heredoc is a program that could start pi
+// (os.system), and the guard is there so pi runs only through pi-session.
+// Not sed or awk either (GNU sed's e command, awk's system()).
+const DATA_COMMANDS = new Set(['cat', 'tee'])
+// Anything that could run text, or a file the heredoc just wrote, in the same command.
+const RUNNERS =
+  /(^|[^\w.-])(bash|sh|zsh|dash|ksh|mksh|ash|csh|tcsh|fish|busybox|eval|source|exec|xargs|sudo|doas|su|ssh|env|nohup|timeout|watch|nice|ionice|chroot|unshare|nsenter|setsid|script|parallel|find|python[\d.]*|node|nodejs|deno|bun|perl|ruby|php|lua|tclsh|expect|osascript|g?awk|mawk|nawk|sed|make|npm|npx|yarn|pnpm|git|vim?|nvim|emacs|at|batch|crontab|systemd-run|docker|podman|tmux|screen|alias|function|hash|enable|trap|builtin)($|[^\w.-])/
+
+/** Whether the rest of a command, with the data heredocs' text taken out, could still run that text. */
+const mayRunData = (rest: string): boolean => {
+  // A pipe (cat <<EOF | bash), a command or process substitution ($(cat <<EOF), >(bash)).
+  if (/[|`]|\$\(|[<>]\(/.test(rest)) return true
+  const text = flat(rest)
+  // A runner, `. file`, a changed PATH, or a function or alias that could stand in for cat.
+  if (RUNNERS.test(text) || /(^|[\s;&(){}])\.(\s|$)/.test(text) || /\b(PATH|BASH_ENV|ENV)\s*=/.test(text) || /[\w-]+\s*\(\s*\)/.test(text)) return true
+  const targets: string[] = []
+  for (const part of text.split(/[;&\n(){}]/)) {
+    const words = part.trim().replace(/^((if|then|else|elif|do|while|until|time|!)\s+)+/, '').split(/\s+/)
+    // A program run by path, glob or variable (./x.sh, ~/bin/*, $f).
+    if (/[/$*?[~]/.test(words[0] ?? '')) return true
+    if (words[0] === 'tee') targets.push(...words.slice(1).filter(w => w && !w.startsWith('-') && !/^\d*[<>]/.test(w)))
+  }
+  for (const m of text.matchAll(/&?>>?(&?)\s*([^\s;&<>()]*)/g)) if (!m[1]) targets.push(m[2]!)
+  // A file the data is written to and then named again might be run (chmod +x f; make -f f).
+  for (const t of targets) {
+    if (!t || /[$*?[{]/.test(t)) return true
+    const name = t.split('/').pop() || t
+    const count = (x: string) => x.split(name).length - 1
+    if (count(text) > targets.reduce((n, u) => n + count(u), 0)) return true
+  }
+  return false
+}
+
+/**
+ * The command with the text of heredocs that are only data taken out: fed to
+ * cat or tee, with a quoted delimiter or a body with no $( ` or ${ (which an
+ * unquoted one would run), and nothing else in the command that could run that
+ * text or the file it goes to. Otherwise, or when a heredoc is unterminated,
+ * the command as it is: when in doubt, everything stays checked.
+ */
+export const withoutHeredocData = (command: string): string => {
+  const docs = heredocs(command)
+  const data = (docs ?? []).filter(h => DATA_COMMANDS.has(commandWord(command, h.op)) && (h.quoted || !/`|\$[({[]/.test(h.body)))
+  if (!data.length) return command
+  let rest = ''
+  let at = 0
+  for (const h of data) {
+    rest += command.slice(at, h.bodyStart)
+    at = h.end
+  }
+  rest += command.slice(at)
+  return mayRunData(rest) ? command : rest
+}
+
 /** The commands a settings layer lets run outside the sandbox, and whether Bash may ask to leave it. */
 export const sandboxEscapes = (texts: (string | null)[]): { excluded: string[]; unsandboxedAllowed: boolean } => {
   const excluded = new Set<string>()
@@ -184,15 +349,18 @@ export const sandboxEscapes = (texts: (string | null)[]): { excluded: string[]; 
 }
 
 /** Whether any command in a Bash line is one the sandbox leaves out (sandbox.excludedCommands). */
-export const runsExcluded = (command: string, excluded: string[]): boolean => {
-  if (!excluded.length) return false
+export const runsExcluded = (command: string, excluded: string[]): boolean => excludedPart(command, excluded) !== null
+
+// The part of a Bash line that runs a command the sandbox leaves out, or null.
+const excludedPart = (command: string, excluded: string[]): string | null => {
+  if (!excluded.length) return null
   const names = new Set(excluded.map(c => c.split(/[\s:]/)[0]!.replace(/\*$/, '')).filter(Boolean))
   for (const part of command.split(/[;&|\n]|\$\(|`|\(/)) {
     const words = part.trim().replace(/^((\w+=\S*|sudo|env|exec|command|nohup|time)\s+)+/, '').split(/\s+/)
     const first = (words[0] ?? '').split('/').pop() ?? ''
-    if (first && names.has(first)) return true
+    if (first && names.has(first)) return part.trim()
   }
-  return false
+  return null
 }
 
 /**
@@ -201,7 +369,8 @@ export const runsExcluded = (command: string, excluded: string[]): boolean => {
  * own check is for the person to allow (option allowUnsandboxed), not Claude.
  */
 export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUnsandboxed: boolean }): string | null => {
-  const text = flat(command)
+  // The text of a heredoc that only writes a file is data, not a command.
+  const text = flat(withoutHeredocData(command))
   // pi-session trusts this to tell it runs in the sandbox; only the sandbox
   // sets it. Naming it (a search, say) is fine; setting or unsetting it is not.
   if (/SANDBOX_RUNTIME\s*=|unset\s+(-v\s+)?SANDBOX_RUNTIME/.test(text))
@@ -210,7 +379,11 @@ export const bashRefusal = (command: string, o: { unsandboxed: boolean; allowUns
   if (/PI_SESSION_PI\s*=/.test(text)) return 'pi: PI_SESSION_PI is for the mod\'s own tests; a command may not set it.'
   // The opencode-go gate lives in pi-session, so pi runs only through it
   // (pi run directly could use any provider, and `pi auth` prints keys).
-  if (runsExcluded(text, ['pi'])) return `pi: run pi only through pi-session (node <pi mod>/scripts/pi-session.mjs serve <name> --model <provider>/<id>). The pi mod works only with an opencode-go API key, or a model at a host you trust (option trustedModelHosts).`
+  const runsPi = excludedPart(text, ['pi'])
+  if (runsPi !== null) {
+    const shown = runsPi.replace(/\s+/g, ' ')
+    return `pi: run pi only through pi-session (node <pi mod>/scripts/pi-session.mjs serve <name> --model <provider>/<id>). The pi mod works only with an opencode-go API key, or a model at a host you trust (option trustedModelHosts). This command was read as running pi at: ${shown.length > 80 ? `${shown.slice(0, 80)}...` : shown}. If it only mentions pi in its text, use the Edit or Write tool to change a file, or the Grep tool to search one: a heredoc's text is skipped only when it feeds cat or tee (cat > file <<'EOF'), not an interpreter such as python3, which could start pi itself.`
+  }
   // pi-session reads the person's options from the file this points at.
   if (/PI_SESSION_OPTIONS\s*=/.test(text)) return 'pi: PI_SESSION_OPTIONS is for the mod\'s own tests; a command may not set it.'
   // Inside the sandbox the options file can't be written; outside it only this text check stands.
