@@ -920,8 +920,10 @@ export const register: Register = (on, options) => {
       const since = s.state === 'busy' && s.runStartedAt ? s.runStartedAt : s.lastActivity
       // Open, the Live view takes the place of the one tool line and the start of the last reply.
       const tail = liveView?.name === s.name ? liveWindow(liveRows(liveView.lines, cols), liveView.offset) : null
-      // The view is the card's last part, so the pane's last rows: a wheel tick over them scrolls it.
-      liveDrawn = tail ? 1 + (tail.older ? 1 : 0) + Math.max(1, tail.rows.length) + (tail.newer ? 1 : 0) : 0
+      // The view is the card's last part, so the pane's last rows: a wheel tick
+      // over them scrolls it. They are its blank row above (marginTop), its bar,
+      // ↑ older, its rows and ↓ newer.
+      liveDrawn = tail ? 1 + 1 + (tail.older ? 1 : 0) + Math.max(1, tail.rows.length) + (tail.newer ? 1 : 0) : 0
       return (
         <Box flexDirection="column" key="card">
           <Text>

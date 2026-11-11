@@ -808,10 +808,18 @@ test('the wheel over the Live view scrolls it, elsewhere the pane; scroll keys m
   expect(pane).toEqual([-1])
   await pressLive(ui)
   expect(await shownRows(ui)).toEqual(numbered(80, 100))
-  // The view is the tree's last rows: its bar, ↑ older, its 20 rows (and ↓ newer once scrolled), the last 22 of 40 here.
+  // The view is the tree's last rows: its blank row above, its bar, ↑ older, its 20 rows (and ↓ newer once scrolled), the last 23 of 40 here.
   const over = { pointer: { column: 2, row: 30 } }
   await $.ui.scroll(scrollEvent(-3, 40, 50, over))
   expect(await shownRows(ui)).toEqual(numbered(77, 97))
+  // Its blank row above the bar (41 - 24 = row 17, with ↓ newer now) is the view's too; the row above that, the pane's.
+  await $.ui.scroll(scrollEvent(-1, 41, 50, { pointer: { column: 2, row: 17 } }))
+  expect(await shownRows(ui)).toEqual(numbered(76, 96))
+  await $.ui.scroll(scrollEvent(1, 41, 50, { pointer: { column: 2, row: 17 } }))
+  await $.ui.scroll(scrollEvent(-1, 41, 50, { pointer: { column: 2, row: 16 } }))
+  expect(await shownRows(ui)).toEqual(numbered(77, 97))
+  expect(pane).toEqual([-1, -1])
+  pane.length = 1
   // Over the tiles above it, the pane moves.
   await $.ui.scroll(scrollEvent(-1, 41, 50, { pointer: { column: 2, row: 3 } }))
   expect(await shownRows(ui)).toEqual(numbered(77, 97))
