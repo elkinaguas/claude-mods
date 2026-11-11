@@ -70,6 +70,12 @@ const PI_HOME = path.join(os.homedir(), '.pi')
 const PI_CONVERSATIONS = path.join(PI_HOME, 'agent', 'sessions')
 // `wait` exits with this when a findings prompt's reply fails its check.
 const BAD_FINDINGS = 4
+// The live tail (read --live, the panel's Live view): pi's last lines of tool
+// calls and reply text, the one streaming now included, never what a tool gave
+// back. Rewritten at most every LIVE_WRITE_MS, however fast pi's deltas come.
+const LIVE_LINES = 20
+const LIVE_WIDTH = 400
+const LIVE_WRITE_MS = 300
 const SEVERITIES = ['critical', 'high', 'medium', 'low']
 const CONFIDENCES = ['high', 'medium', 'low']
 const FINDING_KEYS = ['file', 'line', 'severity', 'confidence', 'title']
@@ -140,8 +146,10 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       A findings reply comes as the JSON array alone. Exit 4 if it fails the
       check, or its run was aborted, wrote no reply, or settled along with a
       later prompt: the error is reported, nothing is written, read --last has it.
-  read <name> [--last | --tail N | --since LINE]
+  read <name> [--last | --live | --tail N | --since LINE]
       Print the transcript (default: last 40 lines), or the last reply.
+      --live prints the last 20 lines of tool calls and reply text, the reply
+      pi is writing now included, and never what a tool gave back.
   status [name] [--json]
   models           List the model ids serve and run would allow: pi's
                    --list-models, kept to what passes the gate.
@@ -320,6 +328,7 @@ const parse = (argv, cmd) => {
       flags[a.slice(2)] = argv[++i]
     else if (a === '--keep' && cmd === 'run') flags.keep = true
     else if (a === '--purge' && cmd === 'forget') flags.purge = true
+    else if (a === '--live' && cmd === 'read') flags.live = true
     else if (/^--(steer|last|json|abort)$/.test(a)) flags[a.slice(2)] = true
     else rest.push(a)
   }
@@ -445,6 +454,28 @@ const argSummary = args => {
   if (!args || typeof args !== 'object') return ''
   const key = ['path', 'file_path', 'command', 'pattern', 'url', 'query'].find(k => typeof args[k] === 'string')
   return oneLine(key ? args[key] : JSON.stringify(args), 90)
+}
+
+// A reply's text as live-tail lines: no blank lines or control characters, a
+// long line kept to its end (the part pi wrote last).
+const liveLines = text =>
+  String(text ?? '')
+    .split('\n')
+    .map(l => l.replace(/\t/g, '  ').replace(/[\x00-\x1f\x7f-\x9f]/g, '').trimEnd())
+    .filter(l => l.trim())
+    .map(l => (l.length > LIVE_WIDTH ? `…${l.slice(-(LIVE_WIDTH - 1))}` : l))
+
+// The text of the assistant message pi is streaming: its partial message when
+// the event carries one, else what came before plus this text delta.
+const streamedText = (r, sofar) => {
+  if (r.message && r.message.role !== 'assistant') return sofar
+  if (Array.isArray(r.message?.content))
+    return r.message.content
+      .filter(c => c?.type === 'text' && typeof c.text === 'string')
+      .map(c => c.text)
+      .join('\n')
+  const ev = r.assistantMessageEvent
+  return ev?.type === 'text_delta' && typeof ev.delta === 'string' ? sofar + ev.delta : sofar
 }
 
 // auth.json's logins, or {} when it is missing or empty; null when it does not parse.
@@ -750,6 +781,39 @@ async function serve(name, flags, extra, first = null) {
   // Declined since the last run settled: still news for the next one, as in the list.
   let unreported = 0
   let lastDeltaSave = 0
+  // The live tail: finished lines, and the reply pi is streaming now.
+  const tail = []
+  let streaming = ''
+  let liveAt = 0
+  let liveTimer = null
+  let liveWritten = ''
+  const writeLive = () => {
+    clearTimeout(liveTimer)
+    liveTimer = null
+    liveAt = Date.now()
+    const lines = [...tail, ...liveLines(streaming)].slice(-LIVE_LINES)
+    // Thinking deltas, say, change nothing here: no write.
+    const key = JSON.stringify([!!streaming, lines])
+    if (key === liveWritten) return
+    try {
+      writeJson(file(name, 'live.json'), { updatedAt: liveAt, streaming: !!streaming, lines })
+      liveWritten = key
+    } catch {
+      // A view only: the next write tries again.
+    }
+  }
+  // At once when the last write is old enough, else once when it is.
+  const live = () => {
+    if (liveTimer) return
+    const wait = LIVE_WRITE_MS - (Date.now() - liveAt)
+    if (wait <= 0) writeLive()
+    else liveTimer = setTimeout(writeLive, wait)
+  }
+  const addLive = lines => {
+    tail.push(...lines)
+    tail.splice(0, Math.max(0, tail.length - LIVE_LINES))
+    live()
+  }
   onLines(pi.stdout, line => {
     if (finished) return
     events.write(`${line}\n`)
@@ -812,6 +876,8 @@ async function serve(name, flags, extra, first = null) {
           .map(c => c.text)
           .join('\n')
           .trim()
+        streaming = ''
+        addLive(liveLines(text))
         if (text) {
           st.lastReply = oneLine(text, 300)
           fs.writeFileSync(file(name, 'last-reply.md'), `${text}\n`)
@@ -827,6 +893,7 @@ async function serve(name, flags, extra, first = null) {
       case 'tool_execution_start':
         st.lastTool = `${r.toolName} ${argSummary(r.args)}`.trim()
         log(`→ ${st.lastTool}`)
+        addLive(liveLines(`→ ${st.lastTool}`))
         break
       case 'tool_execution_end':
         log(`  ${r.isError ? '✗' : '✓'} ${r.toolName}${r.durationMs != null ? ` ${r.durationMs}ms` : ''}`)
@@ -860,9 +927,17 @@ async function serve(name, flags, extra, first = null) {
         st.lastTool = null
         st.runStartedAt = null
         log(`· settled${r.aborted ? ' (aborted)' : ''} · ${clock()}`)
+        // An aborted reply never gets its message_end: keep what had streamed.
+        if (streaming) tail.push(...liveLines(streaming))
+        streaming = ''
+        tail.splice(0, Math.max(0, tail.length - LIVE_LINES))
+        writeLive()
         break
       case 'message_update':
-        // Streaming deltas: only keep the heartbeat and activity time fresh.
+        // Streaming deltas: the live tail, at most every LIVE_WRITE_MS; status.json
+        // only for the heartbeat and activity time.
+        streaming = streamedText(r, streaming)
+        live()
         if (Date.now() - lastDeltaSave < 2000) return
         lastDeltaSave = Date.now()
         break
@@ -877,6 +952,7 @@ async function serve(name, flags, extra, first = null) {
     if (finished) return
     finished = true
     clearInterval(beat)
+    writeLive()
     st.state = state
     st.exitCode = code
     st.runStartedAt = null
@@ -1059,6 +1135,12 @@ async function run(name, flags, rest, extra) {
 }
 
 function read(name, flags) {
+  if (flags.live) {
+    if (!fs.existsSync(dir(name))) fail(`no session ${name}.`)
+    const lv = readJson(file(name, 'live.json'), null)
+    const lines = Array.isArray(lv?.lines) ? lv.lines.filter(l => typeof l === 'string').slice(-LIVE_LINES) : []
+    return process.stdout.write(lines.length ? `${lines.join('\n')}\n` : '(nothing yet)\n')
+  }
   if (flags.last) {
     const p = file(name, 'last-reply.md')
     if (!fs.existsSync(p)) fail(`${name} has no reply yet.`)

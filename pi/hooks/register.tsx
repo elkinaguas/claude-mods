@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { PiSession } from '../types'
+import type { PiLive, PiSession } from '../types'
 
 // Long-lived pi sessions run from Claude Code. The mod never starts pi: its
 // code runs outside the Bash sandbox, where pi would read the real provider
@@ -41,6 +41,17 @@ const warningsAtom = atom({ plugin: 'pi', key: 'warnings' } as const, [] as stri
 const selectedAtom = atom({ plugin: 'pi', key: 'selected' } as const, null as string | null)
 // Moved by the poll while the pane is on screen: reading it redraws the pane, so the card's age moves.
 const tickAtom = atom({ plugin: 'pi', key: 'tick' } as const, 0)
+// The one card whose Live view is open, and the tail serve last wrote for it.
+const liveAtom = atom({ plugin: 'pi', key: 'live' } as const, null as PiLive | null)
+
+// The Live view reads live.json (which serve rewrites at most every 300ms) this
+// often, only while it is open, its pane on screen and its session running.
+const LIVE_POLL_MS = 500
+const LIVE_ROWS = 20
+// pi can write in its session folder: a bigger file is not serve's.
+const LIVE_MAX_BYTES = 64 * 1024
+let liveTimer: Timer | null = null
+let liveSeen = ''
 
 let home = ''
 let cwd = ''
@@ -430,7 +441,73 @@ async function poll($: EngineInterface) {
   await writeOptions($)
   await load($).catch(() => {})
   const panes = await $.ui.panes().catch(() => [])
-  if (panes.some(p => p.id === PANE && p.isShown)) await update($, tickAtom, n => n + 1)
+  const shown = panes.some(p => p.id === PANE && p.isShown)
+  if (shown) await update($, tickAtom, n => n + 1)
+  await syncLive($, shown).catch(() => {})
+}
+
+// The Live view. The panel reads serve's live.json as it reads status.json
+// (the mod's own reads, not Claude's file tools), so no process is started
+// twice a second; `read <name> --live` prints the same tail for Claude.
+async function readLive($: EngineInterface, name: string) {
+  const at = `${sessionsDir()}/${name}/live.json`
+  const st = await $.fs.stat(at).catch(() => null)
+  // Never through a link (it could lead to any file of yours), nor a file serve would not write.
+  const text = st && st.kind === 'file' && !st.isLink && st.size <= LIVE_MAX_BYTES ? await $.fs.read(at).catch(() => null) : null
+  // Missing, or the same as last time: nothing to redraw.
+  if (text === null || text === liveSeen) return
+  let lines: string[]
+  try {
+    const v = obj(JSON.parse(text))
+    lines = Array.isArray(v.lines) ? v.lines.filter((l): l is string => typeof l === 'string').slice(-LIVE_ROWS) : []
+  } catch {
+    return
+  }
+  liveSeen = text
+  await update($, liveAtom, cur => (cur?.name === name ? { name, lines } : cur))
+}
+
+const stopLiveTimer = () => {
+  liveTimer?.cancel()
+  liveTimer = null
+}
+
+// The view's timer runs only while it is open, its pane on screen and its
+// session running; a session that stopped gets one last read.
+async function syncLive($: EngineInterface, shown: boolean) {
+  const lv = await read($, liveAtom)
+  if (!lv) return stopLiveTimer()
+  const s = (await read($, sessionsAtom)).find(x => x.name === lv.name)
+  if (!s) return closeLive($)
+  const want = shown && LIVE.includes(s.state)
+  if (want && !liveTimer) liveTimer = $.clock.every(LIVE_POLL_MS, () => void readLive($, lv.name).catch(() => {}))
+  else if (!want && liveTimer) {
+    stopLiveTimer()
+    await readLive($, lv.name).catch(() => {})
+  }
+}
+
+async function openLive($: EngineInterface, name: string) {
+  stopLiveTimer()
+  liveSeen = ''
+  await update($, liveAtom, () => ({ name, lines: [] }))
+  // The card stays on this session while its view is open.
+  await update($, selectedAtom, () => name)
+  await readLive($, name).catch(() => {})
+  await syncLive($, true)
+}
+
+async function closeLive($: EngineInterface) {
+  stopLiveTimer()
+  liveSeen = ''
+  await update($, liveAtom, () => null)
+}
+
+// Picking another session's tile closes the open view: one card is live at a time.
+async function pick($: EngineInterface, name: string) {
+  await update($, selectedAtom, () => name)
+  const lv = await read($, liveAtom)
+  if (lv && lv.name !== name) await closeLive($)
 }
 
 const ago = (ms: number | null, now: number) => {
@@ -440,6 +517,33 @@ const ago = (ms: number | null, now: number) => {
 }
 const short = (p: string | null) => (p && home && p.startsWith(home) ? `~${p.slice(home.length)}` : p ?? '')
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, Math.max(1, n - 1))}…` : s)
+
+// A line broken into rows of at most n characters, at a space when there is one late enough.
+const wrapRows = (s: string, n: number) => {
+  const out: string[] = []
+  let rest = s
+  while (rest.length > n) {
+    const space = rest.lastIndexOf(' ', n)
+    const at = space > n / 2 ? space : n
+    out.push(rest.slice(0, at).trimEnd())
+    rest = rest.slice(at).trimStart()
+  }
+  if (rest) out.push(rest)
+  return out
+}
+
+/** The Live view's rows: tool calls cut to the pane's width, reply text wrapped to it, the last 20. */
+export const liveRows = (lines: string[], cols: number): string[] => {
+  const n = Math.max(10, cols)
+  const rows: string[] = []
+  for (const raw of lines.slice(-LIVE_ROWS)) {
+    // No control characters reach the terminal; of a long reply line only its end can be among the last rows.
+    const line = raw.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')
+    if (line.startsWith('→ ')) rows.push(clip(line, n))
+    else rows.push(...wrapRows(line.slice(-n * LIVE_ROWS), n))
+  }
+  return rows.slice(-LIVE_ROWS)
+}
 
 const instructions = ($: EngineInterface) => `# pi sessions (pi mod)
 
@@ -451,7 +555,7 @@ You can run long-lived pi coding-agent sessions. Use only this script, through t
 - pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); serve and run read those hosts from the mod's options file themselves` : ''}. serve and run refuse any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If they refuse, tell the person why; never try to get around the gate.
 - One-shot: \`run <name> --model <provider>/<id> [--cwd <dir>] --file <prompt file>\` (or a quoted prompt) with run_in_background starts the session, sends the prompt, prints pi's reply and stops the session, so you are notified when it is done. It takes wait's \`--timeout SECONDS --abort\`, \`--out FILE\` and exit codes, and \`--format findings\`. \`--keep\` leaves the session running for follow-ups; the call then ends only when the session does, so run \`wait <name>\` with run_in_background to be told when the reply is there.
 - Work: \`send <name> "<prompt>"\` prints a prompt id. While pi works a new prompt queues as a follow-up; \`--steer\` delivers it before pi's next model call instead.
-- Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply. Sessions never stop for questions: pi is told to finish and list its assumptions, and a question from a pi extension is declined at once and named on stderr, so a step it guarded may have been skipped. To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. For a long reply, add \`--out FILE\` to write it to a file and print only its path and size. To ask for review findings as a checked JSON array, use \`send <name> --format findings "<prompt>"\`: \`wait\` prints only the array, or exits 4 if the reply is invalid. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply.
+- Results: run \`wait <name> <id>\` with run_in_background; you are notified when pi settles and it prints the reply. Sessions never stop for questions: pi is told to finish and list its assumptions, and a question from a pi extension is declined at once and named on stderr, so a step it guarded may have been skipped. To cap a run, add \`--timeout SECONDS --abort\`: on timeout pi's run is aborted and the wait exits 2. For a long reply, add \`--out FILE\` to write it to a file and print only its path and size. To ask for review findings as a checked JSON array, use \`send <name> --format findings "<prompt>"\`: \`wait\` prints only the array, or exits 4 if the reply is invalid. \`read <name> --tail 40\` shows the transcript, \`read <name> --last\` the last reply, \`read <name> --live\` the last 20 lines of tool calls and reply text as pi writes them.
 - Control: \`status\`, \`abort <name>\` (stop the current run), \`stop <name>\` (end the session), \`forget <name>\`.
 - After a Claude Code restart, \`serve <name>\` again reopens the conversation (a killed \`run\` too); work that was mid-run is lost, so ask pi to continue.
 - After a restart, use \`status <name>\` for how a session stands, and \`read <name> --last\` for its last reply. Never go by the output of a task from before the restart: it is old, and those tasks are gone.
@@ -480,6 +584,9 @@ export const register: Register = (on, options) => {
   ;({ valid: trustedHosts, invalid: badHosts } = parseTrustedHosts(options.trustedModelHosts))
   seen = ''
   optionsWrittenAt = 0
+  // A reload drops the timers; the next poll starts an open view's again.
+  liveTimer = null
+  liveSeen = ''
 
   on('session.start', async ($, e, next) => {
     home = (await $.env.get('HOME')) ?? ''
@@ -569,6 +676,7 @@ export const register: Register = (on, options) => {
     const list = await read($, sessionsAtom)
     const warnings = await read($, warningsAtom)
     const picked = await read($, selectedAtom)
+    const liveView = await read($, liveAtom)
     await read($, tickAtom)
     const now = await $.clock.now()
     const cols = Math.max(20, e.props.bodyColumns ?? 60)
@@ -585,6 +693,8 @@ export const register: Register = (on, options) => {
       const activity = s.lastTool ? `→ ${s.lastTool}` : null
       // A busy session counts from the start of its run, the others from pi's last event.
       const since = s.state === 'busy' && s.runStartedAt ? s.runStartedAt : s.lastActivity
+      // Open, the Live view takes the place of the one tool line and the start of the last reply.
+      const tail = liveView?.name === s.name ? liveRows(liveView.lines, cols) : null
       return (
         <Box flexDirection="column" key="card">
           <Text>
@@ -593,13 +703,20 @@ export const register: Register = (on, options) => {
           </Text>
           <Text dimColor>{clip(`${s.model ?? '-'}  ${short(s.cwd)}`, cols)}</Text>
           {s.sandboxed === false && <Text color="red" bold wrap="wrap">! runs outside the sandbox: pi holds your real provider key</Text>}
-          {activity && <Text>{clip(activity, cols * 2)}</Text>}
+          {!tail && activity && <Text>{clip(activity, cols * 2)}</Text>}
           {s.error && <Text color="red" wrap="wrap">error: {s.error}</Text>}
-          {s.lastReply && <Text dimColor wrap="wrap">last: {s.lastReply}</Text>}
+          {!tail && s.lastReply && <Text dimColor wrap="wrap">last: {s.lastReply}</Text>}
+          {tail && (
+            <Box flexDirection="column" marginTop={1} key="tail">
+              <Text dimColor>{clip(`live · tool calls and reply, last ${LIVE_ROWS} lines`, cols)}</Text>
+              {tail.length ? tail.map(row => <Text wrap="truncate-end">{row}</Text>) : <Text dimColor>(nothing yet)</Text>}
+            </Box>
+          )}
           <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1} key="actions">
             {s.state === 'busy' && <Button key="abort" plain hotkey="a" label="Abort" onPress={() => void runScript($, ['abort', s.name])} />}
             {isLive && <Button key="stop" plain hotkey="s" label="Stop" onPress={() => void runScript($, ['stop', s.name])} />}
             {!isLive && <Button key="resume" plain hotkey="r" label="Resume" onPress={() => ask($, `Serve the pi session ${s.name} again and ask it to continue where it left off.`)} />}
+            <Button key="live" plain hotkey="l" label={tail ? 'Live off' : 'Live'} onPress={() => void (tail ? closeLive($) : openLive($, s.name)).catch(() => {})} />
             <Button key="transcript" plain hotkey="t" label="Transcript" onPress={() => ask($, `Show me the last 40 lines of the pi session ${s.name}'s transcript.`)} />
             {!isLive && <Button key="forget" plain hotkey="f" label="Forget" onPress={() => void runScript($, ['forget', s.name])} />}
           </Box>
@@ -628,7 +745,7 @@ export const register: Register = (on, options) => {
               // The picked tile is filled with its colour (inverse, so it reads
               // on light and dark themes); the others show a bar of it.
               return (
-                <Button key={`session:${x.name}`} plain label={`${x.name} ${x.state}`} onPress={() => void update($, selectedAtom, () => x.name)}>
+                <Button key={`session:${x.name}`} plain label={`${x.name} ${x.state}`} onPress={() => void pick($, x.name).catch(() => {})}>
                   {x.name === s?.name ? (
                     <Text color={color} inverse bold>
                       ▌{label}

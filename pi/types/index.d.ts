@@ -23,6 +23,13 @@ export type PiSession = {
   cost: number | null
 }
 
+/** A card's Live view: its session, and the lines of serve's live tail (live.json) last read. */
+export type PiLive = {
+  name: string
+  /** pi's last tool calls (`→ tool args`) and reply text, the reply streaming now included; never tool output. */
+  lines: string[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     pi: {
@@ -34,6 +41,8 @@ declare module 'claude-code' {
       selected: string | null
       /** Bumped by the poll while the pane is on screen, to redraw the card's age. */
       tick: number
+      /** The one card whose Live view is open, with the tail it shows; null when none is. */
+      live: PiLive | null
     }
   }
 }

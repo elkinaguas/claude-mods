@@ -10,6 +10,7 @@ import {
   sandboxEscapes,
   sandboxSetting,
   settingsProblems,
+  liveRows,
   optionsText,
   usageLine,
   writesOptions,
@@ -477,12 +478,25 @@ test('the panel lists sessions from their status files', async ($, on) => {
 
 // One session and a hand on the poll: each tick() lets one period of
 // clock.every through, then waits for what it set off.
-const pollingPane = async ($: any, on: any, session: object, startAt: number) => {
-  const clock = { now: startAt, panes: [] as object[], writes: [] as string[] }
-  let release = () => {}
+// `files` are the session's other files by name (live.json), `links` the names that are links;
+// `reads` counts what was read of them.
+const pollingPane = async ($: any, on: any, session: object, startAt: number, files: Record<string, string> = {}, links: string[] = []) => {
+  const clock = { now: startAt, panes: [] as object[], writes: [] as string[], reads: [] as string[] }
+  // Every timer's period waits for the next tick (the poll's, and an open Live view's).
+  let waiting: (() => void)[] = []
+  const release = () => {
+    const now = waiting
+    waiting = []
+    for (const go of now) go()
+  }
   on('env.get', () => ({ value: HOME }))
   on('clock.now', () => ({ value: clock.now }))
-  on('clock.every', () => new Promise(resolve => (release = () => resolve({ value: undefined }))))
+  on('clock.every', () => new Promise(resolve => waiting.push(() => resolve({ value: undefined }))))
+  on('fs.stat', (_: unknown, e: { path: string }) => {
+    const f = e.path.split('/').pop()!
+    if (!e.path.includes('/demo/') || !(f in files)) throw new Error('missing')
+    return { value: { kind: 'file', size: files[f]!.length, mtimeMs: 0, isLink: links.includes(f) } }
+  })
   on('command.register', () => ({ value: { command: 'pi' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.panes', () => ({ value: clock.panes }))
@@ -490,6 +504,11 @@ const pollingPane = async ($: any, on: any, session: object, startAt: number) =>
   on('fs.list', () => ({ value: [{ name: 'demo', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] }))
   on('fs.read', (_: unknown, e: { path: string }) => {
     if (e.path.endsWith('/demo/status.json')) return { value: JSON.stringify(session) }
+    const f = e.path.split('/').pop()!
+    if (e.path.includes('/demo/') && f in files) {
+      clock.reads.push(f)
+      return { value: files[f] }
+    }
     throw new Error('missing')
   })
   on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
@@ -544,6 +563,107 @@ test('with the pane closed or behind another tab, the poll redraws nothing', asy
   await tick()
   expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 50s/)
   await ui.unmount()
+})
+
+const liveJson = (lines: string[]) => JSON.stringify({ updatedAt: T0, streaming: true, lines })
+// Live's press takes a few state writes; let them land.
+const pressLive = async (ui: any) => {
+  await ui.press({ key: 'live' })
+  await new Promise(resolve => setTimeout(resolve, 20))
+}
+const texts = async (ui: any) => ((await ui.findAll({ type: 'Text' })) as { text: string }[]).map(t => t.text)
+
+test('Live expands the card with the tail serve writes, follows it while open, and stops reading when closed', async ($, on) => {
+  const session = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000, runStartedAt: T0 - 30000, lastTool: 'bash npm test', lastReply: 'an older reply', turns: 3 }
+  const long = `${'word '.repeat(30)}end`
+  const files = { 'live.json': liveJson(['→ read README.md', long, `→ bash ${'x'.repeat(100)}`]) }
+  const { clock, tick } = await pollingPane($, on, session, T0, files)
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // Closed, the card is as before, and nothing reads live.json.
+  expect(await ui.find({ type: 'Text', text: /→ bash npm test/ })).toBeDefined()
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live')
+  await tick()
+  expect(clock.reads).toEqual([])
+  await pressLive(ui)
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live off')
+  // Open: the header line stays; the tail takes the place of the tool line and the last reply.
+  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 30s · 3 turns$/)
+  expect(await ui.find({ type: 'Text', text: /^live · tool calls and reply/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /→ bash npm test/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /an older reply/ })).toBeUndefined()
+  const shown = await texts(ui)
+  expect(shown).toContain('→ read README.md')
+  // Reply text wraps to the pane's 60 columns; a tool call is cut to them.
+  const wrapped = shown.filter(t => t.startsWith('word') || t.endsWith('end'))
+  expect(wrapped.length).toBe(3)
+  expect(wrapped.every(t => t.length <= 60)).toBe(true)
+  expect(shown.find(t => t.startsWith('→ bash x'))!.length).toBe(60)
+  // Each period reads it again, and a new line shows.
+  files['live.json'] = liveJson(['→ read README.md', 'Now running the tests'])
+  await tick()
+  expect(await ui.find({ type: 'Text', text: 'Now running the tests' })).toBeDefined()
+  // Behind another tab it stops reading.
+  clock.panes = [{ ...OPEN, isShown: false }]
+  await tick()
+  const hidden = clock.reads.length
+  await tick()
+  await tick()
+  expect(clock.reads.length).toBe(hidden)
+  clock.panes = [OPEN]
+  await tick()
+  await tick()
+  expect(clock.reads.length > hidden).toBe(true)
+  // Live off: the card is as before, and nothing reads it any more.
+  await pressLive(ui)
+  expect(await ui.find({ type: 'Text', text: /^live · / })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /→ bash npm test/ })).toBeDefined()
+  const closed = clock.reads.length
+  await tick()
+  await tick()
+  expect(clock.reads.length).toBe(closed)
+  await ui.unmount()
+})
+
+test('a session that stops gets one last read of its tail, then none; a linked live.json is never read', async ($, on) => {
+  const session = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
+  const files = { 'live.json': liveJson(['→ read README.md']) }
+  const { clock, tick } = await pollingPane($, on, session, T0, files)
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await pressLive(ui)
+  expect(await ui.find({ type: 'Text', text: '→ read README.md' })).toBeDefined()
+  Object.assign(session, { state: 'stopped' })
+  files['live.json'] = liveJson(['→ read README.md', 'All done.'])
+  await tick()
+  await tick()
+  expect(await ui.find({ type: 'Text', text: 'All done.' })).toBeDefined()
+  const after = clock.reads.length
+  await tick()
+  await tick()
+  expect(clock.reads.length).toBe(after)
+  await ui.unmount()
+})
+
+test('a live.json that is a link shows nothing', async ($, on) => {
+  const session = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
+  const { clock, tick } = await pollingPane($, on, session, T0, { 'live.json': liveJson(['id_rsa contents']) }, ['live.json'])
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await pressLive(ui)
+  await tick()
+  expect(await ui.find({ type: 'Text', text: '(nothing yet)' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /id_rsa/ })).toBeUndefined()
+  expect(clock.reads).toEqual([])
+  await ui.unmount()
+})
+
+test('live rows: tool calls cut to the width, reply text wrapped at spaces, control characters gone, the last 20', () => {
+  expect(liveRows(['→ read a.ts', 'one two three four'], 10)).toEqual(['→ read a.ts'.slice(0, 9) + '…', 'one two', 'three four'])
+  expect(liveRows(['abcdefghijklmnop'], 10)).toEqual(['abcdefghij', 'klmnop'])
+  expect(liveRows(['red \u001b[31mtext'], 40)).toEqual(['red  [31mtext'])
+  const many = Array.from({ length: 30 }, (_, i) => `line ${i}`)
+  expect(liveRows(many, 40)).toEqual(many.slice(-20))
 })
 
 test('/pi check reports settings that do not parse instead of failing', async ($, on) => {
