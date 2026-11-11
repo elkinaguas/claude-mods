@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { PiLive, PiSession } from '../types'
+import type { PiLive, PiModelList, PiPick, PiSession } from '../types'
 
 // Long-lived pi sessions run from Claude Code. The mod never starts pi: its
 // code runs outside the Bash sandbox, where pi would read the real provider
@@ -43,6 +43,21 @@ const selectedAtom = atom({ plugin: 'pi', key: 'selected' } as const, null as st
 const tickAtom = atom({ plugin: 'pi', key: 'tick' } as const, 0)
 // The one card whose Live view is open, and the tail serve last wrote for it.
 const liveAtom = atom({ plugin: 'pi', key: 'live' } as const, null as PiLive | null, { shape: 'live-2' })
+// The Models view: the picks (kept in the options file, mirrored here to redraw), the list it picks from, and which view is up.
+const pickedAtom = atom({ plugin: 'pi', key: 'picked' } as const, [] as PiPick[], { shape: 'picked-1' })
+const modelListAtom = atom({ plugin: 'pi', key: 'modelList' } as const, null as PiModelList | null, { shape: 'models-1' })
+const viewAtom = atom({ plugin: 'pi', key: 'view' } as const, 'sessions' as 'sessions' | 'models')
+
+// The models picked in the Models view, and when they last changed: the options
+// file holds them for every Claude Code session, so a newer change there wins.
+let picked: PiPick[] = []
+let pickedAt = 0
+// Matches pi-session.mjs: a picked model's id and note.
+const MODEL_ID_RE = /^[A-Za-z0-9][\w.-]*\/[^\s\x00-\x1f\x7f]{1,200}$/
+const NOTE_MAX = 120
+// .models.json is pi-session's, under 64 KB; a bigger one, or a link, is not read.
+const MODEL_LIST_MAX_BYTES = 64 * 1024
+let modelListSeen = ''
 
 // The Live view reads live.json (which serve rewrites at most every 300ms) this
 // often, only while it is open, its pane on screen and its session running.
@@ -587,7 +602,45 @@ async function load($: EngineInterface) {
   const isLive = list.some(s => LIVE.includes(s.state))
   if (isLive && !wasLive && autoOpen) void $.ui.open({ id: PANE, title: TITLE }).catch(() => {})
   wasLive = isLive
+  await loadModelList($).catch(() => {})
 }
+
+/** The ids a .models.json lists, as the picker shows them, or null when it is not pi-session's. */
+export const modelListIn = (text: string): PiModelList | null => {
+  try {
+    const v = obj(JSON.parse(text))
+    if (!Array.isArray(v.models)) return null
+    const models = [...new Set(v.models.filter((m): m is string => typeof m === 'string' && MODEL_ID_RE.test(m)))].slice(0, 500)
+    return { listedAt: num(v.listedAt) ?? 0, models }
+  } catch {
+    return null
+  }
+}
+
+// What `pi-session models` last listed. The mod reads it as it reads status.json
+// and never runs pi for it: the picker's Refresh asks Claude to run `models`.
+async function loadModelList($: EngineInterface) {
+  const at = `${sessionsDir()}/.models.json`
+  const st = await $.fs.stat(at).catch(() => null)
+  const text = st && st.kind === 'file' && !st.isLink && st.size <= MODEL_LIST_MAX_BYTES ? await $.fs.read(at).catch(() => null) : null
+  if (text === null || text === modelListSeen) return
+  modelListSeen = text
+  const got = modelListIn(text)
+  if (got) await update($, modelListAtom, () => got)
+}
+
+// A change in the Models view: kept, and written to the options file at once, so serve and run go by it.
+async function setPicked($: EngineInterface, next: PiPick[]) {
+  picked = next
+  pickedAt = Date.now()
+  await update($, pickedAtom, () => picked)
+  optionsWrittenAt = 0
+  await writeOptions($)
+}
+const togglePick = ($: EngineInterface, id: string) =>
+  setPicked($, picked.some(p => p.id === id) ? picked.filter(p => p.id !== id) : [...picked, { id, note: '' }])
+const setNote = ($: EngineInterface, id: string, note: string) =>
+  setPicked($, picked.map(p => (p.id === id ? { id, note: cleanNote(note) } : p)))
 
 /** Where the mod keeps the options pi-session reads; sandboxed commands can't write under ~/.claude/plugins. */
 export const optionsDir = (homeDir: string) => `${homeDir}/.claude/plugins/data/pi`
@@ -601,17 +654,49 @@ export const writesOptions = (tool: string, input: Json, base: string, homeDir: 
 }
 
 /** The options file's text: what pi-session reads instead of flags in the command. */
-export const optionsText = (o: { allowUnsandboxed: boolean; trustedHosts: string[] }, now: number) =>
-  `${JSON.stringify({ allowUnsandboxed: o.allowUnsandboxed, trustedModelHosts: o.trustedHosts, writtenAt: now }, null, 2)}\n`
+export const optionsText = (o: { allowUnsandboxed: boolean; trustedHosts: string[]; models?: PiPick[]; modelsChangedAt?: number }, now: number) =>
+  `${JSON.stringify(
+    { allowUnsandboxed: o.allowUnsandboxed, trustedModelHosts: o.trustedHosts, models: o.models ?? [], modelsChangedAt: o.modelsChangedAt ?? 0, writtenAt: now },
+    null,
+    2,
+  )}\n`
+
+/** A note as the picker keeps it: one line, no control characters, at most NOTE_MAX. */
+export const cleanNote = (s: string) => s.replace(/[\x00-\x1f\x7f-\x9f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, NOTE_MAX)
+
+/** The picks an options file holds, and when they changed, or null when it holds none pi-session would take. */
+export const picksIn = (text: string | null): { models: PiPick[]; changedAt: number } | null => {
+  if (!text) return null
+  try {
+    const o = obj(JSON.parse(text))
+    const models = o.models ?? []
+    if (!Array.isArray(models)) return null
+    const out = models.map(m => obj(m)).map(m => ({ id: str(m.id) ?? '', note: str(m.note) }))
+    if (!out.every(m => MODEL_ID_RE.test(m.id) && m.note !== null && m.note.length <= NOTE_MAX)) return null
+    return { models: out as PiPick[], changedAt: num(o.modelsChangedAt) ?? 0 }
+  } catch {
+    return null
+  }
+}
 
 // Written once a minute while Claude Code runs: pi-session takes an older file for
 // a mod since turned off. 0 writes at the next chance (new options, a new session).
+// The picks are the person's across sessions: one changed in another session's
+// panel since (a newer modelsChangedAt in the file) is taken before writing.
 const OPTIONS_EVERY_MS = 60000
 let optionsWrittenAt = 0
 async function writeOptions($: EngineInterface) {
   if (!home || Date.now() - optionsWrittenAt < OPTIONS_EVERY_MS) return
   optionsWrittenAt = Date.now()
-  await $.fs.write(`${optionsDir(home)}/options.json`, optionsText({ allowUnsandboxed, trustedHosts }, Date.now())).catch((err: unknown) => {
+  const at = `${optionsDir(home)}/options.json`
+  const st = await $.fs.stat(at).catch(() => null)
+  const there = st && st.kind === 'file' && !st.isLink ? picksIn(await $.fs.read(at).catch(() => null)) : null
+  if (there && there.changedAt > pickedAt) {
+    picked = there.models
+    pickedAt = there.changedAt
+    await update($, pickedAtom, () => picked)
+  }
+  await $.fs.write(at, optionsText({ allowUnsandboxed, trustedHosts, models: picked, modelsChangedAt: pickedAt }, Date.now())).catch((err: unknown) => {
     optionsWrittenAt = 0
     $.ui.log(`pi: could not write its options file: ${String(err)}`)
   })
@@ -788,13 +873,21 @@ export const liveWindow = (rows: string[], offset: number) => {
   return { rows: rows.slice(start, end), older: start, newer: at, offset: at, max }
 }
 
+// The person's picks, for Claude to choose from by their notes; nothing when none are picked.
+const pickedLine = () =>
+  picked.length
+    ? `\n- Models: the person picked the models pi may use (the pi panel's Models view); serve and run refuse any other. For each session or run, choose the one whose note fits the task and pass it with \`--model\`; without \`--model\`, pi's default must be one of them. ${picked
+        .map(p => `\`${p.id}\`${p.note ? ` (${p.note})` : ''}`)
+        .join(', ')}.`
+    : ''
+
 const instructions = ($: EngineInterface) => `# pi sessions (pi mod)
 
 You can run long-lived pi coding-agent sessions. Use only this script, through the Bash tool, so pi runs inside the sandbox where its provider key is masked:
 
   node ${script($)} <command>
 
-- Start: run \`serve <name> --cwd <dir> --model <provider>/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused). \`--model\` may be left out when pi's own default model (its settings.json) passes the gate; if it doesn't, serve and run refuse and say so. \`models\` lists the model ids the gate allows.
+- Start: run \`serve <name> --cwd <dir> --model <provider>/<id>\` with run_in_background. It runs until stopped. pi takes up to ~20s to start; \`status <name>\` says idle when ready. Never start pi any other way (running pi directly is refused). \`--model\` may be left out when pi's own default model (its settings.json) passes the gate; if it doesn't, serve and run refuse and say so. \`models\` lists the model ids the gate allows.${pickedLine()}
 - pi works only on opencode-go with an API key${trustedHosts.length ? `, or on a provider that ~/.pi/agent/models.json points at one of the person's trusted hosts (${trustedHosts.join(', ')}); serve and run read those hosts from the mod's options file themselves` : ''}. serve and run refuse any other model, extra pi arguments, logins in auth.json beyond what that needs, and providers in models.json at other hosts. If they refuse, tell the person why; never try to get around the gate.
 - One-shot: \`run <name> --model <provider>/<id> [--cwd <dir>] --file <prompt file>\` (or a quoted prompt) with run_in_background starts the session, sends the prompt, prints pi's reply and stops the session, so you are notified when it is done. It takes wait's \`--timeout SECONDS --abort\`, \`--out FILE\` and exit codes, and \`--format findings\`. \`--keep\` leaves the session running for follow-ups; the call then ends only when the session does, so run \`wait <name>\` with run_in_background to be told when the reply is there.
 - Work: \`send <name> "<prompt>"\` prints a prompt id. While pi works a new prompt queues as a follow-up; \`--steer\` delivers it before pi's next model call instead.
@@ -837,7 +930,7 @@ export const register: Register = (on, options) => {
     cwd = e.cwd
     await $.command.register({
       name: COMMAND,
-      description: 'pi sessions: /pi opens the panel, /pi check checks the key-masking setup, /pi close',
+      description: 'pi sessions: /pi opens the panel, /pi models picks the models pi may use, /pi check checks the key-masking setup, /pi close',
     }).catch((err: unknown) => $.ui.log(`pi: /${COMMAND} not registered: ${String(err)}`))
     optionsWrittenAt = 0
     await writeOptions($)
@@ -908,8 +1001,11 @@ export const register: Register = (on, options) => {
       await $.ui.close({ id: PANE })
       return { text: 'pi sessions panel closed.' }
     }
+    await update($, viewAtom, () => (word === 'models' ? 'models' : 'sessions'))
     await load($)
     await $.ui.open({ id: PANE, title: TITLE })
+    if (word === 'models')
+      return { text: picked.length ? `pi models: ${picked.length} picked; pick or note them in the panel.` : 'pi models: none picked, so the gate takes any it allows. Pick them in the panel.' }
     const list = await read($, sessionsAtom)
     const live = list.filter(s => LIVE.includes(s.state)).length
     return { text: list.length ? `${list.length} pi session${list.length === 1 ? '' : 's'}, ${live} running.` : 'No pi sessions yet. Ask Claude to start one.' }
@@ -918,11 +1014,14 @@ export const register: Register = (on, options) => {
   // One tile per session, named and coloured by state, in rows that wrap; the card
   // below shows the picked one.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, sessionsAtom)
     const warnings = await read($, warningsAtom)
     const picked = await read($, selectedAtom)
     const liveView = await read($, liveAtom)
+    const view = await read($, viewAtom)
+    const picks = await read($, pickedAtom)
+    const modelList = await read($, modelListAtom)
     await read($, tickAtom)
     const now = await $.clock.now()
     const cols = Math.max(20, e.props.bodyColumns ?? 60)
@@ -987,17 +1086,68 @@ export const register: Register = (on, options) => {
       )
     }
 
+    const warned = warnings.map(w => (
+      <Text color="red" wrap="wrap">! {w}</Text>
+    ))
+    const toView = (v: 'sessions' | 'models') => () => void update($, viewAtom, () => v).catch(() => {})
+
+    // The Models view: pi's list (as `models` last found it) to pick from, each
+    // picked one with its note for Claude. A pick not in the list stays shown, to unpick.
+    if (view === 'models') {
+      const listed = modelList?.models ?? []
+      const ids = [...listed, ...picks.map(p => p.id).filter(id => !listed.includes(id))]
+      return (
+        <Box flexDirection="column">
+          {warned}
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2} key="models-bar">
+            <Text bold>Models</Text>
+            <Button key="models-done" plain hotkey="m" label="Done" onPress={toView('sessions')} />
+            <Button key="models-refresh" plain label="Refresh" onPress={() => ask($, 'List the models pi may use (pi-session models), so the pi panel can pick from them.')} />
+          </Box>
+          <Text dimColor wrap="wrap">
+            {picks.length
+              ? `serve and run take only the ${picks.length} picked; Claude chooses among them by their notes.`
+              : 'None picked: serve and run take any model the gate allows. Pick some to keep pi to them.'}
+          </Text>
+          <Text dimColor wrap="wrap">{modelList ? `pi's list from ${ago(modelList.listedAt, now) || 'a while'} ago.` : 'No list yet: Refresh asks Claude to run models.'}</Text>
+          <Box flexDirection="column" marginTop={1} key="models-list">
+            {ids.map(id => {
+              const p = picks.find(x => x.id === id)
+              return (
+                <Box flexDirection="column" key={`model-row:${id}`}>
+                  <Button
+                    key={`model:${id}`}
+                    plain
+                    label={`${p ? '[x]' : '[ ]'} ${clip(id, cols - 4)}${listed.includes(id) ? '' : ' (not in the list)'}`}
+                    onPress={() => void togglePick($, id).catch(() => {})}
+                  />
+                  {p && (
+                    <Input
+                      key={`note:${id}`}
+                      label="    note: "
+                      value={p.note}
+                      placeholder="what it is good for: reviews, fast and cheap…"
+                      submitLabel="save"
+                      onSubmit={(v: string) => void setNote($, id, v).catch(() => {})}
+                    />
+                  )}
+                </Box>
+              )
+            })}
+          </Box>
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column">
-        {warnings.map(w => (
-          <Text color="red" wrap="wrap">! {w}</Text>
-        ))}
-        {list.length === 0 && <Text dimColor>No pi sessions yet. Ask Claude to start one.</Text>}
-        {list.length > 0 && (
+        {warned}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2} key="head">
           <Text dimColor>
-            {list.length} session{list.length === 1 ? '' : 's'} · {live} running
+            {list.length ? `${list.length} session${list.length === 1 ? '' : 's'} · ${live} running` : 'No pi sessions yet. Ask Claude to start one.'}
           </Text>
-        )}
+          <Button key="models" plain hotkey="m" label={picks.length ? `Models (${picks.length})` : 'Models'} onPress={toView('models')} />
+        </Box>
         {list.length > 0 && (
           <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1} key="grid">
             {list.map(x => {

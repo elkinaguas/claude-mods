@@ -56,6 +56,13 @@ const OPTIONS_FILE = process.env.PI_SESSION_OPTIONS || path.join(os.userInfo().h
 // The mod rewrites the file every minute while Claude Code runs; an older one
 // is from a mod since turned off, so its options no longer hold.
 const OPTIONS_MAX_AGE_MS = 15 * 60 * 1000
+// What `models` last found, for the pi panel's model picker: the mod never runs
+// pi (it runs outside the sandbox), so it reads this instead. Anything sandboxed
+// can write it, which is fine: the picker only narrows what the gate takes.
+const MODEL_LIST = path.join(ROOT, '.models.json')
+// A model picked in the panel, as the options file holds it: provider/id and a short note.
+const MODEL_ID_RE = /^[A-Za-z0-9][\w.-]*\/[^\s\x00-\x1f\x7f]{1,200}$/
+const NOTE_MAX = 120
 const AUTH = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
 const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')
 // pi's own settings: defaultProvider and defaultModel name the model pi starts
@@ -166,7 +173,9 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       gave back.
   status [name] [--json]
   models           List the model ids serve and run would allow: pi's
-                   --list-models, kept to what passes the gate.
+                   --list-models, kept to what passes the gate and, when
+                   models are picked in the pi panel, to those. Keeps the
+                   list before the pick for the panel's picker.
   abort <name>     Stop pi's current run; the session stays.
   stop <name>      End the session; serve it again later to continue.
   forget <name> [--purge]
@@ -516,12 +525,20 @@ const readAuth = () => {
 // host with no login in auth.json. Either way every provider models.json
 // defines must be on a trusted host, so no other service's key sits there.
 // Reads only names, types and base URLs, never a key or a token.
-function gate(model, extra, trustedList, optionsWhy = null, fromDefault = false) {
+// With models picked in the pi panel, only those, on top of the rest.
+function gate(model, extra, options, fromDefault = false) {
   if (extra.length) fail(`extra pi arguments (${extra.join(' ')}) are off. ${GATE_NOTE}`)
-  const why = modelRefusal(model, trustedList, optionsWhy)
+  const why = modelRefusal(model, options.trustedHosts, options.why) ?? pickedRefusal(model, options.picked)
   if (why && fromDefault) fail(`pi's default model ${model} (${SETTINGS}) is not allowed: ${why} Pass --model.`)
   if (why) fail(why)
 }
+
+// Why a model the gate otherwise takes is refused for not being picked, or null.
+// No pick at all leaves the gate as it is.
+const pickedRefusal = (model, picked) =>
+  picked.length && !picked.some(p => p.id === model)
+    ? `${model} is not one of the models picked in the pi panel (${picked.map(p => p.id).join(', ')}). Use one of them, or ask the person to pick it there (/pi, Models).`
+    : null
 
 // Why the gate refuses this model, or null when it may run.
 function modelRefusal(model, trustedList, optionsWhy = null) {
@@ -566,7 +583,7 @@ function modelRefusal(model, trustedList, optionsWhy = null) {
 // The person's options from the pi mod's file, or both off (with why) when it
 // is missing, not a plain file, not the expected JSON, or too old.
 const readOptions = () => {
-  const off = why => ({ allowUnsandboxed: false, trustedHosts: '', why })
+  const off = why => ({ allowUnsandboxed: false, trustedHosts: '', picked: [], why })
   let st
   try {
     st = fs.lstatSync(OPTIONS_FILE)
@@ -583,8 +600,12 @@ const readOptions = () => {
   const hosts = o?.trustedModelHosts
   if (typeof o !== 'object' || !o || typeof o.allowUnsandboxed !== 'boolean' || !Array.isArray(hosts) || !hosts.every(h => typeof h === 'string' && parseHostEntry(h)) || typeof o.writtenAt !== 'number')
     return off(`${OPTIONS_FILE} is not what the pi mod writes`)
+  // The models picked in the panel; a mod from before the picker writes none.
+  const picked = o.models ?? []
+  if (!Array.isArray(picked) || !picked.every(p => p && typeof p.id === 'string' && MODEL_ID_RE.test(p.id) && typeof p.note === 'string' && p.note.length <= NOTE_MAX))
+    return off(`${OPTIONS_FILE} is not what the pi mod writes`)
   if (Date.now() - o.writtenAt > OPTIONS_MAX_AGE_MS) return off(`${OPTIONS_FILE} is old, so the pi mod is not running`)
-  return { allowUnsandboxed: o.allowUnsandboxed, trustedHosts: hosts.join(','), why: null }
+  return { allowUnsandboxed: o.allowUnsandboxed, trustedHosts: hosts.join(','), picked: picked.map(p => ({ id: p.id, note: p.note })), why: null }
 }
 
 // pi's default model as provider/id, from its settings, or null when they name none.
@@ -610,7 +631,9 @@ const parseModelList = text => {
     .map(([p, id]) => `${p}/${id}`)
 }
 
-// The ids serve and run would take: pi's own list, kept to what passes the gate.
+// The ids serve and run would take: pi's own list, kept to what passes the gate
+// and, with models picked in the panel, to those. The list before the pick goes
+// to MODEL_LIST, for the panel to pick from.
 function models(more) {
   if (more.length) fail(`models takes no arguments, not ${more.join(' ')}.`)
   const options = readOptions()
@@ -624,11 +647,20 @@ function models(more) {
     fail(`pi --list-models gave no model list${said ? `: ${said}` : ''}.`)
   }
   const allowed = all.filter(m => !modelRefusal(m, options.trustedHosts, options.why))
+  try {
+    fs.mkdirSync(ROOT, { recursive: true })
+    writeJson(MODEL_LIST, { listedAt: Date.now(), models: allowed })
+  } catch (err) {
+    process.stderr.write(`pi-session: could not keep the list for the pi panel (${err.code ?? err.message}).\n`)
+  }
   if (!allowed.length) {
     if (!all.length) fail(`pi lists no models. ${GATE_NOTE}`)
     fail(`none of pi's ${all.length} models is allowed. ${all[0]}: ${modelRefusal(all[0], options.trustedHosts, options.why)}`)
   }
-  process.stdout.write(`${allowed.join('\n')}\n`)
+  const taken = allowed.filter(m => !pickedRefusal(m, options.picked))
+  if (!taken.length)
+    fail(`none of the models picked in the pi panel (${options.picked.map(p => p.id).join(', ')}) is among the ${allowed.length} the gate allows. Ask the person to pick again (/pi, Models).`)
+  process.stdout.write(`${taken.join('\n')}\n`)
 }
 
 const needSandbox = options => {
@@ -649,7 +681,7 @@ async function serve(name, flags, extra, first = null) {
   const named = flags.model ?? meta.model
   const model = named ?? piDefaultModel()
   const thinking = flags.thinking ?? meta.thinking
-  gate(model, extra, options.trustedHosts, options.why, !named && !!model)
+  gate(model, extra, options, !named && !!model)
   // pi's own session id: reopened when the session is served again, and new
   // for a new session, so a name used again after forget starts afresh.
   const sessionId = meta.sessionId ?? `claude-${name}-${Date.now().toString(36)}`
@@ -873,6 +905,11 @@ async function serve(name, flags, extra, first = null) {
           if (m?.provider !== model.split('/')[0]) {
             // pi chose another provider than the gate let through: end the session.
             st.error = `pi runs ${st.model ?? 'no model'}, not ${model.split('/')[0]}. ${GATE_NOTE}`
+            log(`! ${st.error}`)
+            end()
+          } else if (pickedRefusal(st.model, options.picked)) {
+            // Or a model of that provider not picked in the panel.
+            st.error = `pi runs ${st.model}, ${pickedRefusal(st.model, options.picked)}`
             log(`! ${st.error}`)
             end()
           }

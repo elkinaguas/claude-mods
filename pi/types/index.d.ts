@@ -36,6 +36,20 @@ export type PiLive = {
   offset: number
 }
 
+/** A model picked in the panel's Models view: serve and run take only picked ones, when any are. */
+export type PiPick = {
+  /** provider/id, as `pi-session models` lists it. */
+  id: string
+  /** What it is good for, in a few words, for Claude to choose by; may be empty. */
+  note: string
+}
+
+/** The models `pi-session models` last found the gate allows (its .models.json), for the picker. */
+export type PiModelList = {
+  listedAt: number
+  models: string[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     pi: {
@@ -49,6 +63,12 @@ declare module 'claude-code' {
       tick: number
       /** The one card whose Live view is open, with the tail it shows; null when none is. */
       live: Shaped<PiLive | null>
+      /** The models picked in the Models view, as the options file holds them. */
+      picked: Shaped<PiPick[]>
+      /** The list the Models view picks from; null before `models` first ran. */
+      modelList: Shaped<PiModelList | null>
+      /** What the pane shows: the sessions, or the Models view. */
+      view: 'sessions' | 'models'
     }
   }
 }

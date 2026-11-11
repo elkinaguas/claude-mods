@@ -16,6 +16,9 @@ import {
   optionsText,
   usageLine,
   writesOptions,
+  cleanNote,
+  picksIn,
+  modelListIn,
 } from '../hooks/register'
 
 declare const setTimeout: (fn: (value?: unknown) => void, ms: number) => unknown
@@ -258,7 +261,8 @@ test('the mod writes the options file pi-session reads when a session starts', {
   expect(o.allowUnsandboxed).toBe(true)
   expect(o.trustedModelHosts).toEqual(['llm.corp.example.com'])
   expect(o.writtenAt >= before && o.writtenAt <= Date.now()).toBe(true)
-  expect(JSON.parse(optionsText({ allowUnsandboxed: false, trustedHosts: [] }, 5))).toEqual({ allowUnsandboxed: false, trustedModelHosts: [], writtenAt: 5 })
+  expect(o.models).toEqual([])
+  expect(JSON.parse(optionsText({ allowUnsandboxed: false, trustedHosts: [] }, 5))).toEqual({ allowUnsandboxed: false, trustedModelHosts: [], models: [], modelsChangedAt: 0, writtenAt: 5 })
 })
 
 test("Claude's file tools can't write the options file, also through a link; reading it is fine", async ($, on) => {
@@ -537,7 +541,7 @@ const pollingPane = async ($: any, on: any, session: object, startAt: number, fi
     const [dir, f] = path.split('/').slice(-2) as [string, string]
     return dir === 'demo' ? f : `${dir}/${f}`
   }
-  const clock = { now: startAt, panes: [] as object[], writes: [] as string[], reads: [] as string[], listed }
+  const clock = { now: startAt, panes: [] as object[], writes: [] as string[], reads: [] as string[], listed, written: {} as Record<string, string> }
   // Every timer's period waits for the next tick (the poll's, and an open Live view's).
   let waiting: (() => void)[] = []
   const release = () => {
@@ -548,7 +552,12 @@ const pollingPane = async ($: any, on: any, session: object, startAt: number, fi
   on('env.get', () => ({ value: HOME }))
   on('clock.now', () => ({ value: clock.now }))
   on('clock.every', () => new Promise(resolve => waiting.push(() => resolve({ value: undefined }))))
+  on('fs.write', (_: unknown, e: { path: string; text: string }) => {
+    clock.written[e.path] = e.text
+    return { value: undefined }
+  })
   on('fs.stat', (_: unknown, e: { path: string }) => {
+    if (e.path in clock.written) return { value: { kind: 'file', size: clock.written[e.path]!.length, mtimeMs: 0, isLink: false } }
     const f = fileOf(e.path)
     if (!(f in files)) throw new Error('missing')
     return { value: { kind: 'file', size: files[f]!.length, mtimeMs: 0, isLink: links.includes(f) } }
@@ -559,6 +568,7 @@ const pollingPane = async ($: any, on: any, session: object, startAt: number, fi
   on('ui.toast', () => ({ value: undefined }))
   on('fs.list', () => ({ value: clock.listed.map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) }))
   on('fs.read', (_: unknown, e: { path: string }) => {
+    if (e.path in clock.written) return { value: clock.written[e.path] }
     const [dir, name] = e.path.split('/').slice(-2) as [string, string]
     if (name === 'status.json' && clock.listed.includes(dir)) return { value: JSON.stringify(sessions[dir]) }
     const f = fileOf(e.path)
@@ -906,6 +916,99 @@ test('Live stays on as tiles are picked, moving to each session from its end, un
   await new Promise(resolve => setTimeout(resolve, 20))
   expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live')
   await ui.unmount()
+})
+
+const OPTIONS_PATH = '/home/u/.claude/plugins/data/pi/options.json'
+const compose = async ($: any) =>
+  ((await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] })).sections as { id: string; text: string }[]).find(s => s.id === 'pi:sessions')?.text ?? ''
+const settle = () => new Promise(resolve => setTimeout(resolve, 20))
+
+test("the Models view picks the models pi may use, a note each; the options file and Claude's instructions carry them", async ($, on) => {
+  const session = { state: 'idle', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
+  const files = { 'claude-sessions/.models.json': JSON.stringify({ listedAt: T0 - 120000, models: ['opencode-go/glm-5', 'opencode-go/kimi-k2.5', 'bad id', 7] }) }
+  const filled: string[] = []
+  on('prompt.compose', () => ({ sections: [] }))
+  on('prompt.fill', (_: unknown, e: { text: string }) => {
+    filled.push(e.text)
+    return { isFilled: true }
+  })
+  const { clock } = await pollingPane($, on, session, T0, files)
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ key: 'models' }))?.props.label).toBe('Models')
+  await ui.press({ key: 'models' })
+  await settle()
+  expect(await ui.find({ type: 'Text', text: /^None picked: serve and run take any model the gate allows/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: "pi's list from 2m ago." })).toBeDefined()
+  // Only what the list holds as provider/id.
+  expect((await ui.find({ key: 'model:opencode-go/glm-5' }))?.props.label).toBe('[ ] opencode-go/glm-5')
+  expect(await ui.find({ key: 'model:bad id' })).toBeUndefined()
+  expect(await ui.find({ key: 'note:opencode-go/glm-5' })).toBeUndefined()
+  // Picked: written to the options file at once, with a field for its note.
+  await ui.press({ key: 'model:opencode-go/kimi-k2.5' })
+  await settle()
+  expect((await ui.find({ key: 'model:opencode-go/kimi-k2.5' }))?.props.label).toBe('[x] opencode-go/kimi-k2.5')
+  expect(JSON.parse(clock.written[OPTIONS_PATH]!).models).toEqual([{ id: 'opencode-go/kimi-k2.5', note: '' }])
+  expect(await compose($)).toMatch(/- Models: the person picked the models pi may use .*serve and run refuse any other.* `opencode-go\/kimi-k2\.5`\./)
+  await ui.input({ key: 'note:opencode-go/kimi-k2.5', text: '  reviews,\n careful  ' })
+  await settle()
+  const written = JSON.parse(clock.written[OPTIONS_PATH]!)
+  expect(written.models).toEqual([{ id: 'opencode-go/kimi-k2.5', note: 'reviews, careful' }])
+  expect(written.modelsChangedAt > 0).toBe(true)
+  expect(await compose($)).toMatch(/`opencode-go\/kimi-k2\.5` \(reviews, careful\)\./)
+  expect(await ui.find({ type: 'Text', text: /^serve and run take only the 1 picked/ })).toBeDefined()
+  // Refresh asks Claude to list them: the mod never runs pi.
+  await ui.press({ key: 'models-refresh' })
+  expect(filled).toEqual(['List the models pi may use (pi-session models), so the pi panel can pick from them.'])
+  // Done: back to the sessions, the button counting the picks.
+  await ui.press({ key: 'models-done' })
+  await settle()
+  expect(await ui.find({ type: 'Text', text: /^demo/ })).toBeDefined()
+  expect((await ui.find({ key: 'models' }))?.props.label).toBe('Models (1)')
+  // Unpicked again: none in the file, none in the instructions.
+  await ui.press({ key: 'models' })
+  await settle()
+  await ui.press({ key: 'model:opencode-go/kimi-k2.5' })
+  await settle()
+  expect(JSON.parse(clock.written[OPTIONS_PATH]!).models).toEqual([])
+  expect(await compose($)).not.toMatch(/- Models:/)
+  await ui.unmount()
+})
+
+test('picks made in another Claude Code session are taken from the options file; one not in the list stays shown, to unpick', async ($, on) => {
+  const session = { state: 'idle', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
+  const there = { allowUnsandboxed: false, trustedModelHosts: [], models: [{ id: 'opencode-go/old-one', note: 'fast' }], modelsChangedAt: 1000, writtenAt: Date.now() }
+  on('prompt.compose', () => ({ sections: [] }))
+  const { clock } = await pollingPane($, on, session, T0, { 'pi/options.json': JSON.stringify(there) })
+  clock.panes = [OPEN]
+  // Taken at the session's start, and written back as they were.
+  expect(await compose($)).toMatch(/`opencode-go\/old-one` \(fast\)/)
+  expect(JSON.parse(clock.written[OPTIONS_PATH]!).models).toEqual(there.models)
+  // /pi models opens the Models view.
+  const ran = await $.command.run({ command: 'pi', args: 'models', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  expect(JSON.stringify(ran)).toMatch(/1 picked/)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'No list yet: Refresh asks Claude to run models.' })).toBeDefined()
+  expect((await ui.find({ key: 'model:opencode-go/old-one' }))?.props.label).toBe('[x] opencode-go/old-one (not in the list)')
+  // Another session picks again later: this one takes it at its next write, not the other way round.
+  clock.written[OPTIONS_PATH] = JSON.stringify({ ...there, models: [{ id: 'opencode-go/glm-5', note: '' }], modelsChangedAt: Date.now() + 1000 })
+  await $.session.start({ cwd: '/home/u/proj', surface: 'terminal', isInteractive: true })
+  await settle()
+  expect(JSON.parse(clock.written[OPTIONS_PATH]!).models).toEqual([{ id: 'opencode-go/glm-5', note: '' }])
+  expect(await compose($)).toMatch(/`opencode-go\/glm-5`\./)
+  await ui.unmount()
+})
+
+test('picks and model lists are read only as pi-session would take them; notes are one short line', () => {
+  expect(picksIn(JSON.stringify({ models: [{ id: 'opencode-go/glm-5', note: 'x' }], modelsChangedAt: 3 }))).toEqual({ models: [{ id: 'opencode-go/glm-5', note: 'x' }], changedAt: 3 })
+  expect(picksIn(JSON.stringify({ allowUnsandboxed: false }))).toEqual({ models: [], changedAt: 0 })
+  for (const models of [{}, [{ id: 'glm-5', note: '' }], [{ id: 'opencode-go/glm-5' }], [{ id: 'opencode-go/a b', note: '' }], [{ id: 'opencode-go/x', note: 'n'.repeat(121) }]])
+    expect(picksIn(JSON.stringify({ models }))).toBe(null)
+  expect(picksIn('not json')).toBe(null)
+  expect(modelListIn(JSON.stringify({ listedAt: 5, models: ['a/b', 'a/b', 'c d/e', 'f/g\u001b[31m', 3] }))).toEqual({ listedAt: 5, models: ['a/b'] })
+  expect(modelListIn('{}')).toBe(null)
+  expect(cleanNote('  fast\tand\n cheap \u001b[31m ')).toBe('fast and cheap [31m')
+  expect(cleanNote('n'.repeat(200)).length).toBe(120)
 })
 
 test('/pi check reports settings that do not parse instead of failing', async ($, on) => {
