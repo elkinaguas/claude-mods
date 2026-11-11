@@ -23,11 +23,17 @@ export type PiSession = {
   cost: number | null
 }
 
-/** A card's Live view: its session, and the lines of serve's live tail (live.json) last read. */
+/** A card's Live view: its session, the lines of serve's live tail (live.json) last read, and where it is scrolled. */
 export type PiLive = {
   name: string
-  /** pi's last tool calls (`→ tool args`) and reply text, the reply streaming now included; never tool output. */
+  /** pi's last tool calls (`→ tool args`) and reply text (up to 200), the reply streaming now included; never tool output. */
   lines: string[]
+  /** The number serve gave lines[0]: lines keep theirs as older ones drop off the front. */
+  first: number
+  /** How many of `lines` are finished; the rest is the reply streaming now. */
+  done: number
+  /** Display rows scrolled up from the live end; 0 follows it. */
+  offset: number
 }
 
 declare module 'claude-code' {
@@ -42,7 +48,7 @@ declare module 'claude-code' {
       /** Bumped by the poll while the pane is on screen, to redraw the card's age. */
       tick: number
       /** The one card whose Live view is open, with the tail it shows; null when none is. */
-      live: PiLive | null
+      live: Shaped<PiLive | null>
     }
   }
 }

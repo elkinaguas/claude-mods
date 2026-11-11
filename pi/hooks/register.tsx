@@ -42,16 +42,22 @@ const selectedAtom = atom({ plugin: 'pi', key: 'selected' } as const, null as st
 // Moved by the poll while the pane is on screen: reading it redraws the pane, so the card's age moves.
 const tickAtom = atom({ plugin: 'pi', key: 'tick' } as const, 0)
 // The one card whose Live view is open, and the tail serve last wrote for it.
-const liveAtom = atom({ plugin: 'pi', key: 'live' } as const, null as PiLive | null)
+const liveAtom = atom({ plugin: 'pi', key: 'live' } as const, null as PiLive | null, { shape: 'live-2' })
 
 // The Live view reads live.json (which serve rewrites at most every 300ms) this
 // often, only while it is open, its pane on screen and its session running.
 const LIVE_POLL_MS = 500
+// It shows LIVE_ROWS rows of the last LIVE_LINES lines serve keeps.
 const LIVE_ROWS = 20
-// pi can write in its session folder: a bigger file is not serve's.
-const LIVE_MAX_BYTES = 64 * 1024
+const LIVE_LINES = 200
+// pi can write in its session folder: a bigger file is not serve's (which keeps under it).
+const LIVE_MAX_BYTES = 256 * 1024
 let liveTimer: Timer | null = null
 let liveSeen = ''
+// As the pane last drew the view: its width, and the rows the view took at the
+// bottom of the pane's tree (0 when not drawn), so a wheel tick can be told to be over it.
+let liveCols = 60
+let liveDrawn = 0
 
 let home = ''
 let cwd = ''
@@ -456,15 +462,46 @@ async function readLive($: EngineInterface, name: string) {
   const text = st && st.kind === 'file' && !st.isLink && st.size <= LIVE_MAX_BYTES ? await $.fs.read(at).catch(() => null) : null
   // Missing, or the same as last time: nothing to redraw.
   if (text === null || text === liveSeen) return
-  let lines: string[]
+  let got: Omit<PiLive, 'name' | 'offset'>
   try {
     const v = obj(JSON.parse(text))
-    lines = Array.isArray(v.lines) ? v.lines.filter((l): l is string => typeof l === 'string').slice(-LIVE_ROWS) : []
+    const all = Array.isArray(v.lines) ? v.lines.filter((l): l is string => typeof l === 'string') : []
+    const cut = Math.max(0, all.length - LIVE_LINES)
+    const lines = all.slice(cut)
+    // A file without the numbers (an older serve's) counts as all finished, from 0.
+    const first = Math.max(0, Math.floor(num(v.first) ?? 0)) + cut
+    const done = Math.min(lines.length, Math.max(0, Math.floor(num(v.done) ?? all.length) - cut))
+    got = { lines, first, done }
   } catch {
     return
   }
   liveSeen = text
-  await update($, liveAtom, cur => (cur?.name === name ? { name, lines } : cur))
+  await update($, liveAtom, cur => (cur?.name === name ? { name, ...got, offset: keepPlace(cur, got, liveCols) } : cur))
+}
+
+/**
+ * Where a scrolled-up Live view stands once new lines came: as many rows more
+ * from the end as came after what it had, so the rows shown stay put. A view
+ * at the end (0) follows it; a new serve, numbering its lines afresh, too.
+ */
+export const keepPlace = (cur: Omit<PiLive, 'name'>, next: Omit<PiLive, 'name' | 'offset'>, cols: number): number => {
+  if (!cur.offset) return 0
+  const end = cur.first + cur.done
+  if (next.first < cur.first || next.first + next.done < end) return 0
+  // Rows of the lines numbered `from` on: lines before it are finished in both, the same.
+  const after = (lv: Omit<PiLive, 'name' | 'offset'>, from: number) => liveRows(lv.lines.slice(Math.max(0, from - lv.first)), cols).length
+  const offset = cur.offset + after(next, end) - after(cur, end)
+  return Math.min(Math.max(0, liveRows(next.lines, cols).length - LIVE_ROWS), Math.max(0, offset))
+}
+
+// Scrolls the open view back by `to` rows (negative: toward the end), or to its top or end.
+async function scrollLive($: EngineInterface, to: number | 'top' | 'end') {
+  await update($, liveAtom, cur => {
+    if (!cur) return cur
+    const max = Math.max(0, liveRows(cur.lines, liveCols).length - LIVE_ROWS)
+    const offset = to === 'end' ? 0 : to === 'top' ? max : Math.min(max, Math.max(0, cur.offset + to))
+    return offset === cur.offset ? cur : { ...cur, offset }
+  })
 }
 
 const stopLiveTimer = () => {
@@ -490,7 +527,7 @@ async function syncLive($: EngineInterface, shown: boolean) {
 async function openLive($: EngineInterface, name: string) {
   stopLiveTimer()
   liveSeen = ''
-  await update($, liveAtom, () => ({ name, lines: [] }))
+  await update($, liveAtom, () => ({ name, lines: [], first: 0, done: 0, offset: 0 }))
   // The card stays on this session while its view is open.
   await update($, selectedAtom, () => name)
   await readLive($, name).catch(() => {})
@@ -532,17 +569,29 @@ const wrapRows = (s: string, n: number) => {
   return out
 }
 
-/** The Live view's rows: tool calls cut to the pane's width, reply text wrapped to it, the last 20. */
+/** The Live view's rows, all of them: tool calls cut to the pane's width, reply text wrapped to it. */
 export const liveRows = (lines: string[], cols: number): string[] => {
   const n = Math.max(10, cols)
   const rows: string[] = []
-  for (const raw of lines.slice(-LIVE_ROWS)) {
-    // No control characters reach the terminal; of a long reply line only its end can be among the last rows.
+  for (const raw of lines) {
+    // No control characters reach the terminal; a long reply line keeps its end, at most a view's worth of rows.
     const line = raw.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')
     if (line.startsWith('→ ')) rows.push(clip(line, n))
     else rows.push(...wrapRows(line.slice(-n * LIVE_ROWS), n))
   }
-  return rows.slice(-LIVE_ROWS)
+  return rows
+}
+
+/**
+ * The 20 rows the view shows, `offset` rows up from the end (clamped to what
+ * there is), with how many rows are above (`older`) and below (`newer`) them.
+ */
+export const liveWindow = (rows: string[], offset: number) => {
+  const max = Math.max(0, rows.length - LIVE_ROWS)
+  const at = Math.min(max, Math.max(0, Math.floor(offset) || 0))
+  const end = rows.length - at
+  const start = Math.max(0, end - LIVE_ROWS)
+  return { rows: rows.slice(start, end), older: start, newer: at, offset: at, max }
 }
 
 const instructions = ($: EngineInterface) => `# pi sessions (pi mod)
@@ -587,6 +636,7 @@ export const register: Register = (on, options) => {
   // A reload drops the timers; the next poll starts an open view's again.
   liveTimer = null
   liveSeen = ''
+  liveDrawn = 0
 
   on('session.start', async ($, e, next) => {
     home = (await $.env.get('HOME')) ?? ''
@@ -680,6 +730,8 @@ export const register: Register = (on, options) => {
     await read($, tickAtom)
     const now = await $.clock.now()
     const cols = Math.max(20, e.props.bodyColumns ?? 60)
+    liveCols = cols
+    liveDrawn = 0
 
     const fallback = [...list].sort((a, b) => rank(a.state) - rank(b.state))[0]
     const s = list.find(x => x.name === picked) ?? fallback
@@ -694,7 +746,9 @@ export const register: Register = (on, options) => {
       // A busy session counts from the start of its run, the others from pi's last event.
       const since = s.state === 'busy' && s.runStartedAt ? s.runStartedAt : s.lastActivity
       // Open, the Live view takes the place of the one tool line and the start of the last reply.
-      const tail = liveView?.name === s.name ? liveRows(liveView.lines, cols) : null
+      const tail = liveView?.name === s.name ? liveWindow(liveRows(liveView.lines, cols), liveView.offset) : null
+      // The view is the card's last part, so the pane's last rows: a wheel tick over them scrolls it.
+      liveDrawn = tail ? 1 + (tail.older ? 1 : 0) + Math.max(1, tail.rows.length) + (tail.newer ? 1 : 0) : 0
       return (
         <Box flexDirection="column" key="card">
           <Text>
@@ -706,12 +760,6 @@ export const register: Register = (on, options) => {
           {!tail && activity && <Text>{clip(activity, cols * 2)}</Text>}
           {s.error && <Text color="red" wrap="wrap">error: {s.error}</Text>}
           {!tail && s.lastReply && <Text dimColor wrap="wrap">last: {s.lastReply}</Text>}
-          {tail && (
-            <Box flexDirection="column" marginTop={1} key="tail">
-              <Text dimColor>{clip(`live · tool calls and reply, last ${LIVE_ROWS} lines`, cols)}</Text>
-              {tail.length ? tail.map(row => <Text wrap="truncate-end">{row}</Text>) : <Text dimColor>(nothing yet)</Text>}
-            </Box>
-          )}
           <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1} key="actions">
             {s.state === 'busy' && <Button key="abort" plain hotkey="a" label="Abort" onPress={() => void runScript($, ['abort', s.name])} />}
             {isLive && <Button key="stop" plain hotkey="s" label="Stop" onPress={() => void runScript($, ['stop', s.name])} />}
@@ -720,6 +768,23 @@ export const register: Register = (on, options) => {
             <Button key="transcript" plain hotkey="t" label="Transcript" onPress={() => ask($, `Show me the last 40 lines of the pi session ${s.name}'s transcript.`)} />
             {!isLive && <Button key="forget" plain hotkey="f" label="Forget" onPress={() => void runScript($, ['forget', s.name])} />}
           </Box>
+          {tail && (
+            // Under the actions, so they stay put as the tail grows. Scrolled
+            // up, it stays on the rows shown as lines come (paused) until
+            // `↓ N newer`, End or scrolling down takes it back to the end.
+            <Box flexDirection="column" marginTop={1} key="tail">
+              <Box flexDirection="row" columnGap={2} key="tail-bar">
+                <Text dimColor wrap="truncate-end">
+                  {`live · tool calls and reply${tail.newer ? ' · paused' : ''}`}
+                </Text>
+                {tail.offset < tail.max && <Button key="live-up" plain hotkey="k" label="▲" onPress={() => void scrollLive($, 1).catch(() => {})} />}
+                {tail.offset > 0 && <Button key="live-down" plain hotkey="j" label="▼" onPress={() => void scrollLive($, -1).catch(() => {})} />}
+              </Box>
+              {tail.older > 0 && <Text dimColor>{`↑ ${tail.older} older`}</Text>}
+              {tail.rows.length ? tail.rows.map(row => <Text wrap="truncate-end">{row}</Text>) : <Text dimColor>(nothing yet)</Text>}
+              {tail.newer > 0 && <Button key="live-end" plain label={`↓ ${tail.newer} newer`} onPress={() => void scrollLive($, 'end').catch(() => {})} />}
+            </Box>
+          )}
         </Box>
       )
     }
@@ -777,5 +842,30 @@ export const register: Register = (on, options) => {
         {s && card(s)}
       </Box>
     )
+  })
+
+  // The person's wheel over the open Live view, or their scroll keys while it
+  // is in sight, scroll the view rather than the pane: arrows and ticks by
+  // rows, PageUp/PageDown by its 20, Home and End to its top and end. At the
+  // view's edge, or with the pointer elsewhere, Live closed or a tail that
+  // fits, the pane scrolls as ever.
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    if (e.origin.kind !== 'person' || !e.by || !liveDrawn) return next(e)
+    const lv = await read($, liveAtom)
+    if (!lv) return next(e)
+    const { offset, max } = liveWindow(liveRows(lv.lines, liveCols), lv.offset)
+    if (!max) return next(e)
+    // The pane's window before this move, and the tree row the view starts at.
+    const top = Math.min(Math.max(0, e.contentRows - e.bodyRows), Math.max(0, e.offset - e.by))
+    const from = e.contentRows - liveDrawn
+    if (e.pointer) {
+      const row = top + e.pointer.row
+      if (row < from || row >= e.contentRows) return next(e)
+    } else if (top + e.bodyRows <= from) return next(e)
+    if (e.by < 0 ? offset >= max : offset <= 0) return next(e)
+    const n = Math.abs(e.by)
+    const rows = e.pointer ? n : n === e.contentRows ? max : n === e.bodyRows ? LIVE_ROWS : n
+    await scrollLive($, e.by < 0 ? rows : -rows)
+    return {}
   })
 }

@@ -1195,6 +1195,55 @@ test('a long or control-laden reply line is kept to its end, without control cha
   child.kill()
 })
 
+test('live.json keeps the last 200 lines, numbered as they drop off the front; read --live still prints 20', async () => {
+  const child = await serve('longer')
+  assert.equal(cli('wait', 'longer', cli('send', 'longer', 'lines=250').trim(), '--timeout', '5'), `${Array.from({ length: 250 }, (_, i) => `row ${i}`).join('\n')}\n`)
+  await until(() => liveFile('longer').lines.at(-1) === 'row 249' && liveFile('longer').streaming === false)
+  // The tool line and 250 rows: the first 51 are let go, and lines[0] is number 51.
+  let lv = liveFile('longer')
+  assert.equal(lv.lines.length, 200)
+  assert.equal(lv.lines[0], 'row 50')
+  assert.equal(lv.first, 51)
+  assert.equal(lv.done, 200)
+  const shown = cli('read', 'longer', '--live').trimEnd().split('\n')
+  assert.deepEqual(shown, Array.from({ length: 20 }, (_, i) => `row ${230 + i}`))
+  assert.equal(cli('read', 'longer', '--live', '--tail', '50').trimEnd().split('\n').length, 50)
+  assert.equal(cli('read', 'longer', '--live', '--tail', '999').trimEnd().split('\n').length, 200)
+  // Four more lines: four more let go, each line keeping its number.
+  cli('wait', 'longer', cli('send', 'longer', 'lines=3').trim(), '--timeout', '5')
+  await until(() => liveFile('longer').first === 55)
+  lv = liveFile('longer')
+  assert.equal(lv.lines[0], 'row 54')
+  assert.deepEqual(lv.lines.slice(-4), ['→ read README.md', 'row 0', 'row 1', 'row 2'])
+  cli('stop', 'longer')
+  await until(() => status('longer').state === 'stopped')
+  child.kill()
+})
+
+test('live.json stays under the 256 KB the panel reads: 200 wide lines fit, and fewer are kept past it', async () => {
+  const child = await serve('heavy')
+  const size = () => fs.statSync(path.join(root, 'heavy', 'live.json')).size
+  // 200 lines at the 400-character cap, each character three bytes: they all fit.
+  cli('wait', 'heavy', cli('send', 'heavy', 'lines=250:390').trim(), '--timeout', '10')
+  await until(() => liveFile('heavy').lines.at(-1)?.startsWith('row 249 ') && liveFile('heavy').streaming === false)
+  let lv = liveFile('heavy')
+  assert.equal(lv.lines.length, 200)
+  assert.equal(lv.lines.at(-1), `row 249 ${'€'.repeat(390)}`)
+  assert.ok(size() <= 256 * 1024, `${size()} bytes`)
+  // Characters JSON spells in six bytes each: fewer lines, still under the limit, still numbered.
+  cli('wait', 'heavy', cli('send', 'heavy', 'lines=250:390!').trim(), '--timeout', '10')
+  await until(() => liveFile('heavy').first > 251 && liveFile('heavy').streaming === false)
+  lv = liveFile('heavy')
+  assert.ok(size() <= 256 * 1024, `${size()} bytes`)
+  assert.ok(lv.lines.length > 80 && lv.lines.length < 200, `${lv.lines.length} lines`)
+  assert.equal(lv.first + lv.lines.length, 502)
+  assert.equal(lv.done, lv.lines.length)
+  assert.ok(lv.lines.at(-1).startsWith('row 249 \ud800'))
+  cli('stop', 'heavy')
+  await until(() => status('heavy').state === 'stopped')
+  child.kill()
+})
+
 test('names that pi would refuse are refused', () => {
   assert.match(cliFails('send', 'alpha/../x', 'hi').out, /not a session name/)
 })
