@@ -1093,6 +1093,42 @@ test('status lists sessions in one line each', () => {
   assert.match(cli('status'), /^alpha {2}idle {2}opencode-go\/echo/m)
 })
 
+test("status shows the conversation's turns, and pi's tokens and cost when it reports them, across serves", async () => {
+  const ask = (name, text) => cli('wait', name, cli('send', name, text).trim(), '--timeout', '5')
+  let live = await serve('counted')
+  assert.doesNotMatch(cli('status', 'counted'), /turn|tok|\$/)
+  ask('counted', 'one')
+  // Only the assistant message's usage: the tool result's is left out.
+  assert.deepEqual(status('counted').usage, { input: 1200, output: 300, cacheRead: 8000, cacheWrite: 500, cost: 0.0042 })
+  assert.match(cli('status', 'counted'), /^counted {2}idle .* ago {2}1 turn · 10\.0k tok · \$0\.004$/m)
+  ask('counted', 'two')
+  // A provider that reports no usage still counts the turn.
+  ask('counted', 'nousage')
+  assert.match(cli('status', 'counted'), / ago {2}3 turns · 20\.0k tok · \$0\.008$/m)
+  cli('stop', 'counted')
+  await until(() => status('counted').state === 'stopped')
+  live.kill()
+  // Serving again carries it on: it covers the whole conversation. A model with no prices adds tokens, not cost.
+  live = await serve('counted')
+  ask('counted', 'free')
+  assert.match(cli('status', 'counted'), / ago {2}4 turns · 30\.0k tok · \$0\.008$/m)
+  const [row] = JSON.parse(cli('status', 'counted', '--json'))
+  assert.equal(row.turns, 4)
+  assert.equal(row.usage.input, 3600)
+  cli('stop', 'counted')
+  await until(() => status('counted').state === 'stopped')
+  live.kill()
+  // An older status.json without the fields shows none of it; one with turns alone shows only those.
+  const st = status('counted')
+  for (const [n, fields] of [['old-none', { turns: undefined, usage: undefined }], ['old-turns', { turns: 3, usage: undefined }]]) {
+    fs.mkdirSync(path.join(root, n))
+    fs.writeFileSync(path.join(root, n, 'status.json'), JSON.stringify({ ...st, ...fields, name: n }))
+  }
+  assert.match(cli('status', 'old-none'), / ago\n/)
+  assert.match(cli('status', 'old-turns'), / ago {2}3 turns\n/)
+  for (const n of ['old-none', 'old-turns', 'counted']) fs.rmSync(path.join(root, n), { recursive: true })
+})
+
 test('names that pi would refuse are refused', () => {
   assert.match(cliFails('send', 'alpha/../x', 'hi').out, /not a session name/)
 })

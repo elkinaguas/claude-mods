@@ -36,7 +36,7 @@ const rank = (state: string) => {
   return i === -1 ? ATTENTION.length : i
 }
 
-const sessionsAtom = atom({ plugin: 'pi', key: 'sessions' } as const, [] as PiSession[], { shape: 'sessions-2' })
+const sessionsAtom = atom({ plugin: 'pi', key: 'sessions' } as const, [] as PiSession[], { shape: 'sessions-3' })
 const warningsAtom = atom({ plugin: 'pi', key: 'warnings' } as const, [] as string[])
 const selectedAtom = atom({ plugin: 'pi', key: 'selected' } as const, null as string | null)
 // Moved by the poll while the pane is on screen: reading it redraws the pane, so the card's age moves.
@@ -353,8 +353,25 @@ const toSession = (name: string, raw: Json, now: number): PiSession => {
     lastReply: str(raw.lastReply),
     error: str(raw.error),
     sandboxed: typeof raw.sandboxed === 'boolean' ? raw.sandboxed : null,
+    ...usageOf(raw),
   }
 }
+
+const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0)
+// status.json's turns, and its usage summed by pi-session from pi's assistant messages.
+const usageOf = (raw: Json) => {
+  const u = obj(raw.usage)
+  const tokens = ['input', 'output', 'cacheRead', 'cacheWrite'].reduce((n, k) => n + count(u[k]), 0)
+  return { turns: count(raw.turns), tokens: tokens || null, cost: count(u.cost) || null }
+}
+
+const fmtTokens = (n: number) =>
+  n < 1000 ? `${n}` : n < 99950 ? `${(n / 1e3).toFixed(1)}k` : n < 999500 ? `${Math.round(n / 1e3)}k` : n < 99950000 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e6)}M`
+const fmtCost = (c: number) => (c < 0.001 ? '<$0.001' : `$${c.toFixed(c < 10 ? 3 : 2)}`)
+
+/** "12 turns · 48.2k tok · $0.031", each part only when there is something to show (as pi-session status). */
+export const usageLine = (s: { turns: number; tokens: number | null; cost: number | null }) =>
+  [s.turns && `${s.turns} turn${s.turns === 1 ? '' : 's'}`, s.tokens && `${fmtTokens(s.tokens)} tok`, s.cost && fmtCost(s.cost)].filter(Boolean).join(' · ')
 
 async function load($: EngineInterface) {
   const entries = await $.fs.list(sessionsDir()).catch(() => [])
@@ -572,7 +589,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column" key="card">
           <Text>
             <Text bold>{s.name}</Text> <Text color={STATE_COLOR[s.state] ?? 'white'}>{s.state}</Text>
-            <Text dimColor> {ago(since, now)}</Text>
+            <Text dimColor> {[ago(since, now), usageLine(s)].filter(Boolean).join(' · ')}</Text>
           </Text>
           <Text dimColor>{clip(`${s.model ?? '-'}  ${short(s.cwd)}`, cols)}</Text>
           {s.sandboxed === false && <Text color="red" bold wrap="wrap">! runs outside the sandbox: pi holds your real provider key</Text>}

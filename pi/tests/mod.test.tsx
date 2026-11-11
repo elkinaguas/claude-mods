@@ -11,6 +11,7 @@ import {
   sandboxSetting,
   settingsProblems,
   optionsText,
+  usageLine,
   writesOptions,
 } from '../hooks/register'
 
@@ -400,6 +401,16 @@ test('CA expiry is read from openssl output', () => {
   expect(daysLeft('garbage', now)).toBe(null)
 })
 
+test('the usage line shows turns, tokens and cost, each only when there is one', () => {
+  expect(usageLine({ turns: 0, tokens: null, cost: null })).toBe('')
+  expect(usageLine({ turns: 1, tokens: null, cost: null })).toBe('1 turn')
+  expect(usageLine({ turns: 12, tokens: 48210, cost: 0.0312 })).toBe('12 turns · 48.2k tok · $0.031')
+  expect(usageLine({ turns: 3, tokens: 950, cost: null })).toBe('3 turns · 950 tok')
+  expect(usageLine({ turns: 3, tokens: 99960, cost: 0.0004 })).toBe('3 turns · 100k tok · <$0.001')
+  expect(usageLine({ turns: 80, tokens: 999600, cost: 12.345 })).toBe('80 turns · 1.0M tok · $12.35')
+  expect(usageLine({ turns: 200, tokens: 123456789, cost: null })).toBe('200 turns · 123M tok')
+})
+
 const PANE = {
   plugin: 'pi',
   component: 'Pane',
@@ -410,7 +421,16 @@ const PANE = {
 test('the panel lists sessions from their status files', async ($, on) => {
   const now = Date.parse('2026-10-28T18:00:00Z')
   const status = {
-    demo: { state: 'busy', cwd: '/home/u/proj', model: 'opencode-go/glm-5.3', heartbeatAt: now - 1000, lastActivity: now - 5000, lastTool: 'read src/a.ts' },
+    demo: {
+      state: 'busy',
+      cwd: '/home/u/proj',
+      model: 'opencode-go/glm-5.3',
+      heartbeatAt: now - 1000,
+      lastActivity: now - 5000,
+      lastTool: 'read src/a.ts',
+      turns: 12,
+      usage: { input: 30000, output: 2200, cacheRead: 15000, cacheWrite: 1000, cost: 0.031 },
+    },
     old: { state: 'idle', cwd: '/home/u/x', model: 'opencode-go/glm-5.3', heartbeatAt: now - 600000, lastActivity: now - 600000 },
   } as Record<string, object>
   on('env.get', () => ({ value: HOME }))
@@ -435,7 +455,7 @@ test('the panel lists sessions from their status files', async ($, on) => {
   await $.session.start({ cwd: '/home/u/proj', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 5s/)
+  expect((await ui.find({ type: 'Text', text: /^demo/ }))?.text).toMatch(/demo busy 5s · 12 turns · 48\.2k tok · \$0\.031$/)
   expect((await ui.find({ type: 'Text', text: /→ read src\/a\.ts/ }))?.text).toBe('→ read src/a.ts')
   // One tile per session; the busy one is picked before the lost one.
   expect(await ui.find({ key: 'session:demo' })).toBeDefined()
@@ -446,7 +466,8 @@ test('the panel lists sessions from their status files', async ($, on) => {
   // Pressing a tile shows that session's card instead. Its heartbeat
   // stopped ten minutes ago: the serve is gone.
   await ui.press({ key: 'session:old' })
-  expect((await ui.find({ type: 'Text', text: /^old/ }))?.text).toMatch(/old lost 10m/)
+  // A status.json from before the counts shows none of them.
+  expect((await ui.find({ type: 'Text', text: /^old/ }))?.text).toMatch(/old lost 10m$/)
   expect((await ui.find({ type: 'Text', text: /~\/x/ }))?.text).toMatch(/~\/x/)
   expect(await ui.find({ key: 'abort' })).toBeUndefined()
   expect(await ui.find({ key: 'forget' })).toBeDefined()
