@@ -2,10 +2,13 @@
 // A stand-in for `pi --mode rpc`: answers get_state, runs each prompt as one
 // turn (a tool call, then "echo: <prompt>"), and opens a confirm dialog when
 // the prompt says "ask", refuses a prompt that says "reject", and works for
-// ten minutes (until aborted) on one that says "slow". One holding reply=<url-encoded text> gets
+// ten minutes (until aborted) on one that says "slow" ("stream": after
+// streaming part of a reply). Replies stream in as message_update deltas. One holding reply=<url-encoded text> gets
 // that text as its reply. "nag" asks again each time it hears no; "nag=<n>" asks n times, then replies. Enough of pi's protocol to test pi-session.
 
 const out = r => process.stdout.write(`${JSON.stringify(r)}\n`)
+// What the read tool "gives back": file contents, which the live tail must never show.
+const TOOL_OUTPUT = 'TOOL-OUTPUT: the file holds secret=hunter2'
 // --list-models: a table laid out as pi's own (columns padded to the widest
 // cell, two spaces apart, sorted by provider then id), then exit.
 if (process.argv.includes('--list-models')) {
@@ -36,7 +39,18 @@ const run = msg => {
   out({ type: 'agent_start' })
   out({ type: 'turn_start' })
   out({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'README.md' } })
-  out({ type: 'tool_execution_end', toolCallId: 't1', toolName: 'read', isError: false, durationMs: 3 })
+  // What the tool gave back: never shown in the live tail.
+  out({ type: 'tool_execution_update', toolCallId: 't1', toolName: 'read', partialResult: { content: [{ type: 'text', text: TOOL_OUTPUT }] } })
+  out({ type: 'tool_execution_end', toolCallId: 't1', toolName: 'read', isError: false, durationMs: 3, result: { content: [{ type: 'text', text: TOOL_OUTPUT }] } })
+  if (/\bstream\b/.test(msg)) {
+    // Streams part of a reply as bare text deltas, then works until aborted.
+    for (const delta of ['Reading the', ' code now.\nNext I will', ' run the tests'])
+      out({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta } })
+    slow = setTimeout(() => finish(msg), 600000)
+    return
+  }
+  // "flood": a reply in 400 tiny deltas at once, as a fast model streams.
+  if (/\bflood\b/.test(msg)) for (let i = 0; i < 400; i++) out({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'x' } })
   if (/\bslow\b/.test(msg)) {
     out({ type: 'tool_execution_start', toolCallId: 't2', toolName: 'bash', args: { command: 'npm test -- --watch' } })
     slow = setTimeout(() => finish(msg), 600000)
@@ -81,8 +95,17 @@ const finish = (msg, extra = '') => {
       cost: free ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } : { input: 0.0012, output: 0.0012, cacheRead: 0.0008, cacheWrite: 0.001, total: 0.0042 },
     }
   }
+  // The reply streams in, as pi sends it: each update carries the partial message so far.
+  for (let at = 0; at < text.length; at += Math.ceil(text.length / 3) || 1) {
+    const partial = text.slice(0, at + (Math.ceil(text.length / 3) || 1))
+    out({
+      type: 'message_update',
+      message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'thinking it over' }, { type: 'text', text: partial }] },
+      assistantMessageEvent: { type: 'text_delta', contentIndex: 1, delta: partial.slice(at) },
+    })
+  }
   // A tool result can carry usage too (a subagent's); pi-session counts only assistant messages.
-  out({ type: 'message_end', message: { role: 'toolResult', toolCallId: 't1', content: [], usage: { input: 99999, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 99999, cost: { total: 9 } } } })
+  out({ type: 'message_end', message: { role: 'toolResult', toolCallId: 't1', content: [{ type: 'text', text: TOOL_OUTPUT }], usage: { input: 99999, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 99999, cost: { total: 9 } } } })
   out({ type: 'message_end', message })
   out({ type: 'turn_end', message: {}, toolResults: [] })
   out({ type: 'agent_end', messages: [], willRetry: false })

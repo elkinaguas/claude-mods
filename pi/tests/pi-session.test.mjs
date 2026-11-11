@@ -1129,6 +1129,72 @@ test("status shows the conversation's turns, and pi's tokens and cost when it re
   for (const n of ['old-none', 'old-turns', 'counted']) fs.rmSync(path.join(root, n), { recursive: true })
 })
 
+const liveFile = name => JSON.parse(fs.readFileSync(path.join(root, name, 'live.json'), 'utf8'))
+
+test('read --live shows the tool calls and the reply as it streams, never what a tool gave back', async () => {
+  const child = await serve('watched')
+  assert.equal(cli('read', 'watched', '--live'), '(nothing yet)\n')
+  // Mid-reply: the text streamed so far, from bare deltas.
+  const id = cli('send', 'watched', 'stream').trim()
+  await until(() => fs.existsSync(path.join(root, 'watched', 'live.json')) && liveFile('watched').lines.at(-1)?.endsWith('run the tests'))
+  assert.equal(liveFile('watched').streaming, true)
+  assert.equal(cli('read', 'watched', '--live'), '→ read README.md\nReading the code now.\nNext I will run the tests\n')
+  // Aborted mid-reply: what had streamed stays.
+  cliFails('wait', 'watched', id, '--timeout', '1', '--abort')
+  await until(() => liveFile('watched').streaming === false)
+  assert.match(cli('read', 'watched', '--live'), /Next I will run the tests\n$/)
+  // A finished reply, streamed as partial messages: its text once, not its thinking.
+  assert.equal(cli('wait', 'watched', cli('send', 'watched', 'a finished one').trim(), '--timeout', '5'), 'echo: a finished one\n')
+  await until(() => cli('read', 'watched', '--live').endsWith('→ read README.md\necho: a finished one\n'))
+  const shown = cli('read', 'watched', '--live')
+  assert.equal(shown.match(/echo: a finished one/g).length, 1)
+  assert.doesNotMatch(shown, /TOOL-OUTPUT|hunter2|thinking it over/)
+  assert.doesNotMatch(fs.readFileSync(path.join(root, 'watched', 'live.json'), 'utf8'), /TOOL-OUTPUT|hunter2/)
+  // The transcript has the tool's line, but not its output either.
+  assert.doesNotMatch(cli('read', 'watched', '--tail', '100'), /TOOL-OUTPUT/)
+  // The last 20 lines only.
+  for (let i = 0; i < 12; i++) cli('send', 'watched', `round ${i}`)
+  assert.equal(cli('wait', 'watched', '--timeout', '10'), 'echo: round 11\n')
+  await until(() => cli('read', 'watched', '--live').endsWith('echo: round 11\n'))
+  const lines = cli('read', 'watched', '--live').trimEnd().split('\n')
+  assert.equal(lines.length, 20)
+  assert.deepEqual(lines.slice(-2), ['→ read README.md', 'echo: round 11'])
+  // --live is read's alone: in a prompt it is just a word.
+  assert.equal(cli('wait', 'watched', cli('send', 'watched', 'say', '--live').trim(), '--timeout', '5'), 'echo: say --live\n')
+  assert.match(cliFails('read', 'nobody-here', '--live').out, /no session nobody-here/)
+  cli('stop', 'watched')
+  await until(() => status('watched').state === 'stopped')
+  child.kill()
+})
+
+test('a reply streamed in hundreds of deltas rewrites the live tail only a few times', async () => {
+  const child = await serve('flooded')
+  let writes = 0
+  const watcher = fs.watch(path.join(root, 'flooded'), (_, f) => f === 'live.json' && writes++)
+  assert.equal(cli('wait', 'flooded', cli('send', 'flooded', 'flood').trim(), '--timeout', '5'), 'echo: flood\n')
+  await until(() => cli('read', 'flooded', '--live').endsWith('echo: flood\n'))
+  await new Promise(r => setTimeout(r, 400))
+  watcher.close()
+  assert.ok(writes >= 1 && writes <= 6, `${writes} writes`)
+  cli('stop', 'flooded')
+  await until(() => status('flooded').state === 'stopped')
+  child.kill()
+})
+
+test('a long or control-laden reply line is kept to its end, without control characters, in the live tail', async () => {
+  const child = await serve('wide')
+  const text = `${'x'.repeat(500)}END\u001b[31m\ttab`
+  cli('wait', 'wide', cli('send', 'wide', `reply=${encodeURIComponent(text)}`).trim(), '--timeout', '5')
+  await until(() => liveFile('wide').lines.length === 2)
+  const last = liveFile('wide').lines.at(-1)
+  assert.equal(last.length, 400)
+  assert.ok(last.startsWith('…'))
+  assert.ok(last.endsWith('END[31m  tab'))
+  cli('stop', 'wide')
+  await until(() => status('wide').state === 'stopped')
+  child.kill()
+})
+
 test('names that pi would refuse are refused', () => {
   assert.match(cliFails('send', 'alpha/../x', 'hi').out, /not a session name/)
 })
