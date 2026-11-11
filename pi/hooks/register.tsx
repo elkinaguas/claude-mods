@@ -53,6 +53,8 @@ const LIVE_LINES = 200
 // pi can write in its session folder: a bigger file is not serve's (which keeps under it).
 const LIVE_MAX_BYTES = 256 * 1024
 let liveTimer: Timer | null = null
+// The session whose live.json the timer reads.
+let liveTimerFor = ''
 let liveSeen = ''
 // As the pane last drew the view: its width, and the rows the view took at the
 // bottom of the pane's tree (0 when not drawn), so a wheel tick can be told to be over it.
@@ -619,10 +621,13 @@ async function writeOptions($: EngineInterface) {
 async function poll($: EngineInterface) {
   await writeOptions($)
   await load($).catch(() => {})
-  const panes = await $.ui.panes().catch(() => [])
-  const shown = panes.some(p => p.id === PANE && p.isShown)
+  const panes = await $.ui.panes().catch(() => null)
+  const shown = !!panes?.some(p => p.id === PANE && p.isShown)
   if (shown) await update($, tickAtom, n => n + 1)
-  await syncLive($, shown).catch(() => {})
+  // Live lasts while the panel is open: one gone without a close we heard (an unload) turns it off.
+  if (panes && !panes.some(p => p.id === PANE)) {
+    if (await read($, liveAtom)) await closeLive($).catch(() => {})
+  } else await syncLive($, shown).catch(() => {})
 }
 
 // The Live view. The panel reads serve's live.json as it reads status.json
@@ -634,7 +639,7 @@ async function readLive($: EngineInterface, name: string) {
   // Never through a link (it could lead to any file of yours), nor a file serve would not write.
   const text = st && st.kind === 'file' && !st.isLink && st.size <= LIVE_MAX_BYTES ? await $.fs.read(at).catch(() => null) : null
   // Missing, or the same as last time: nothing to redraw.
-  if (text === null || text === liveSeen) return
+  if (text === null || `${name}\n${text}` === liveSeen) return
   let got: Omit<PiLive, 'name' | 'offset'>
   try {
     const v = obj(JSON.parse(text))
@@ -648,8 +653,12 @@ async function readLive($: EngineInterface, name: string) {
   } catch {
     return
   }
-  liveSeen = text
-  await update($, liveAtom, cur => (cur?.name === name ? { name, ...got, offset: keepPlace(cur, got, liveCols) } : cur))
+  // Read for a view since moved on (a pick while this read was out): dropped, and not remembered as seen.
+  await update($, liveAtom, cur => {
+    if (cur?.name !== name) return cur
+    liveSeen = `${name}\n${text}`
+    return { name, ...got, offset: keepPlace(cur, got, liveCols) }
+  })
 }
 
 /**
@@ -684,14 +693,23 @@ const stopLiveTimer = () => {
 
 // The view's timer runs only while it is open, its pane on screen and its
 // session running; a session that stopped gets one last read.
+//
+// The view moves to another session while a sync is out (a pick, Live
+// pressed), so the sessions are read first and the view last, with nothing
+// awaited between reading the view and acting on it; the timer remembers whose
+// file it reads, and closing closes only the view this sync read.
 async function syncLive($: EngineInterface, shown: boolean) {
+  const list = await read($, sessionsAtom)
   const lv = await read($, liveAtom)
   if (!lv) return stopLiveTimer()
-  const s = (await read($, sessionsAtom)).find(x => x.name === lv.name)
-  if (!s) return closeLive($)
+  if (liveTimer && liveTimerFor !== lv.name) stopLiveTimer()
+  const s = list.find(x => x.name === lv.name)
+  if (!s) return closeLive($, lv.name)
   const want = shown && LIVE.includes(s.state)
-  if (want && !liveTimer) liveTimer = $.clock.every(LIVE_POLL_MS, () => void readLive($, lv.name).catch(() => {}))
-  else if (!want && liveTimer) {
+  if (want && !liveTimer) {
+    liveTimerFor = lv.name
+    liveTimer = $.clock.every(LIVE_POLL_MS, () => void readLive($, lv.name).catch(() => {}))
+  } else if (!want && liveTimer) {
     stopLiveTimer()
     await readLive($, lv.name).catch(() => {})
   }
@@ -707,17 +725,20 @@ async function openLive($: EngineInterface, name: string) {
   await syncLive($, true)
 }
 
-async function closeLive($: EngineInterface) {
+// Closes the open view, or with a name only that session's (a view moved on stays open).
+async function closeLive($: EngineInterface, name?: string) {
   stopLiveTimer()
   liveSeen = ''
-  await update($, liveAtom, () => null)
+  await update($, liveAtom, cur => (name === undefined || cur?.name === name ? null : cur))
 }
 
-// Picking another session's tile closes the open view: one card is live at a time.
+// Live is a mode of the panel: picking another session's tile while it is on
+// moves the view to that session (from its live end), still one card's file
+// read at a time. It stays on until Live off, or the panel closes.
 async function pick($: EngineInterface, name: string) {
-  await update($, selectedAtom, () => name)
   const lv = await read($, liveAtom)
-  if (lv && lv.name !== name) await closeLive($)
+  if (lv && lv.name !== name) return openLive($, name)
+  await update($, selectedAtom, () => name)
 }
 
 const ago = (ms: number | null, now: number) => {
@@ -820,6 +841,8 @@ export const register: Register = (on, options) => {
     }).catch((err: unknown) => $.ui.log(`pi: /${COMMAND} not registered: ${String(err)}`))
     optionsWrittenAt = 0
     await writeOptions($)
+    // Live lasts only while the panel is open, so never across a restart.
+    await closeLive($).catch(() => {})
     await load($).catch(() => {})
     $.clock.every(POLL_MS, () => void poll($).catch(() => {}))
     const problems = await check($).catch(() => [] as string[])
@@ -1017,6 +1040,13 @@ export const register: Register = (on, options) => {
         {s && card(s)}
       </Box>
     )
+  })
+
+  // Closing the panel (the person's mark, /pi close) turns Live off: it lasts only while the panel is open.
+  on('ui.close', async ($, e, next) => {
+    const closed = await next(e)
+    if (e.id === PANE) await closeLive($).catch(() => {})
+    return closed
   })
 
   // The person's wheel over the open Live view, or their scroll keys while it

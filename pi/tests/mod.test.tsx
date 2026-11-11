@@ -527,9 +527,17 @@ test('the panel lists sessions from their status files', async ($, on) => {
 // One session and a hand on the poll: each tick() lets one period of
 // clock.every through, then waits for what it set off.
 // `files` are the session's other files by name (live.json), `links` the names that are links;
-// `reads` counts what was read of them.
-const pollingPane = async ($: any, on: any, session: object, startAt: number, files: Record<string, string> = {}, links: string[] = []) => {
-  const clock = { now: startAt, panes: [] as object[], writes: [] as string[], reads: [] as string[] }
+// `reads` counts what was read of them. `others` are more sessions by name
+// (their files in `files` as `name/live.json`), listed after demo; `listed` the names fs.list gives.
+const pollingPane = async ($: any, on: any, session: object, startAt: number, files: Record<string, string> = {}, links: string[] = [], others: Record<string, object> = {}) => {
+  const sessions: Record<string, object> = { demo: session, ...others }
+  const listed = Object.keys(sessions)
+  // A session's file by its path: demo's by name, another's as `name/file`.
+  const fileOf = (path: string) => {
+    const [dir, f] = path.split('/').slice(-2) as [string, string]
+    return dir === 'demo' ? f : `${dir}/${f}`
+  }
+  const clock = { now: startAt, panes: [] as object[], writes: [] as string[], reads: [] as string[], listed }
   // Every timer's period waits for the next tick (the poll's, and an open Live view's).
   let waiting: (() => void)[] = []
   const release = () => {
@@ -541,19 +549,20 @@ const pollingPane = async ($: any, on: any, session: object, startAt: number, fi
   on('clock.now', () => ({ value: clock.now }))
   on('clock.every', () => new Promise(resolve => waiting.push(() => resolve({ value: undefined }))))
   on('fs.stat', (_: unknown, e: { path: string }) => {
-    const f = e.path.split('/').pop()!
-    if (!e.path.includes('/demo/') || !(f in files)) throw new Error('missing')
+    const f = fileOf(e.path)
+    if (!(f in files)) throw new Error('missing')
     return { value: { kind: 'file', size: files[f]!.length, mtimeMs: 0, isLink: links.includes(f) } }
   })
   on('command.register', () => ({ value: { command: 'pi' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.panes', () => ({ value: clock.panes }))
   on('ui.toast', () => ({ value: undefined }))
-  on('fs.list', () => ({ value: [{ name: 'demo', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] }))
+  on('fs.list', () => ({ value: clock.listed.map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) }))
   on('fs.read', (_: unknown, e: { path: string }) => {
-    if (e.path.endsWith('/demo/status.json')) return { value: JSON.stringify(session) }
-    const f = e.path.split('/').pop()!
-    if (e.path.includes('/demo/') && f in files) {
+    const [dir, name] = e.path.split('/').slice(-2) as [string, string]
+    if (name === 'status.json' && clock.listed.includes(dir)) return { value: JSON.stringify(sessions[dir]) }
+    const f = fileOf(e.path)
+    if (f in files) {
       clock.reads.push(f)
       return { value: files[f] }
     }
@@ -848,6 +857,54 @@ test('the wheel over the Live view scrolls it, elsewhere the pane; scroll keys m
   await $.ui.scroll(scrollEvent(1, 100, 30, { offset: 1 }))
   expect(pane).toEqual([-1, -1, 1, -1, 1])
   expect(await shownRows(ui)).toEqual(numbered(80, 100))
+  await ui.unmount()
+})
+
+test('Live stays on as tiles are picked, moving to each session from its end, until the panel closes', async ($, on) => {
+  const busy = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
+  const files = { 'live.json': liveFile(numbered(0, 50)), 'other/live.json': liveFile(['→ read other.ts', 'other says hi']) }
+  on('ui.close', () => ({ value: undefined }))
+  const { clock, tick } = await pollingPane($, on, busy, T0, files, [], { other: { ...busy } })
+  clock.panes = [OPEN]
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await pressLive(ui)
+  await ui.press({ key: 'live-up' })
+  expect(await shownRows(ui)).toEqual(numbered(29, 49))
+  // Another tile: the card is that session's, still live, from its end; only its file is read now.
+  await ui.press({ key: 'session:other' })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  expect((await ui.find({ type: 'Text', text: /^other/ }))?.text).toMatch(/^other busy/)
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live off')
+  expect(await ui.find({ type: 'Text', text: 'other says hi' })).toBeDefined()
+  expect(await shownRows(ui)).toEqual([])
+  clock.reads.length = 0
+  await tick()
+  await tick()
+  expect(clock.reads.length > 0).toBe(true)
+  expect(clock.reads.every(f => f === 'other/live.json')).toBe(true)
+  // Back to demo: from its end again, not where it was scrolled.
+  await ui.press({ key: 'session:demo' })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  expect(await shownRows(ui)).toEqual(numbered(30, 50))
+  expect(await ui.find({ key: 'live-end' })).toBeUndefined()
+  // Closing the panel turns it off; opened again, the card is as before.
+  await $.command.run({ command: 'pi', args: 'close', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live')
+  expect(await ui.find({ type: 'Text', text: /^live · / })).toBeUndefined()
+  // A panel gone without a close heard (an unload) turns it off at the next poll.
+  await pressLive(ui)
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live off')
+  clock.panes = []
+  await tick()
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live')
+  // And a new Claude Code session starts with it off.
+  clock.panes = [OPEN]
+  await pressLive(ui)
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live off')
+  await $.session.start({ cwd: '/home/u/proj', surface: 'terminal', isInteractive: true })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live')
   await ui.unmount()
 })
 
