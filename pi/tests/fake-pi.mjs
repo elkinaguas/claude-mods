@@ -4,7 +4,7 @@
 // the prompt says "ask", refuses a prompt that says "reject", and works for
 // ten minutes (until aborted) on one that says "slow" ("stream": after
 // streaming part of a reply). Replies stream in as message_update deltas. One holding reply=<url-encoded text> gets
-// that text as its reply, one holding lines=<n> a reply of n lines. "nag" asks again each time it hears no; "nag=<n>" asks n times, then replies. Enough of pi's protocol to test pi-session.
+// that text as its reply, one holding lines=<n> a reply of n lines. "nag" asks again each time it hears no; "nag=<n>" asks n times, then replies. "retry": a model error, then the reply, in one run (pi retried); "fail": the reply, then a model error that ends the run. Enough of pi's protocol to test pi-session.
 
 const out = r => process.stdout.write(`${JSON.stringify(r)}\n`)
 // What the read tool "gives back": file contents, which the live tail must never show.
@@ -114,7 +114,10 @@ const finish = (msg, extra = '') => {
   }
   // A tool result can carry usage too (a subagent's); pi-session counts only assistant messages.
   out({ type: 'message_end', message: { role: 'toolResult', toolCallId: 't1', content: [{ type: 'text', text: TOOL_OUTPUT }], usage: { input: 99999, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 99999, cost: { total: 9 } } } })
+  const modelError = { type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'provider overloaded' } }
+  if (/\bretry\b/.test(msg)) out(modelError)
   out({ type: 'message_end', message })
+  if (/\bfail\b/.test(msg)) out(modelError)
   out({ type: 'turn_end', message: {}, toolResults: [] })
   out({ type: 'agent_end', messages: [], willRetry: false })
   if (queue.length) return run(queue.shift())
