@@ -68,7 +68,22 @@ const run = msg => {
 const finish = (msg, extra = '') => {
   const scripted = /\breply=(\S+)/.exec(msg)
   const text = scripted ? decodeURIComponent(scripted[1]) : `echo: ${msg}${extra}`
-  out({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }] } })
+  const message = { role: 'assistant', content: [{ type: 'text', text }] }
+  // pi's Usage shape (packages/ai). "nousage": a provider that reports none; "free": no prices for the model.
+  if (!/\bnousage\b/.test(msg)) {
+    const free = /\bfree\b/.test(msg)
+    message.usage = {
+      input: 1200,
+      output: 300,
+      cacheRead: 8000,
+      cacheWrite: 500,
+      totalTokens: 10000,
+      cost: free ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } : { input: 0.0012, output: 0.0012, cacheRead: 0.0008, cacheWrite: 0.001, total: 0.0042 },
+    }
+  }
+  // A tool result can carry usage too (a subagent's); pi-session counts only assistant messages.
+  out({ type: 'message_end', message: { role: 'toolResult', toolCallId: 't1', content: [], usage: { input: 99999, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 99999, cost: { total: 9 } } } })
+  out({ type: 'message_end', message })
   out({ type: 'turn_end', message: {}, toolResults: [] })
   out({ type: 'agent_end', messages: [], willRetry: false })
   if (queue.length) return run(queue.shift())

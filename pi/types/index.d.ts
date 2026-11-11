@@ -15,6 +15,12 @@ export type PiSession = {
   error: string | null
   /** false when serve ran outside Claude Code's sandbox (allowUnsandboxed); null from an older serve. */
   sandboxed: boolean | null
+  /** pi's turns over the whole conversation; 0 from an older serve. */
+  turns: number
+  /** pi's tokens over the conversation (input, output, cache read and write), or null when it reported none. */
+  tokens: number | null
+  /** pi's cost in dollars over the conversation, or null when it reported none. */
+  cost: number | null
 }
 
 declare module 'claude-code' {

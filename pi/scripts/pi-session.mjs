@@ -198,6 +198,33 @@ const ago = ms => {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`
 }
 
+// pi's AssistantMessage.usage (packages/ai Usage): input, output, cacheRead and
+// cacheWrite tokens, and cost.total in dollars, 0 when pi has no prices for the model.
+const USAGE_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite']
+const count = v => (Number.isFinite(v) && v > 0 ? v : 0)
+// Adds one assistant message's usage to the conversation's; nothing when pi reported none.
+const addUsage = (st, u) => {
+  if (!u || typeof u !== 'object') return
+  const tokens = USAGE_KEYS.map(k => count(u[k]))
+  const cost = count(u.cost?.total)
+  if (!tokens.some(Boolean) && !cost) return
+  const sum = st.usage && typeof st.usage === 'object' ? st.usage : {}
+  USAGE_KEYS.forEach((k, i) => (sum[k] = count(sum[k]) + tokens[i]))
+  sum.cost = count(sum.cost) + cost
+  st.usage = sum
+}
+const fmtTokens = n =>
+  n < 1000 ? `${n}` : n < 99950 ? `${(n / 1e3).toFixed(1)}k` : n < 999500 ? `${Math.round(n / 1e3)}k` : n < 99950000 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e6)}M`
+const fmtCost = c => (c < 0.001 ? '<$0.001' : `$${c.toFixed(c < 10 ? 3 : 2)}`)
+// "12 turns · 48.2k tok · $0.031", each part only when there is something to show.
+const usageLine = st => {
+  const turns = count(st?.turns)
+  const u = st?.usage && typeof st.usage === 'object' ? st.usage : {}
+  const tokens = USAGE_KEYS.reduce((n, k) => n + count(u[k]), 0)
+  const cost = count(u.cost)
+  return [turns && `${turns} turn${turns === 1 ? '' : 's'}`, tokens && `${fmtTokens(tokens)} tok`, cost && fmtCost(cost)].filter(Boolean).join(' · ')
+}
+
 // Splits a stream on LF only: Node's readline also splits on U+2028/U+2029,
 // which are valid inside JSON strings (pi's RPC docs call this out).
 const onLines = (stream, fn) => {
@@ -614,6 +641,8 @@ async function serve(name, flags, extra, first = null) {
     lastRunAborted: before?.lastRunAborted ?? false,
     prompts: before?.prompts ?? {},
     turns: before?.turns ?? 0,
+    // pi's token counts and cost over the whole conversation; null until pi reports any.
+    usage: before?.usage ?? null,
     lastTool: null,
     lastReply: before?.lastReply ?? null,
     declined: [],
@@ -777,6 +806,7 @@ async function serve(name, flags, extra, first = null) {
       case 'message_end': {
         const msg = r.message
         if (msg?.role !== 'assistant') break
+        addUsage(st, msg.usage)
         const text = (Array.isArray(msg.content) ? msg.content : [])
           .filter(c => c.type === 'text')
           .map(c => c.text)
@@ -1049,7 +1079,8 @@ function status(name, flags) {
   if (flags.json) return process.stdout.write(`${JSON.stringify(rows, null, 2)}\n`)
   if (!rows.length) return process.stdout.write(`No pi sessions in ${ROOT}.\n`)
   for (const r of rows) {
-    process.stdout.write(`${r.name}  ${r.shown}  ${r.model ?? '-'}  ${r.cwd ?? '-'}  active ${ago(r.lastActivity)} ago${r.sandboxed === false ? '  UNSANDBOXED' : ''}\n`)
+    const used = usageLine(r)
+    process.stdout.write(`${r.name}  ${r.shown}  ${r.model ?? '-'}  ${r.cwd ?? '-'}  active ${ago(r.lastActivity)} ago${used ? `  ${used}` : ''}${r.sandboxed === false ? '  UNSANDBOXED' : ''}\n`)
     const detail = r.error ? `error: ${r.error}` : r.lastTool ? `→ ${r.lastTool}` : r.lastReply ? `last: ${r.lastReply}` : ''
     if (detail) process.stdout.write(`  ${oneLine(detail, 160)}\n`)
     const declined = declinedCount(r)
