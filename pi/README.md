@@ -98,7 +98,7 @@ Without the sandbox (with `allowUnsandboxed` on), Claude could read `models.json
 pi-session serve <name> [--model PROVIDER/ID] [--cwd DIR] [--thinking LEVEL]
 pi-session run <name> [--model PROVIDER/ID] [--cwd DIR] [--thinking LEVEL] [--format findings] [--timeout SECONDS [--abort]] [--out FILE] [--keep] <prompt...> | --file FILE | -
 pi-session send <name> [--steer] [--format findings] <prompt...> | --file FILE | -
-pi-session wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]   # exit 2: timed out (--abort stops the run); 4: bad findings
+pi-session wait <name> [ID] [--timeout SECONDS [--abort]] [--out FILE]   # exit 2: timed out (--abort stops the run); 3: no reply of its own; 4: bad findings
 pi-session read <name> [--last | --live [--tail N] | --tail N | --since LINE]   # --live: the last 20 lines of the live tail (--tail: up to 200)
 pi-session status [name] [--json]   # with the conversation's turns, and pi's tokens and cost when it reports them
 pi-session models   # the model ids the gate allows, from pi's own --list-models
@@ -112,13 +112,15 @@ Each session keeps `status.json`, `transcript.md`, `last-reply.md`, `live.json` 
 
 `forget --purge` also deletes pi's copy of the conversation, which can't be undone. Like `forget`, it refuses a running session. It takes the path pi reported, kept in `status.json`, and deletes it only if it is a plain file inside the real `~/.pi/agent/sessions`, reached by no link. It refuses a link, a folder, the sessions folder itself, anything outside it, or a `~/.pi/agent/sessions` that is itself a link. If pi never reported a path, or nothing is there, it says pi's copy was not found; it never searches for one. Any of these exits 1 and deletes nothing, so `status.json` still says where the copy was; plain `forget` then drops the session's folder and keeps whatever pi has. The panel's Forget button never purges.
 
-`run` is `serve`, `send` and `wait` in one call and one process, meant as one background Bash call. It goes through the same gate and sandbox checks as `serve`, refuses a session that is already running, and checks `--out` and the prompt before pi starts. Its output, `--out`, findings check, and exit codes 2 and 4 are `wait`'s. Then:
+`run` is `serve`, `send` and `wait` in one call and one process, meant as one background Bash call. It goes through the same gate and sandbox checks as `serve`, refuses a session that is already running, and checks `--out` and the prompt before pi starts. Its output, `--out`, findings check, and exit codes 2, 3 and 4 are `wait`'s. Then:
 
 - **After the reply** it stops the session, whatever the reply was, and exits. `--keep` leaves the session running for `send` and `wait`; the call then ends when the session does, with the reply's exit code if that was not 0.
 - **A timeout** with `--abort` stops pi's run, as `wait` does, then the session. Without `--abort`, `wait` would leave pi working, but here that needs this process: it exits 2 and stops the session. With `--keep` the session stays either way, and the code comes when it ends.
 - **A kill** (Claude Code restarting, say) takes pi and the waiter together. The session shows as lost; `serve` or `run` under the same name reopens the conversation.
 
 `wait --out FILE` writes the reply to `FILE` and prints only its path and size, also after a timeout with `--abort`, which keeps long reports out of Claude's context. `FILE` must be somewhere sandboxed commands can write, such as the project or the scratchpad. Paths into `~/.pi` are refused, also through links and relative paths. Without the sandbox (option `allowUnsandboxed`), nothing else limits it, so `FILE` must also be under the folder the command runs in or the temp folder, unless that folder holds your home folder, and never in `.git` or `.claude`.
+
+When a prompt has no reply of its own (pi refused it or hit an error, its run was aborted, or it wrote no reply text), `wait` exits 3 and says why on stderr. It prints nothing and writes nothing, so an older reply is never passed off as this prompt's: `--out FILE` is not created, and an existing `FILE` is left as it was. A reply pi writes after retrying past a model error in the same run still counts, for findings too; text written before the error the run ended on does not. A prompt that settled along with a later one (queued behind it in the same run) can't be told apart from it, so `wait` gives the last reply as before. A timeout with `--abort` still exits 2 with the last reply before the abort.
 
 `send --format findings` asks pi for one fenced JSON array, in a fixed schema so a script can merge reports from several models:
 

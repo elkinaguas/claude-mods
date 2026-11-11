@@ -147,10 +147,91 @@ test('pi hears once per conversation not to stop for questions, also after servi
   cli('forget', 'noted')
 })
 
-test('a prompt pi refuses ends wait with the error instead of hanging', () => {
+test('a prompt pi refuses ends wait with the error instead of hanging, exit 3', () => {
   const id = cli('send', 'alpha', 'please reject this').trim()
-  assert.match(cli('wait', 'alpha', id, '--timeout', '5'), /^error: prompt: no model selected\n/)
+  const refused = cliFails('wait', 'alpha', id, '--timeout', '5')
+  assert.equal(refused.code, 3)
+  assert.match(refused.out, new RegExp(`alpha has no reply to prompt ${id}: prompt: no model selected\\. Nothing was printed or written`))
   assert.equal(status('alpha').state, 'idle')
+})
+
+// The bug this guards: wait gave the previous prompt's reply, or wrote it to --out, and exited 0.
+test('a plain prompt refused, aborted or with no reply of its own exits 3: no stale reply printed, nothing written', async () => {
+  const dest = path.join(fs.realpathSync(root), 'no-reply', 'report.md')
+  const stale = 'an older reply that must not come back'
+  cli('wait', 'alpha', cli('send', 'alpha', stale).trim(), '--timeout', '5')
+  const noReply = (id, why, extra = []) => {
+    const r = spawnSync('node', [SCRIPT, 'wait', 'alpha', id, '--timeout', '5', ...extra], { env, encoding: 'utf8' })
+    assert.equal(r.status, 3, r.stderr)
+    assert.equal(r.stdout, '')
+    assert.ok(!r.stderr.includes(stale), r.stderr)
+    assert.match(r.stderr, new RegExp(`^pi-session: alpha has no reply to prompt ${id}: ${why}\\.`))
+  }
+  const refused = cli('send', 'alpha', 'please reject this').trim()
+  noReply(refused, 'prompt: no model selected')
+  noReply(refused, 'prompt: no model selected', ['--out', dest])
+  assert.ok(!fs.existsSync(dest))
+  const silent = cli('send', 'alpha', 'silent').trim()
+  noReply(silent, 'pi wrote no reply to it')
+  // An existing FILE is left as it was.
+  fs.writeFileSync(dest, 'kept\n')
+  noReply(silent, 'pi wrote no reply to it', ['--out', dest])
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'kept\n')
+  const slow = cli('send', 'alpha', 'slow: a long job').trim()
+  await until(() => status('alpha').state === 'busy' && status('alpha').lastTool?.startsWith('bash'))
+  cli('abort', 'alpha')
+  await until(() => status('alpha').state === 'idle')
+  noReply(slow, 'its run was aborted', ['--out', dest])
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'kept\n')
+  // wait with no ID covers the last prompt the same way.
+  const r = spawnSync('node', [SCRIPT, 'wait', 'alpha', '--timeout', '5'], { env, encoding: 'utf8' })
+  assert.equal(r.status, 3)
+  assert.match(r.stderr, /alpha has no reply to the last prompt: its run was aborted/)
+  // A normal reply after them still comes, printed and through --out.
+  const fine = cli('send', 'alpha', 'all good').trim()
+  assert.equal(cli('wait', 'alpha', fine, '--timeout', '5'), 'echo: all good\n')
+  assert.equal(cli('wait', 'alpha', fine, '--timeout', '5', '--out', dest), `${dest} (15 bytes)\n`)
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: all good\n')
+  fs.rmSync(path.dirname(dest), { recursive: true })
+})
+
+test('a reply pi writes after a model error in the same run (it retried) stands; text before a failure does not', () => {
+  const dest = path.join(fs.realpathSync(root), 'retried.md')
+  const retried = cli('send', 'alpha', 'retry this').trim()
+  assert.equal(cli('wait', 'alpha', retried, '--timeout', '5'), 'echo: retry this\n')
+  assert.equal(status('alpha').error, null)
+  assert.match(cli('read', 'alpha', '--tail', '10'), /! provider overloaded/)
+  assert.equal(cli('wait', 'alpha', retried, '--timeout', '5', '--out', dest), `${dest} (17 bytes)\n`)
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: retry this\n')
+  // Text, then an error the run ends on: that text is not its reply.
+  const failed = cli('send', 'alpha', 'fail this').trim()
+  const r = spawnSync('node', [SCRIPT, 'wait', 'alpha', failed, '--timeout', '5', '--out', dest], { env, encoding: 'utf8' })
+  assert.equal(r.status, 3, r.stderr)
+  assert.equal(r.stdout, '')
+  assert.match(r.stderr, new RegExp(`alpha has no reply to prompt ${failed}: provider overloaded\\.`))
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'echo: retry this\n')
+  // The same for findings: a retried run's reply is checked, a failed one's is not.
+  const good = cli('send', 'alpha', '--format', 'findings', `retry ${scripted(fence([finding]))}`).trim()
+  assert.deepEqual(JSON.parse(cli('wait', 'alpha', good, '--timeout', '5')), [finding])
+  const bad = cli('send', 'alpha', '--format', 'findings', `fail ${scripted(fence([finding]))}`).trim()
+  const no = cliFails('wait', 'alpha', bad, '--timeout', '5')
+  assert.equal(no.code, 4)
+  assert.match(no.out, /no valid findings: provider overloaded/)
+  fs.rmSync(dest)
+})
+
+// Settled along with a later prompt, its own reply can't be told apart: kept as before.
+test('a plain prompt refused while another runs, settled with it, still gets the last reply as before', async () => {
+  const slow = cli('send', 'alpha', 'stream: then reply').trim()
+  await until(() => status('alpha').state === 'busy')
+  const refused = cli('send', 'alpha', 'please reject this').trim()
+  await until(() => status('alpha').error === 'prompt: no model selected')
+  cli('abort', 'alpha')
+  await until(() => status('alpha').state === 'idle')
+  // The aborted run settled the refused prompt too: that one has its error, exit 3.
+  assert.equal(cliFails('wait', 'alpha', refused, '--timeout', '5').code, 3)
+  // The first can't be told apart from it: the old behaviour, error line and last reply, exit 0.
+  assert.match(cli('wait', 'alpha', slow, '--timeout', '5'), /^error: prompt: no model selected\n/)
 })
 
 test('a wait that times out with --abort stops the run', () => {
@@ -1049,10 +1130,21 @@ test('run --out and findings go through the wait path: path and size, the array 
   cli('forget', 'outs')
 })
 
-test('a prompt pi refuses ends run with the error, as it does wait', async () => {
-  const run = await runOnce(['refused', ...AT, 'please reject this'])
-  assert.equal(run.code, 0, run.err)
-  assert.match(run.out, /^error: prompt: no model selected\n/)
+test('a prompt pi refuses ends run with the error and exit 3, as it does wait', async () => {
+  const first = await runOnce(['refused', ...AT, 'an older reply'])
+  assert.equal(first.code, 0, first.err)
+  const dest = path.join(fs.realpathSync(root), 'run-refused.md')
+  const run = await runOnce(['refused', '--out', dest, 'please reject this'])
+  assert.equal(run.code, 3, run.err)
+  assert.equal(run.out, '')
+  assert.match(run.err, /refused has no reply to prompt p[0-9a-z]+: prompt: no model selected\. Nothing was printed or written/)
+  assert.ok(!fs.existsSync(dest))
+  assert.equal(status('refused').state, 'stopped')
+  // With no reply text, the same: nothing printed, exit 3.
+  const silent = await runOnce(['refused', 'silent'])
+  assert.equal(silent.code, 3, silent.err)
+  assert.equal(silent.out, '')
+  assert.match(silent.err, /refused has no reply to prompt p[0-9a-z]+: pi wrote no reply to it/)
   assert.equal(status('refused').state, 'stopped')
   cli('forget', 'refused')
 })

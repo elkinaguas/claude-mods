@@ -68,6 +68,9 @@ const GATE_NOTE = `The pi mod works only with an ${PROVIDER} API key, or a model
 const PI_HOME = path.join(os.homedir(), '.pi')
 // Where pi keeps its own copy of each conversation: all that forget --purge may delete.
 const PI_CONVERSATIONS = path.join(PI_HOME, 'agent', 'sessions')
+// `wait` exits with this when a plain prompt has no reply of its own: pi
+// refused it or hit an error, its run was aborted, or it wrote no reply.
+const NO_REPLY = 3
 // `wait` exits with this when a findings prompt's reply fails its check.
 const BAD_FINDINGS = 4
 // The live tail (read --live, the panel's Live view): pi's last lines of tool
@@ -148,6 +151,11 @@ const USAGE = `pi-session: long-lived pi sessions for Claude Code
       stops pi's run. Sessions never stop for questions: a dialog an extension
       opens is declined at once, and wait names it on stderr. --out writes the
       reply to FILE and prints only its path and size; FILE can't be in ~/.pi.
+      Exit 3 if the prompt has no reply of its own (pi refused it or hit an
+      error, its run was aborted, or it wrote no reply): the reason goes to
+      stderr, nothing is printed or written, and an existing FILE is left as
+      it was. One that settled along with a later prompt can't be told apart
+      from it: wait gives the last reply.
       A findings reply comes as the JSON array alone. Exit 4 if it fails the
       check, or its run was aborted, wrote no reply, or settled along with a
       later prompt: the error is reported, nothing is written, read --last has it.
@@ -451,6 +459,8 @@ const checkFindings = reply => {
   }
   return { findings }
 }
+const noReply = (name, id, why) =>
+  fail(`${name} has no reply to ${id ? `prompt ${id}` : 'the last prompt'}: ${why}. Nothing was printed or written; the transcript: read ${name}.`, NO_REPLY)
 const noFindings = (name, why, code) => fail(`${name} gave no valid findings: ${why}. Nothing was written; its raw reply: read ${name} --last.`, code)
 
 const lastReply = name => (fs.existsSync(file(name, 'last-reply.md')) ? fs.readFileSync(file(name, 'last-reply.md'), 'utf8') : '')
@@ -784,6 +794,11 @@ async function serve(name, flags, extra, first = null) {
   }, START_MS).unref()
 
   let declines = 0
+  // This run's model error while st.error still holds it, and the error st.error
+  // held before it (a refused prompt's, say): a reply pi writes after the error
+  // (it retried) clears the one and puts the other back.
+  let modelError = null
+  let beforeModelError = null
   // Declined since the last run settled: still news for the next one, as in the list.
   let unreported = 0
   let lastDeltaSave = 0
@@ -884,6 +899,7 @@ async function serve(name, flags, extra, first = null) {
       case 'agent_start':
         st.state = 'busy'
         st.error = null
+        modelError = null
         st.runStartedAt = Date.now()
         // What an earlier run already reported; one asked since then is still news.
         st.declined = st.declined.filter(d => !d.done)
@@ -911,8 +927,15 @@ async function serve(name, flags, extra, first = null) {
           log(`\n## pi · ${clock()}\n${text}`)
         }
         if (msg.stopReason === 'error' || msg.errorMessage) {
+          if (modelError == null || st.error !== modelError) beforeModelError = st.error
           st.error = oneLine(msg.errorMessage ?? 'model error', 200)
+          modelError = st.error
           log(`! ${st.error}`)
+        } else if (text && modelError != null) {
+          // pi retried and replied after the error: the reply stands. Only when
+          // the error came first, so text written before a failure never does.
+          if (st.error === modelError) st.error = beforeModelError
+          modelError = null
         }
         break
       }
@@ -1055,7 +1078,7 @@ const needOut = flags => {
 
 const isFindings = (st, seq) => !!seq && (st?.findingsSeqs ?? []).includes(seq)
 
-// Why last-reply.md can't be taken as this findings prompt's reply, if so.
+// Why last-reply.md can't be taken as this prompt's reply, if so.
 const notItsReply = (st, seq) => {
   if (st.error) return st.error
   if (st.settledSeq !== seq) return "a later prompt settled with it, so its reply can't be told apart"
@@ -1086,11 +1109,15 @@ async function wait(name, id, flags, { outChecked = false, deadline = deadlineFr
     } else if (st.settledSeq >= (target ?? 0) && st.state !== 'busy' && st.state !== 'starting' && st.state !== 'waiting') {
       reportDeclined(name, st)
       let reply = lastReply(name)
+      const why = target ? notItsReply(st, target) : null
       if (isFindings(st, target)) {
-        const why = notItsReply(st, target)
         const checked = why ? { error: why } : checkFindings(reply)
         if (checked.error) noFindings(name, checked.error, BAD_FINDINGS)
         reply = `${JSON.stringify(checked.findings, null, 2)}\n`
+      } else if (why && st.settledSeq === target) {
+        // A plain prompt with no reply of its own: last-reply.md holds an older one.
+        // Settled along with a later prompt, it can't be told apart: as before.
+        noReply(name, id, why)
       } else if (st.error) process.stdout.write(`error: ${st.error}\n`)
       if (flags.out) writeOut(flags.out, reply)
       else process.stdout.write(reply || '(no reply text)\n')
