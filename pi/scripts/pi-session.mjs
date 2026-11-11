@@ -1279,13 +1279,28 @@ async function forget(name, flags, more) {
   process.stdout.write(purged ? `forgot ${name} and deleted pi's copy, ${purged}\n` : `forgot ${name}\n`)
 }
 
+// serve and run refuse what they don't take, rather than drop it: an unknown
+// option such as --provider anthropic reads as a pi argument that got through.
+const SERVE_OPTIONS = '--model, --cwd and --thinking'
+const RUN_OPTIONS = '--model, --cwd, --thinking, --format, --timeout, --abort, --out, --keep and --file'
+const needNoMore = (cmd, flags, rest) => {
+  if (cmd === 'serve' && rest.length > 1) fail(`serve takes a name and ${SERVE_OPTIONS}, not ${rest.slice(1).join(' ')}. Nothing was started.`)
+  if (cmd !== 'run') return
+  const words = rest.slice(1)
+  const option = words.find(a => /^--?[A-Za-z]/.test(a))
+  if (option) fail(`run does not take ${option}: it takes a name, ${RUN_OPTIONS}, and the prompt. Nothing was started. A prompt that starts with - goes in --file.`)
+  if (flags.file && words.length) fail(`run takes --file or a prompt, not both (${words.join(' ')}). Nothing was started.`)
+}
+
 const [cmd, ...argv] = process.argv.slice(2)
 const { flags, rest, extra } = parse(argv, cmd)
 switch (cmd) {
   case 'serve':
+    needNoMore(cmd, flags, rest)
     await serve(needName(rest[0]), flags, extra)
     break
   case 'run':
+    needNoMore(cmd, flags, rest)
     await run(needName(rest[0]), flags, rest.slice(1), extra)
     break
   case 'send':

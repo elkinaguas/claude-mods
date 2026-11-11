@@ -633,6 +633,27 @@ const runOnce = (args, runEnv) => startRun(args, runEnv).done
 const stillRunning = child => child.exitCode === null && child.signalCode === null
 const noSession = name => assert.ok(!fs.existsSync(path.join(root, name, 'status.json')), `${name} started`)
 
+test('serve and run refuse arguments they do not take, before starting anything', async () => {
+  const gone = name => assert.ok(!fs.existsSync(path.join(root, name)), `${name} was made`)
+  assert.match(cliFails('serve', 'extra-serve', ...AT, '--provider', 'anthropic').out, /serve takes a name and --model, --cwd and --thinking, not --provider anthropic\. Nothing was started\./)
+  assert.match(cliFails('serve', 'extra-serve', 'more', ...AT).out, /not more\. Nothing was started/)
+  gone('extra-serve')
+  const option = await runOnce(['extra-run', ...AT, '--provider', 'anthropic', 'hi'])
+  assert.equal(option.code, 1)
+  assert.equal(option.out, '')
+  assert.match(option.err, /run does not take --provider: .* Nothing was started\. A prompt that starts with - goes in --file\./)
+  assert.match((await runOnce(['extra-run', ...AT, '-p', 'hi'])).err, /run does not take -p/)
+  const prompt = path.join(root, 'extra-prompt.md')
+  fs.writeFileSync(prompt, 'hi')
+  assert.match((await runOnce(['extra-run', ...AT, '--file', prompt, 'and more'])).err, /run takes --file or a prompt, not both \(and more\)/)
+  gone('extra-run')
+  // An option named inside a quoted prompt is the prompt's.
+  const quoted = await runOnce(['extra-run', ...AT, 'what does --provider do?'])
+  assert.equal(quoted.code, 0, quoted.err)
+  assert.equal(quoted.out, 'echo: what does --provider do?\n')
+  cli('forget', 'extra-run')
+})
+
 test('run starts the session, sends the prompt, prints the reply, and stops it', async () => {
   const run = await runOnce(['one', ...AT, 'hello', 'there'])
   assert.equal(run.code, 0, run.err)
