@@ -19,8 +19,8 @@ fs.mkdirSync(path.dirname(authFile), { recursive: true })
 fs.writeFileSync(authFile, goodAuth)
 // The mod's options file, for these tests only, so the real one is never read.
 const optionsFile = path.join(home, 'pi-options.json')
-const setOptions = ({ allowUnsandboxed = false, trustedModelHosts = [], writtenAt = Date.now() } = {}) =>
-  fs.writeFileSync(optionsFile, JSON.stringify({ allowUnsandboxed, trustedModelHosts, writtenAt }))
+const setOptions = ({ allowUnsandboxed = false, trustedModelHosts = [], writtenAt = Date.now(), models = undefined } = {}) =>
+  fs.writeFileSync(optionsFile, JSON.stringify({ allowUnsandboxed, trustedModelHosts, writtenAt, ...(models ? { models } : {}) }))
 const clearOptions = () => fs.rmSync(optionsFile, { force: true })
 const env = { ...process.env, HOME: home, SANDBOX_RUNTIME: '1', PI_SESSIONS_DIR: root, PI_SESSION_PI: path.join(here, 'fake-pi.mjs'), PI_SESSION_OPTIONS: optionsFile }
 const { SANDBOX_RUNTIME: _, ...bareEnv } = env
@@ -633,6 +633,27 @@ const runOnce = (args, runEnv) => startRun(args, runEnv).done
 const stillRunning = child => child.exitCode === null && child.signalCode === null
 const noSession = name => assert.ok(!fs.existsSync(path.join(root, name, 'status.json')), `${name} started`)
 
+test('serve and run refuse arguments they do not take, before starting anything', async () => {
+  const gone = name => assert.ok(!fs.existsSync(path.join(root, name)), `${name} was made`)
+  assert.match(cliFails('serve', 'extra-serve', ...AT, '--provider', 'anthropic').out, /serve takes a name and --model, --cwd and --thinking, not --provider anthropic\. Nothing was started\./)
+  assert.match(cliFails('serve', 'extra-serve', 'more', ...AT).out, /not more\. Nothing was started/)
+  gone('extra-serve')
+  const option = await runOnce(['extra-run', ...AT, '--provider', 'anthropic', 'hi'])
+  assert.equal(option.code, 1)
+  assert.equal(option.out, '')
+  assert.match(option.err, /run does not take --provider: .* Nothing was started\. A prompt that starts with - goes in --file\./)
+  assert.match((await runOnce(['extra-run', ...AT, '-p', 'hi'])).err, /run does not take -p/)
+  const prompt = path.join(root, 'extra-prompt.md')
+  fs.writeFileSync(prompt, 'hi')
+  assert.match((await runOnce(['extra-run', ...AT, '--file', prompt, 'and more'])).err, /run takes --file or a prompt, not both \(and more\)/)
+  gone('extra-run')
+  // An option named inside a quoted prompt is the prompt's.
+  const quoted = await runOnce(['extra-run', ...AT, 'what does --provider do?'])
+  assert.equal(quoted.code, 0, quoted.err)
+  assert.equal(quoted.out, 'echo: what does --provider do?\n')
+  cli('forget', 'extra-run')
+})
+
 test('run starts the session, sends the prompt, prints the reply, and stops it', async () => {
   const run = await runOnce(['one', ...AT, 'hello', 'there'])
   assert.equal(run.code, 0, run.err)
@@ -872,6 +893,49 @@ test('models lists only the ids the gate allows, and keeps to the sandbox check'
   assert.match(cliFails('models', 'extra').out, /models takes no arguments/)
 })
 
+test('models picked in the panel: the gate takes only those, models lists only those, and keeps the full list for the panel', async () => {
+  const kept = () => JSON.parse(fs.readFileSync(path.join(root, '.models.json'), 'utf8'))
+  setOptions({ models: [{ id: 'opencode-go/kimi-k2.5', note: 'reviews' }] })
+  try {
+    assert.equal(cli('models'), 'opencode-go/kimi-k2.5\n')
+    assert.deepEqual(kept().models, ['opencode-go/glm-5', 'opencode-go/kimi-k2.5'])
+    assert.ok(Date.now() - kept().listedAt < 60000)
+    // A file, not a session: status lists no session for it.
+    assert.ok(!cli('status').includes('.models'))
+    assert.match(cliFails('serve', 'unpicked', ...AT).out, /opencode-go\/echo is not one of the models picked in the pi panel \(opencode-go\/kimi-k2\.5\)\. Use one of them, or ask the person to pick it there/)
+    noSession('unpicked')
+    const run = await runOnce(['unpicked', ...AT, 'hi'])
+    assert.equal(run.code, 1)
+    assert.match(run.err, /not one of the models picked in the pi panel/)
+    noSession('unpicked')
+    await withSettings({ defaultProvider: 'opencode-go', defaultModel: 'glm-5' }, () =>
+      assert.match(cliFails('serve', 'unpicked', '--cwd', root).out, /pi's default model opencode-go\/glm-5 .* is not allowed: opencode-go\/glm-5 is not one of the models picked.* Pass --model\./),
+    )
+    // A picked model runs.
+    setOptions({ models: [{ id: 'opencode-go/echo', note: '' }] })
+    const picked = await runOnce(['picked', ...AT, 'hi'])
+    assert.equal(picked.code, 0, picked.err)
+    assert.equal(picked.out, 'echo: hi\n')
+    cli('forget', 'picked')
+    // pi on a model of the same provider that is not picked: the session ends before the prompt reaches it.
+    setOptions({ models: [{ id: 'opencode-go/glm-5', note: '' }] })
+    const switched = await runOnce(['switched', '--cwd', root, '--model', 'opencode-go/glm-5', 'a secret prompt'])
+    assert.equal(switched.code, 1)
+    assert.match(switched.err, /before it took the prompt: pi runs opencode-go\/echo, opencode-go\/echo is not one of the models picked/)
+    assert.ok(!cli('read', 'switched', '--tail', '50').includes('a secret prompt'))
+    cli('forget', 'switched')
+    // Picks the gate no longer allows: models says so.
+    setOptions({ models: [{ id: 'opencode-go/gone', note: '' }] })
+    assert.match(cliFails('models').out, /none of the models picked in the pi panel \(opencode-go\/gone\) is among the 2 the gate allows/)
+    // No pick: the gate as before.
+    setOptions({ models: [] })
+    assert.equal(cli('models'), 'opencode-go/glm-5\nopencode-go/kimi-k2.5\n')
+  } finally {
+    clearOptions()
+    fs.rmSync(path.join(root, 'unpicked'), { recursive: true, force: true })
+  }
+})
+
 test('run --keep prints the reply and leaves the session up for follow-ups', async () => {
   const run = startRun(['kept', ...AT, '--keep', 'first'])
   await until(() => run.seen.out === 'echo: first\n')
@@ -1057,6 +1121,11 @@ test('the options file counts only when it is a fresh, plain file the mod wrote;
   assert.match(tryBare(), /counts as off: .* is old, so the pi mod is not running/)
   fs.writeFileSync(optionsFile, JSON.stringify({ allowUnsandboxed: 'yes', trustedModelHosts: [], writtenAt: Date.now() }))
   assert.match(tryBare(), /counts as off: .* is not what the pi mod writes/)
+  // Picked models must be provider/id with a short note.
+  for (const models of [{}, [{ id: 'glm-5', note: '' }], [{ id: 'opencode-go/glm-5' }], [{ id: 'opencode-go/glm-5', note: 'x'.repeat(121) }], [{ id: 'opencode-go/a b', note: '' }], [{ id: 'opencode-go/a`b', note: '' }]]) {
+    fs.writeFileSync(optionsFile, JSON.stringify({ allowUnsandboxed: true, trustedModelHosts: [], writtenAt: Date.now(), models }))
+    assert.match(tryBare(), /counts as off: .* is not what the pi mod writes/)
+  }
   fs.writeFileSync(optionsFile, 'not json')
   assert.match(tryBare(), /counts as off: .* could not be read/)
   // A link, even to a good file, is not taken.
