@@ -61,7 +61,7 @@ const OPTIONS_MAX_AGE_MS = 15 * 60 * 1000
 // can write it, which is fine: the picker only narrows what the gate takes.
 const MODEL_LIST = path.join(ROOT, '.models.json')
 // A model picked in the panel, as the options file holds it: provider/id and a short note.
-const MODEL_ID_RE = /^[A-Za-z0-9][\w.-]*\/[^\s\x00-\x1f\x7f]{1,200}$/
+const MODEL_ID_RE = /^[A-Za-z0-9][\w.-]*\/[\w.:@+\/-]{1,200}$/
 const NOTE_MAX = 120
 const AUTH = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
 const MODELS = path.join(os.homedir(), '.pi', 'agent', 'models.json')

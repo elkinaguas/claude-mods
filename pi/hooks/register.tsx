@@ -53,7 +53,7 @@ const viewAtom = atom({ plugin: 'pi', key: 'view' } as const, 'sessions' as 'ses
 let picked: PiPick[] = []
 let pickedAt = 0
 // Matches pi-session.mjs: a picked model's id and note.
-const MODEL_ID_RE = /^[A-Za-z0-9][\w.-]*\/[^\s\x00-\x1f\x7f]{1,200}$/
+const MODEL_ID_RE = /^[A-Za-z0-9][\w.-]*\/[\w.:@+\/-]{1,200}$/
 const NOTE_MAX = 120
 // .models.json is pi-session's, under 64 KB; a bigger one, or a link, is not read.
 const MODEL_LIST_MAX_BYTES = 64 * 1024
@@ -629,18 +629,22 @@ async function loadModelList($: EngineInterface) {
   if (got) await update($, modelListAtom, () => got)
 }
 
-// A change in the Models view: kept, and written to the options file at once, so serve and run go by it.
-async function setPicked($: EngineInterface, next: PiPick[]) {
-  picked = next
-  pickedAt = Date.now()
+// A change in the Models view: made on the newest picks (another session's
+// panel may have changed them since this one last looked), then written to the
+// options file at once, so serve and run go by it.
+async function changePicks($: EngineInterface, change: (cur: PiPick[]) => PiPick[]) {
+  await takeNewerPicks($)
+  picked = change(picked)
+  // Later than the file's, even with the clock at the same millisecond.
+  pickedAt = Math.max(Date.now(), pickedAt + 1)
   await update($, pickedAtom, () => picked)
   optionsWrittenAt = 0
   await writeOptions($)
 }
 const togglePick = ($: EngineInterface, id: string) =>
-  setPicked($, picked.some(p => p.id === id) ? picked.filter(p => p.id !== id) : [...picked, { id, note: '' }])
+  changePicks($, cur => (cur.some(p => p.id === id) ? cur.filter(p => p.id !== id) : [...cur, { id, note: '' }]))
 const setNote = ($: EngineInterface, id: string, note: string) =>
-  setPicked($, picked.map(p => (p.id === id ? { id, note: cleanNote(note) } : p)))
+  changePicks($, cur => cur.map(p => (p.id === id ? { id, note: cleanNote(note) } : p)))
 
 /** Where the mod keeps the options pi-session reads; sandboxed commands can't write under ~/.claude/plugins. */
 export const optionsDir = (homeDir: string) => `${homeDir}/.claude/plugins/data/pi`
@@ -685,18 +689,22 @@ export const picksIn = (text: string | null): { models: PiPick[]; changedAt: num
 // panel since (a newer modelsChangedAt in the file) is taken before writing.
 const OPTIONS_EVERY_MS = 60000
 let optionsWrittenAt = 0
-async function writeOptions($: EngineInterface) {
-  if (!home || Date.now() - optionsWrittenAt < OPTIONS_EVERY_MS) return
-  optionsWrittenAt = Date.now()
+// The options file's picks, when changed later than this session's.
+async function takeNewerPicks($: EngineInterface) {
+  if (!home) return
   const at = `${optionsDir(home)}/options.json`
   const st = await $.fs.stat(at).catch(() => null)
   const there = st && st.kind === 'file' && !st.isLink ? picksIn(await $.fs.read(at).catch(() => null)) : null
-  if (there && there.changedAt > pickedAt) {
-    picked = there.models
-    pickedAt = there.changedAt
-    await update($, pickedAtom, () => picked)
-  }
-  await $.fs.write(at, optionsText({ allowUnsandboxed, trustedHosts, models: picked, modelsChangedAt: pickedAt }, Date.now())).catch((err: unknown) => {
+  if (!there || there.changedAt <= pickedAt) return
+  picked = there.models
+  pickedAt = there.changedAt
+  await update($, pickedAtom, () => picked)
+}
+async function writeOptions($: EngineInterface) {
+  if (!home || Date.now() - optionsWrittenAt < OPTIONS_EVERY_MS) return
+  optionsWrittenAt = Date.now()
+  await takeNewerPicks($)
+  await $.fs.write(`${optionsDir(home)}/options.json`,optionsText({ allowUnsandboxed, trustedHosts, models: picked, modelsChangedAt: pickedAt }, Date.now())).catch((err: unknown) => {
     optionsWrittenAt = 0
     $.ui.log(`pi: could not write its options file: ${String(err)}`)
   })

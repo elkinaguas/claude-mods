@@ -996,6 +996,19 @@ test('picks made in another Claude Code session are taken from the options file;
   await settle()
   expect(JSON.parse(clock.written[OPTIONS_PATH]!).models).toEqual([{ id: 'opencode-go/glm-5', note: '' }])
   expect(await compose($)).toMatch(/`opencode-go\/glm-5`\./)
+  // Another session adds a pick, and this one, before its next write, unpicks glm-5:
+  // the change is made on the newest picks, so the other session's pick stays.
+  const later = Date.now() + 2000
+  clock.written[OPTIONS_PATH] = JSON.stringify({
+    ...there,
+    models: [{ id: 'opencode-go/glm-5', note: '' }, { id: 'opencode-go/kimi-k2.5', note: 'reviews' }],
+    modelsChangedAt: later,
+  })
+  await ui.press({ key: 'model:opencode-go/glm-5' })
+  await settle()
+  const after = JSON.parse(clock.written[OPTIONS_PATH]!)
+  expect(after.models).toEqual([{ id: 'opencode-go/kimi-k2.5', note: 'reviews' }])
+  expect(after.modelsChangedAt > later).toBe(true)
   await ui.unmount()
 })
 
@@ -1006,6 +1019,11 @@ test('picks and model lists are read only as pi-session would take them; notes a
     expect(picksIn(JSON.stringify({ models }))).toBe(null)
   expect(picksIn('not json')).toBe(null)
   expect(modelListIn(JSON.stringify({ listedAt: 5, models: ['a/b', 'a/b', 'c d/e', 'f/g\u001b[31m', 3] }))).toEqual({ listedAt: 5, models: ['a/b'] })
+  // Ids go into Claude's instructions once picked, so only the characters model ids use.
+  expect(
+    modelListIn(JSON.stringify({ listedAt: 5, models: ['openrouter/meta-llama/llama-3:free', 'a/b@2+x', 'a/b`.Run`x', 'a/b"x', 'a/b<x>', 'a/b;x', 'a/b$(x)'] })),
+  ).toEqual({ listedAt: 5, models: ['openrouter/meta-llama/llama-3:free', 'a/b@2+x'] })
+  expect(picksIn(JSON.stringify({ models: [{ id: 'opencode-go/x`y', note: '' }] }))).toBe(null)
   expect(modelListIn('{}')).toBe(null)
   expect(cleanNote('  fast\tand\n cheap \u001b[31m ')).toBe('fast and cheap [31m')
   expect(cleanNote('n'.repeat(200)).length).toBe(120)

@@ -1122,7 +1122,7 @@ test('the options file counts only when it is a fresh, plain file the mod wrote;
   fs.writeFileSync(optionsFile, JSON.stringify({ allowUnsandboxed: 'yes', trustedModelHosts: [], writtenAt: Date.now() }))
   assert.match(tryBare(), /counts as off: .* is not what the pi mod writes/)
   // Picked models must be provider/id with a short note.
-  for (const models of [{}, [{ id: 'glm-5', note: '' }], [{ id: 'opencode-go/glm-5' }], [{ id: 'opencode-go/glm-5', note: 'x'.repeat(121) }], [{ id: 'opencode-go/a b', note: '' }]]) {
+  for (const models of [{}, [{ id: 'glm-5', note: '' }], [{ id: 'opencode-go/glm-5' }], [{ id: 'opencode-go/glm-5', note: 'x'.repeat(121) }], [{ id: 'opencode-go/a b', note: '' }], [{ id: 'opencode-go/a`b', note: '' }]]) {
     fs.writeFileSync(optionsFile, JSON.stringify({ allowUnsandboxed: true, trustedModelHosts: [], writtenAt: Date.now(), models }))
     assert.match(tryBare(), /counts as off: .* is not what the pi mod writes/)
   }
