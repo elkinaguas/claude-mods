@@ -870,38 +870,61 @@ test('the wheel over the Live view scrolls it, elsewhere the pane; scroll keys m
   await ui.unmount()
 })
 
-test('Live stays on as tiles are picked, moving to each session from its end, until the panel closes', async ($, on) => {
+test('Live is on or off per session: a picked tile shows its own, from its end, until the panel closes', async ($, on) => {
   const busy = { state: 'busy', heartbeatAt: T0 + 3600000, lastActivity: T0 - 1000 }
   const files = { 'live.json': liveFile(numbered(0, 50)), 'other/live.json': liveFile(['→ read other.ts', 'other says hi']) }
   on('ui.close', () => ({ value: undefined }))
   const { clock, tick } = await pollingPane($, on, busy, T0, files, [], { other: { ...busy } })
   clock.panes = [OPEN]
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const pickTile = async (name: string) => {
+    await ui.press({ key: `session:${name}` })
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  const liveLabel = async () => (await ui.find({ key: 'live' }))?.props.label
   await pressLive(ui)
   await ui.press({ key: 'live-up' })
   expect(await shownRows(ui)).toEqual(numbered(29, 49))
-  // Another tile: the card is that session's, still live, from its end; only its file is read now.
-  await ui.press({ key: 'session:other' })
-  await new Promise(resolve => setTimeout(resolve, 20))
+  // Another tile, its Live never turned on: its card without a view, and no live.json read.
+  await pickTile('other')
   expect((await ui.find({ type: 'Text', text: /^other/ }))?.text).toMatch(/^other busy/)
-  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live off')
+  expect(await liveLabel()).toBe('Live')
+  expect(await ui.find({ type: 'Text', text: /^live · / })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'other says hi' })).toBeUndefined()
+  clock.reads.length = 0
+  await tick()
+  await tick()
+  expect(clock.reads.some(f => f.endsWith('live.json'))).toBe(false)
+  // Turned on there: only its file is read now.
+  await pressLive(ui)
+  expect(await liveLabel()).toBe('Live off')
   expect(await ui.find({ type: 'Text', text: 'other says hi' })).toBeDefined()
-  expect(await shownRows(ui)).toEqual([])
   clock.reads.length = 0
   await tick()
   await tick()
   expect(clock.reads.length > 0).toBe(true)
   expect(clock.reads.every(f => f === 'other/live.json')).toBe(true)
-  // Back to demo: from its end again, not where it was scrolled.
-  await ui.press({ key: 'session:demo' })
-  await new Promise(resolve => setTimeout(resolve, 20))
+  // Back to demo: its Live was left on, so it shows again, from its end, not where it was scrolled.
+  await pickTile('demo')
+  expect(await liveLabel()).toBe('Live off')
   expect(await shownRows(ui)).toEqual(numbered(30, 50))
   expect(await ui.find({ key: 'live-end' })).toBeUndefined()
-  // Closing the panel turns it off; opened again, the card is as before.
+  // Live off on demo leaves other's on.
+  await pressLive(ui)
+  expect(await liveLabel()).toBe('Live')
+  await pickTile('other')
+  expect(await liveLabel()).toBe('Live off')
+  await pickTile('demo')
+  expect(await liveLabel()).toBe('Live')
+  await pressLive(ui)
+  // Closing the panel turns every session's off; opened again, both cards are as before.
   await $.command.run({ command: 'pi', args: 'close', origin: { kind: 'user' }, presentation: { isFullscreen: false, columns: 120 } } as never)
   await new Promise(resolve => setTimeout(resolve, 20))
-  expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live')
+  expect(await liveLabel()).toBe('Live')
   expect(await ui.find({ type: 'Text', text: /^live · / })).toBeUndefined()
+  await pickTile('other')
+  expect(await liveLabel()).toBe('Live')
+  await pickTile('demo')
   // A panel gone without a close heard (an unload) turns it off at the next poll.
   await pressLive(ui)
   expect((await ui.find({ key: 'live' }))?.props.label).toBe('Live off')

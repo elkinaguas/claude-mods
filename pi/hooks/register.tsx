@@ -43,6 +43,8 @@ const selectedAtom = atom({ plugin: 'pi', key: 'selected' } as const, null as st
 const tickAtom = atom({ plugin: 'pi', key: 'tick' } as const, 0)
 // The one card whose Live view is open, and the tail serve last wrote for it.
 const liveAtom = atom({ plugin: 'pi', key: 'live' } as const, null as PiLive | null, { shape: 'live-2' })
+// The sessions whose Live is on: each card keeps its own, and only the shown one's file is read.
+const liveOnAtom = atom({ plugin: 'pi', key: 'liveOn' } as const, [] as string[], { shape: 'live-on-1' })
 // The Models view: the picks (kept in the options file, mirrored here to redraw), the list it picks from, and which view is up.
 const pickedAtom = atom({ plugin: 'pi', key: 'picked' } as const, [] as PiPick[], { shape: 'picked-1' })
 const modelListAtom = atom({ plugin: 'pi', key: 'modelList' } as const, null as PiModelList | null, { shape: 'models-1' })
@@ -719,7 +721,7 @@ async function poll($: EngineInterface) {
   if (shown) await update($, tickAtom, n => n + 1)
   // Live lasts while the panel is open: one gone without a close we heard (an unload) turns it off.
   if (panes && !panes.some(p => p.id === PANE)) {
-    if (await read($, liveAtom)) await closeLive($).catch(() => {})
+    if ((await read($, liveAtom)) || (await read($, liveOnAtom)).length) await liveAllOff($).catch(() => {})
   } else await syncLive($, shown).catch(() => {})
 }
 
@@ -797,7 +799,11 @@ async function syncLive($: EngineInterface, shown: boolean) {
   if (!lv) return stopLiveTimer()
   if (liveTimer && liveTimerFor !== lv.name) stopLiveTimer()
   const s = list.find(x => x.name === lv.name)
-  if (!s) return closeLive($, lv.name)
+  if (!s) {
+    // Forgotten: its Live goes with it.
+    await update($, liveOnAtom, on => on.filter(n => n !== lv.name))
+    return closeLive($, lv.name)
+  }
   const want = shown && LIVE.includes(s.state)
   if (want && !liveTimer) {
     liveTimerFor = lv.name
@@ -825,13 +831,29 @@ async function closeLive($: EngineInterface, name?: string) {
   await update($, liveAtom, cur => (name === undefined || cur?.name === name ? null : cur))
 }
 
-// Live is a mode of the panel: picking another session's tile while it is on
-// moves the view to that session (from its live end), still one card's file
-// read at a time. It stays on until Live off, or the panel closes.
+// Live is each session's own: picking a tile shows that session's view (from
+// its live end) if its Live is on, and none if not; a session left keeps its
+// Live for when it is picked again. Still one card's file read at a time, and
+// all of it goes off when the panel closes.
 async function pick($: EngineInterface, name: string) {
   const lv = await read($, liveAtom)
-  if (lv && lv.name !== name) return openLive($, name)
+  if ((await read($, liveOnAtom)).includes(name)) {
+    if (lv?.name !== name) return openLive($, name)
+  } else if (lv) await closeLive($)
   await update($, selectedAtom, () => name)
+}
+
+// The card's Live button: on or off for that session only.
+async function toggleLive($: EngineInterface, name: string) {
+  const on = (await read($, liveOnAtom)).includes(name)
+  await update($, liveOnAtom, cur => (on ? cur.filter(n => n !== name) : [...cur.filter(n => n !== name), name]))
+  return on ? closeLive($, name) : openLive($, name)
+}
+
+// Every session's Live off: the panel closed, or a new Claude Code session.
+async function liveAllOff($: EngineInterface) {
+  await update($, liveOnAtom, () => [])
+  await closeLive($)
 }
 
 const ago = (ms: number | null, now: number) => {
@@ -943,7 +965,7 @@ export const register: Register = (on, options) => {
     optionsWrittenAt = 0
     await writeOptions($)
     // Live lasts only while the panel is open, so never across a restart.
-    await closeLive($).catch(() => {})
+    await liveAllOff($).catch(() => {})
     await load($).catch(() => {})
     $.clock.every(POLL_MS, () => void poll($).catch(() => {}))
     const problems = await check($).catch(() => [] as string[])
@@ -1069,7 +1091,7 @@ export const register: Register = (on, options) => {
             {s.state === 'busy' && <Button key="abort" plain hotkey="a" label="Abort" onPress={() => void runScript($, ['abort', s.name])} />}
             {isLive && <Button key="stop" plain hotkey="s" label="Stop" onPress={() => void runScript($, ['stop', s.name])} />}
             {!isLive && <Button key="resume" plain hotkey="r" label="Resume" onPress={() => ask($, `Serve the pi session ${s.name} again and ask it to continue where it left off.`)} />}
-            <Button key="live" plain hotkey="l" label={tail ? 'Live off' : 'Live'} onPress={() => void (tail ? closeLive($) : openLive($, s.name)).catch(() => {})} />
+            <Button key="live" plain hotkey="l" label={tail ? 'Live off' : 'Live'} onPress={() => void toggleLive($, s.name).catch(() => {})} />
             <Button key="transcript" plain hotkey="t" label="Transcript" onPress={() => ask($, `Show me the last 40 lines of the pi session ${s.name}'s transcript.`)} />
             {!isLive && <Button key="forget" plain hotkey="f" label="Forget" onPress={() => void runScript($, ['forget', s.name])} />}
           </Box>
@@ -1203,7 +1225,7 @@ export const register: Register = (on, options) => {
   // Closing the panel (the person's mark, /pi close) turns Live off: it lasts only while the panel is open.
   on('ui.close', async ($, e, next) => {
     const closed = await next(e)
-    if (e.id === PANE) await closeLive($).catch(() => {})
+    if (e.id === PANE) await liveAllOff($).catch(() => {})
     return closed
   })
 

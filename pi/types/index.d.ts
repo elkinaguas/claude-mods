@@ -63,6 +63,8 @@ declare module 'claude-code' {
       tick: number
       /** The one card whose Live view is open, with the tail it shows; null when none is. */
       live: Shaped<PiLive | null>
+      /** The sessions whose Live is on, each turned on in its own card. */
+      liveOn: Shaped<string[]>
       /** The models picked in the Models view, as the options file holds them. */
       picked: Shaped<PiPick[]>
       /** The list the Models view picks from; null before `models` first ran. */
