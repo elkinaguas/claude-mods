@@ -261,7 +261,7 @@ test('/todo run asks Claude to orchestrate the ready tasks: T- in Todo, no open 
   expect(await run('run')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks.' })
   await new Promise<void>(resolve => setTimeout(resolve, 20))
   expect(prompts[0]).toMatch(
-    /^I started a long run of the board \(from the task panel or \/todo run\)\. Run the board in TODO\.md in long-running mode, following the task board rules \(Long run\): run branch run\/\d{4}-\d{2}-\d{2}-\d{4}, up to 2 workers at a time, a time cap of 60 minutes per task; don't wait for me between tasks\. Ready now, in board order: T-5, T-9\. Already running: T-2\.$/,
+    /^I started a long run of the board \(from the task panel or \/todo run\)\. Run the board in TODO\.md in long-running mode, following the task board rules \(Long run\): run branch run\/\d{4}-\d{2}-\d{2}-\d{4}, up to 2 workers at a time, a time cap of 60 minutes per task; don't wait for me between tasks\. Ready now, in board order: T-5, T-9\. In Doing from before this run, not part of it \(no worker slot\): T-2\.$/,
   )
 })
 
@@ -377,6 +377,37 @@ test('a long run keeps two workers busy, stops only the one past its cap, notifi
   await clock.advance(1600)
   expect(prompts).toHaveLength(3)
   expect(statuses.at(-1)).toBeUndefined()
+})
+
+test('tasks already in Doing when a run starts take no worker slot: the run still wakes and goes idle', async ($, on) => {
+  const clock = mock.clock(on)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
+  const before = '- T-2 Old task\n- T-3 Another old task\n'
+  const { prompts, notes, statuses, writeOutside } = project(on, { 'TODO.md': runBoardWith('- T-5 Later\n  > Q: Which?\n- T-9 Ready\n', before) }, { realClock: true })
+  await start($)
+  await clock.advance(1600)
+  await run('run')($)
+  await clock.advance(10)
+  expect(prompts[0]).toContain('Ready now, in board order: T-9.')
+  expect(prompts[0]).not.toContain('Already running')
+  expect(prompts[0]).toContain('In Doing from before this run, not part of it (no worker slot): T-2, T-3.')
+  // Claude starts T-9; then the engineer answers T-5: a slot is free, so the run wakes.
+  await turn($, 'start')
+  writeOutside('TODO.md', runBoardWith('- T-5 Later\n  > Q: Which?\n', `${before}- T-9 Ready\n`))
+  await turn($, 'complete')
+  await clock.advance(1600)
+  expect(statuses.at(-1)).toBe('▸ T-2 Old task (+2) · run: 1/2 workers · 1 wait on you')
+  writeOutside('TODO.md', runBoardWith('- T-5 Later\n  > Q: Which?\n  > A: This.\n', `${before}- T-9 Ready\n`))
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(2)
+  expect(prompts[1]).toContain('Ready now, in board order: T-5.')
+  // Once T-9 and T-5 are in Review, the run goes idle though T-2 and T-3 stay in Doing.
+  await turn($, 'start')
+  await turn($, 'complete')
+  writeOutside('TODO.md', runBoardWith('', before, '- T-9 Ready\n- T-5 Later\n'))
+  await clock.advance(1600)
+  expect(notes).toContain('Run idle: nothing ready.')
 })
 
 test('a long run outlives its session: a new one picks it up on the same branch, only stop forgets it, and the stored run wins over a resumed one', async ($, on) => {
@@ -1089,6 +1120,23 @@ test('a CLAUDE.local.md pointing outside the boards folder is refused, nothing r
   expect(paths.some(p => p.includes('.ssh'))).toBe(false)
 })
 
+test('a CLAUDE.local.md naming another project\'s folder in the boards folder is refused: its board is neither shown nor edited', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+  const box: { files?: Record<string, string> } = {}
+  shell(on, () => box.files!, 'git@github.com:attacker/repo.git')
+  const victim = '/home/me/todos/victim/app'
+  const theirs = `# TODO\n\n## Todo\n\n- T-1 victim secret task\n\n## Done\n`
+  const { files, paths } = project(on, { 'TODO.md': BOARD, 'CLAUDE.local.md': LOCAL_NOTE(victim), [`${victim}/TODO.md`]: theirs })
+  box.files = files
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect(await ui.find({ text: /not this project's folder \/home\/me\/todos\/attacker\/repo/ })).toBeDefined()
+  expect(await ui.find({ text: /victim secret task/ })).toBeUndefined()
+  await run('quick')($)
+  await run('archive')($)
+  expect(files[`${victim}/TODO.md`]).toBe(theirs)
+  expect(paths.some(p => p.startsWith(victim))).toBe(false)
+})
+
 test('without a remote the subfolder is the project folder\'s name', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
   const box: { files?: Record<string, string> } = {}
   shell(on, () => box.files!)
@@ -1124,6 +1172,433 @@ test('the answer goes under the open question, not at the end of the notes; empt
   await ui.input({ key: 'answer', text: 'Raise the timeout' })
   expect(files['TODO.md']).toContain('  > Q: Mock the clock or raise the timeout?\n  > A: Raise the timeout\n  > Note: flaky on CI only.\n')
   expect(prompts).toHaveLength(1)
+})
+
+// A board with priority marks: T-8 is now, T-5 someday, the rest normal.
+const PRIORITY_BOARD = `# TODO
+
+## Todo
+
+- T-8 Patch the leak !1
+  > Prod is leaking memory.
+- T-3 Add retry to upload client
+  > Decision: how many retries.
+- T-4 Bump node
+- T-5 Rename the logo !3
+
+## Doing
+
+- T-2 Fix flaky auth test
+
+## Done
+
+- T-1 Cache git status (2026-10-08)
+`
+
+test('a priority mark ends the line: the title is shown without it, !1 red and !3 dim beside the row', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': PRIORITY_BOARD })
+  expect((await ui.find({ key: 'task:T-8' }))?.props.label).toBe('  T-8 Patch the leak')
+  expect((await ui.find({ type: 'Text', text: ' !1' }))?.props.color).toBe('red')
+  expect((await ui.find({ type: 'Text', text: ' !3' }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Add retry to upload client')
+})
+
+test('1, 2 and 3 set a priority: the mark is rewritten and the task moves to the end of its new level', async ($, on) => {
+  const { ui, files, prompts } = await panel($, on, { 'TODO.md': PRIORITY_BOARD })
+  await ui.press({ key: 'task:T-4' })
+  // The current level has no button.
+  expect(await ui.find({ key: 'priority-2' })).toBeUndefined()
+  expect((await ui.find({ key: 'priority-1' }))?.props.label).toBe('Now (!1)')
+  expect((await ui.find({ key: 'priority-3' }))?.props.label).toBe('Someday (!3)')
+  await ui.press({ key: 'priority-1' })
+  expect(files['TODO.md']).toContain('## Todo\n\n- T-8 Patch the leak !1\n  > Prod is leaking memory.\n- T-4 Bump node !1\n- T-3 Add retry to upload client\n')
+  await ui.press({ key: 'priority-3' })
+  expect(files['TODO.md']).toContain('- T-3 Add retry to upload client\n  > Decision: how many retries.\n- T-5 Rename the logo !3\n- T-4 Bump node !3\n\n## Doing')
+  await ui.press({ key: 'priority-2' })
+  expect(files['TODO.md']).toContain('  > Decision: how many retries.\n- T-4 Bump node\n- T-5 Rename the logo !3\n')
+  expect(files['TODO.md']).toBe(PRIORITY_BOARD)
+  // A Doing task too; Done tasks have none.
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'priority-1' })
+  expect(files['TODO.md']).toContain('## Doing\n\n- T-2 Fix flaky auth test !1\n')
+  await ui.press({ key: 'done-heading' })
+  await ui.press({ key: 'task:T-1' })
+  expect(await ui.find({ key: 'priority-1' })).toBeUndefined()
+  expect(prompts).toHaveLength(0)
+})
+
+test('k and j stay within a priority level', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': PRIORITY_BOARD })
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ key: 'up' })).toBeUndefined()
+  expect(await ui.find({ key: 'down' })).toBeDefined()
+  await ui.press({ key: 'task:T-4' })
+  expect(await ui.find({ key: 'up' })).toBeDefined()
+  expect(await ui.find({ key: 'down' })).toBeUndefined()
+})
+
+test('a new task goes before the someday ones, and one typed with a mark to the end of its level', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': PRIORITY_BOARD })
+  await run('write the release notes')($)
+  expect(files['TODO.md']).toContain('- T-4 Bump node\n- write the release notes\n- T-5 Rename the logo !3\n')
+  await run('page the on-call !1')($)
+  expect(files['TODO.md']).toContain('- T-8 Patch the leak !1\n  > Prod is leaking memory.\n- page the on-call !1\n- T-3 Add retry')
+})
+
+test('moving to Done drops the mark; back to Todo goes to the top of its level; rename keeps it', async ($, on) => {
+  const board = PRIORITY_BOARD.replace('- T-2 Fix flaky auth test\n', '- T-2 Fix flaky auth test !3\n- T-6 Ship it !1\n')
+  const { ui, files } = await panel($, on, { 'TODO.md': board })
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'back' })
+  expect(files['TODO.md']).toContain('- T-4 Bump node\n- T-2 Fix flaky auth test !3\n- T-5 Rename the logo !3\n')
+  await ui.press({ key: 'rename-open' })
+  expect((await ui.find({ key: 'rename' }))?.props.value).toBe('Fix flaky auth test')
+  await ui.input({ key: 'rename', text: 'Fix the flaky auth test' })
+  expect(files['TODO.md']).toContain('- T-2 Fix the flaky auth test !3\n')
+  await ui.press({ key: 'task:T-6' })
+  await ui.press({ key: 'quick-done' })
+  expect(files['TODO.md']).toMatch(/## Done\n\n- T-6 Ship it \(\d{4}-\d{2}-\d{2}\)\n/)
+})
+
+test('a run and a batch take tasks by priority, then board order', async ($, on) => {
+  const { ui, prompts } = await panel($, on, { 'TODO.md': PRIORITY_BOARD.replace('- T-8 Patch the leak !1\n  > Prod is leaking memory.\n', '').replace('- T-4 Bump node\n', '- T-4 Bump node !1\n') })
+  for (const id of ['T-5', 'T-3', 'T-4']) {
+    await ui.press({ key: `task:${id}` })
+    await ui.press({ key: 'mark' })
+  }
+  await ui.press({ key: 'start-marked' })
+  expect(prompts[0]).toContain('one at a time in this order:\n1. T-4\n2. T-3\n3. T-5\n')
+})
+
+test('the run prompt lists ready tasks by priority', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': PRIORITY_BOARD.replace('- T-8 Patch the leak !1', '- T-8 Patch the leak').replace('- T-4 Bump node', '- T-4 Bump node !1') })
+  await run('run')($)
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toContain('Ready now, by priority, then board order: T-4, T-8, T-3, T-5.')
+})
+
+// A board whose T-3 and T-2 carry `title` (T-5 waits on T-3, so a graph shows).
+const hostileBoard = (title: string, note = 'fine') => `# TODO
+
+## Todo
+
+- T-3 ${title}
+  > ${note}
+- T-5 Next
+  > Depends: T-3
+
+## Doing
+
+- T-2 ${title}
+
+## Done
+`
+
+test('control and format characters in board text never blank the panel; the status line gets them cleaned', async ($, on) => {
+  const { ui, statuses } = await panel($, on, { 'TODO.md': hostileBoard('Fix \x1b[2J login now', 'see \x1b]0;pwn\x07 here') })
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Fix  [2J login now')
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ text: 'see  ]0;pwn  here' })).toBeDefined()
+  expect(statuses.at(-1)).toBe('▸ T-2 Fix  [2J login now')
+})
+
+test('a format character or soft hyphen in a title draws as ? in the zoom-3 graph instead of breaking it', async ($, on) => {
+  mock.store(on, { 'graphZoom:/project': 3 })
+  const { ui } = await panel($, on, { 'TODO.md': hostileBoard('Fix ‮rob­ust') })
+  const text = rasterText(await ui.find({ key: 'graph-cells' }))
+  expect(text).toContain('Fix ?rob?ust')
+})
+
+test('a Depends line repeating one ID thousands of times draws one arrow, fast', async ($, on) => {
+  // 8000 repeats: before, one draw took close to a minute.
+  const board = `# TODO\n\n## Todo\n\n- T-1 base\n- T-2 mid\n  > Depends: T-1\n- T-3 top\n  > Depends: T-2, ${Array(8000).fill('T-1').join(', ')}\n  > Depends: T-1, T-2\n\n## Done\n`
+  const t0 = Date.now()
+  const { ui } = await panel($, on, { 'TODO.md': board })
+  const text = rasterText(await ui.find({ key: 'graph-cells' }))
+  expect(Date.now() - t0).toBeLessThan(2000)
+  expect(text).toContain('T-3')
+  // One head per target (arrows into a task join): T-2's and T-3's.
+  expect(text.split('▶').length - 1).toBe(2)
+})
+
+test('a CRLF board shows its tasks, and edits keep every line CRLF', async ($, on) => {
+  const crlf = BOARD.replace(/\n/g, '\r\n')
+  const { ui, files } = await panel($, on, { 'TODO.md': crlf, 'TODO-archive.md': '# TODO archive\r\n' })
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Add retry to upload client')
+  expect(await ui.find({ text: 'Q: Mock the clock or raise the timeout?' })).toBeUndefined()
+  await ui.press({ key: 'task:T-2' })
+  expect(await ui.find({ text: 'Q: Mock the clock or raise the timeout?' })).toBeDefined()
+  await run('write the release notes')($)
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'priority-1' })
+  await ui.press({ key: 'quick-done' })
+  const text = files['TODO.md']!
+  expect(text).toContain('- write the release notes\r\n')
+  expect(text).toMatch(/## Done\r\n\r\n- T-3 Add retry to upload client \(\d{4}-\d{2}-\d{2}\)\r\n/)
+  expect(text.replace(/\r\n/g, '')).not.toContain('\n')
+  await run('archive')($)
+  expect(files['TODO-archive.md']!.replace(/\r\n/g, '')).not.toContain('\n')
+  expect(files['TODO-archive.md']).toContain('- T-1 Cache git status (2026-10-08)\r\n')
+})
+
+test('the rules give the engineer the priority mark and order the board by it', async ($, on) => {
+  const { files } = project(on, {})
+  await run('init')($)
+  expect(files['CLAUDE.md']).toContain('- **Priority.** A task line may end with the engineer\'s priority mark: `!1` (now) or `!3` (someday); no mark is normal.')
+  expect(files['CLAUDE.md']).toContain('drop it when a task moves to Done')
+  expect(files['CLAUDE.md']).toContain('take them by priority, then board order')
+})
+
+// A board with tags: T-3 and T-4 are #upload, H-6 too (the engineer's), T-5 #docs.
+const TAG_BOARD = `# TODO
+
+## Todo
+
+- T-3 Add retry to upload client !1 #upload #release
+  > Decision: how many retries.
+- T-4 Resume big uploads #upload
+- H-6 Ask for a bigger bucket #upload
+- T-5 Fix bug #12 in the readme #docs
+- T-7 Bump node
+
+## Doing
+
+- T-2 Fix flaky auth test
+
+## Done
+
+- T-1 Cache git status #perf (2026-10-08)
+`
+
+test('tags end the line after the priority: shown dim beside the row, kept out of the title; #12 stays in it', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Add retry to upload client')
+  expect((await ui.find({ type: 'Text', text: ' #upload #release' }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ key: 'task:T-5' }))?.props.label).toBe('  T-5 Fix bug #12 in the readme')
+  await ui.press({ key: 'done-heading' })
+  expect((await ui.find({ key: 'task:T-1' }))?.props.label).toBe('  T-1 Cache git status (2026-10-08)')
+  expect(await ui.find({ type: 'Text', text: ' #perf' })).toBeDefined()
+})
+
+test('i opens a Tag field: each word toggles a tag, the priority mark kept; a bad word writes nothing', async ($, on) => {
+  const { ui, files, toasts } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  await ui.press({ key: 'task:T-7' })
+  await ui.press({ key: 'tag-open' })
+  expect(await ui.find({ type: 'Text', text: 'On the board: #upload #release #docs' })).toBeDefined()
+  await ui.input({ key: 'tag', text: '#Docs  release' })
+  expect(files['TODO.md']).toContain('- T-7 Bump node #docs #release\n')
+  expect(await ui.find({ key: 'tag' })).toBeUndefined()
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'tag-open' })
+  await ui.input({ key: 'tag', text: 'upload' })
+  expect(files['TODO.md']).toContain('- T-3 Add retry to upload client !1 #release\n')
+  const before = files['TODO.md']
+  await ui.press({ key: 'tag-open' })
+  await ui.input({ key: 'tag', text: 'no_way' })
+  expect(files['TODO.md']).toBe(before)
+  expect(toasts.at(-1)).toBe('todo: a tag is a letter, then lowercase letters, digits and -')
+  // Setting a priority keeps the tags.
+  await ui.press({ key: 'priority-3' })
+  expect(files['TODO.md']).toContain('- T-3 Add retry to upload client !3 #release\n')
+})
+
+test('Mark #tag marks the tag\'s Todo T- tasks at once, and g starts them as one batch', async ($, on) => {
+  const { ui, prompts } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  await ui.press({ key: 'task:T-4' })
+  expect((await ui.find({ key: 'mark-group:upload' }))?.props.label).toBe('Mark #upload (2)')
+  await ui.press({ key: 'mark-group:upload' })
+  expect((await ui.find({ key: 'mark-group:upload' }))?.props.label).toBe('Unmark #upload (2)')
+  expect((await ui.find({ key: 'start-marked' }))?.props.label).toBe('Start 2 marked')
+  await ui.press({ key: 'start-marked' })
+  expect(prompts[0]).toContain('one at a time in this order:\n1. T-3\n2. T-4\n')
+})
+
+test('/todo start #tag starts the tag\'s group; /todo run #tag runs only its tasks', async ($, on) => {
+  const { prompts, files } = project(on, { 'TODO.md': TAG_BOARD })
+  expect(await run('start #nope')($)).toMatchObject({ text: 'No T- tasks in Todo tagged #nope.' })
+  expect(await run('start #Bad_tag')($)).toMatchObject({ text: expect.stringContaining('Not a tag') })
+  expect(await run('run #docs')($)).toMatchObject({ text: 'Asked Claude to run the board: 1 ready task tagged #docs.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toContain('Ready now, in board order: T-5.')
+  expect(prompts[0]).toContain('This run takes only the tasks tagged #docs.')
+  expect(await run('run #upload')($)).toMatchObject({ text: 'A run is already on for #docs: /todo run stop first.' })
+  await run('run stop')($)
+  expect(await run('start #upload')($)).toMatchObject({ text: 'Started 2 tasks tagged #upload as one batch.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[1]).toContain('1. T-3\n2. T-4\n')
+  expect(files['TODO.md']).toContain('## Doing\n\n- T-3 Add retry to upload client !1 #upload #release\n')
+})
+
+test('a #tag run waits for an untagged task its tagged task depends on', async ($, on) => {
+  const board = runBoardWith('- T-1 Needs the untagged one #up\n  > Depends: T-9\n- T-9 Untagged prerequisite\n- T-4 Free #up\n')
+  const { prompts } = project(on, { 'TODO.md': board })
+  expect(await run('run #up')($)).toMatchObject({ text: 'Asked Claude to run the board: 1 ready task tagged #up.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toContain('Ready now, in board order: T-4.')
+})
+
+test('the run block names the tag a run is limited to', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect(await run('run #upload')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks tagged #upload.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  const block = await ui.find({ key: 'run-status' })
+  expect(JSON.stringify(block)).toContain('#upload')
+})
+
+test('quick done keeps the tags before the date and drops the priority', async ($, on) => {
+  const { ui, files } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'quick-done' })
+  expect(files['TODO.md']).toMatch(/## Done\n\n- T-3 Add retry to upload client #upload #release \(\d{4}-\d{2}-\d{2}\)\n/)
+})
+
+test('a hostile line of spaces and marks parses in one pass', async ($, on) => {
+  // 1.4 MB on one line: 400k spaces, then 200k marks (quadratic, this took minutes).
+  const line = `- T-3 x${' '.repeat(400_000)}y${' #a !1'.repeat(200_000)}`
+  project(on, { 'TODO.md': BOARD.replace('- T-3 Add retry to upload client', line) })
+  const t0 = Date.now()
+  expect(await run('start #a')($)).toMatchObject({ text: 'Started 1 task tagged #a as one batch.' })
+  expect(Date.now() - t0).toBeLessThan(2000)
+  // The batch it starts runs just after the command.
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+})
+
+test('the rules keep the engineer\'s tags and let enrichment use only existing ones', async ($, on) => {
+  const { files } = project(on, {})
+  await run('init')($)
+  expect(files['CLAUDE.md']).toContain('- **Tags.** A task line may also end with tags, `#name`')
+  expect(files['CLAUDE.md']).toContain('never invent one')
+  expect(files['CLAUDE.md']).toContain('only those carrying the tag, when the prompt names one')
+})
+
+// The task rows the panel lists, by key.
+const rowKeys = async (ui: { findAll: (q: { type: string }) => Promise<{ key?: string; props: Record<string, unknown> }[]> }) =>
+  (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('task:'))
+
+test('4 cycles the lists through the board\'s tags, 5 through the priority levels; they combine with v and are saved', async ($, on) => {
+  const saved: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: saved[e.key] }))
+  on('store.set', (_$, e) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: all')
+  await ui.press({ key: 'done-heading' })
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: #upload')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3', 'task:T-4', 'task:H-6'])
+  // v: Claude's only.
+  await ui.press({ key: 'type-filter' })
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3', 'task:T-4'])
+  await ui.press({ key: 'type-filter' })
+  await ui.press({ key: 'type-filter' })
+  // 5: !1 only.
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: !1')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3'])
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: normal')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-4', 'task:H-6'])
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: !3')
+  expect(await rowKeys(ui as never)).toEqual([])
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: all')
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: #release')
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: #docs')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-5'])
+  // The headings count what is shown.
+  expect(await ui.find({ type: 'Text', text: /^Todo 1$/ })).toBeDefined()
+  expect(saved['tagFilter:/project']).toBe('docs')
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect(await rowKeys(ui as never)).toContain('task:T-1')
+})
+
+test('saved filters come back in a new session; a tag no longer on the board is no filter', async ($, on) => {
+  mock.store(on, { 'tagFilter:/project': 'gone', 'priorityFilter:/project': 1 })
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: !1')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3'])
+})
+
+test('no tag or priority filter on a board without tags or marks', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await ui.find({ key: 'tag-filter' })).toBeUndefined()
+  expect(await ui.find({ key: 'priority-filter' })).toBeUndefined()
+})
+
+test('a question dialog about a task the filters hide clears them', async ($, on) => {
+  const { ask } = dialogs(on)
+  mock.store(on, { 'tagFilter:/project': 'docs', 'priorityFilter:/project': 2 })
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect(await ui.find({ key: 'task:T-3' })).toBeUndefined()
+  await ask($, 'T-3: how many retries?')
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: all')
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('▾ T-3 Add retry to upload client')
+})
+
+// A chat question dialog: core answers, and the line under the dialog is
+// recorded. The test kit has no scroll for a pane's own `$.ui.scroll`, so the
+// scroll to the row isn't checked here (the mod treats it as best effort).
+function dialogs(on: On) {
+  const notices: { tool_use_id: string; text: string | undefined }[] = []
+  on('tool.call', () => ({ result: 'answered' }) as never)
+  on('ui.notice', (_$, e) => {
+    notices.push(e)
+    return { value: undefined }
+  })
+  const ask = ($: Engine, question: string) =>
+    $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'q1', questions: [{ question, header: 'Q', multiSelect: false, options: [{ label: 'A', description: 'a' }, { label: 'B', description: 'b' }] }] } as never)
+  return { notices, ask }
+}
+
+test('a question dialog naming a task opens it in the panel, since the dialog holds the keys', async ($, on) => {
+  const { notices, ask } = dialogs(on)
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await ask($, 'T-3: how many retries should the upload client make?')).toMatchObject({ result: 'answered' })
+  expect(await ui.find({ text: 'Decision: how many retries.' })).toBeDefined()
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('▾ T-3 Add retry to upload client')
+  expect(notices).toEqual([{ tool_use_id: 'q1', text: 'Task panel: T-3 is open there, its notes in view.' }])
+})
+
+test('a question dialog naming no task shows the only task in Doing; a done task named unfolds Done', async ($, on) => {
+  const { notices, ask } = dialogs(on)
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  await ask($, 'Mock the clock or raise the timeout?')
+  expect(await ui.find({ text: 'Q: Mock the clock or raise the timeout?' })).toBeDefined()
+  expect(notices.at(-1)?.text).toBe('Task panel: T-2 is open there, its notes in view.')
+  await ask($, 'Should T-1 cache for longer?')
+  expect(await ui.find({ key: 'task:T-1' })).toBeDefined()
+  expect(await ui.find({ text: 'Log: cached for 5s.' })).toBeDefined()
+})
+
+test('a question dialog leaves the panel alone when it names no board task and Doing has several, or the panel is closed', async ($, on) => {
+  const { notices, ask } = dialogs(on)
+  const board = BOARD.replace('- T-2 Fix flaky auth test\n', '- T-2 Fix flaky auth test\n- T-7 Second\n')
+  const { ui, panes } = await panel($, on, { 'TODO.md': board })
+  await ask($, 'Which colour, T-99 or blue?')
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  panes.delete('todo')
+  await ask($, 'T-3: how many retries?')
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  expect(notices).toHaveLength(0)
+})
+
+test('a question dialog naming an H- task while the view shows only T- tasks switches the view to all', async ($, on) => {
+  const { ask } = dialogs(on)
+  const { ui } = await panel($, on, { 'TODO.md': MIXED_BOARD })
+  await ui.press({ key: 'type-filter' })
+  expect(await ui.find({ key: 'task:H-4' })).toBeUndefined()
+  await ask($, 'H-4: which certificate vendor?')
+  expect((await ui.find({ key: 'type-filter' }))?.props.label).toBe('View: all')
+  expect((await ui.find({ key: 'task:H-4' }))?.props.label).toBe('▾ H-4 Buy the certificate')
 })
 
 // A board where T-5 waits on T-3, T-6 on T-5 and T-2: three graph columns.
