@@ -1592,10 +1592,15 @@ async function revealAsked($: EngineInterface, t: Task): Promise<boolean> {
   await update($, renamingAtom, () => null)
   await update($, rejectingAtom, () => null)
   await update($, selectedAtom, () => t.key)
-  const to = { to: { key: `task:${t.key}` }, in: PANE, block: 'start' as const }
-  const moved = await $.ui.scroll(to).catch(() => ({ deny: 'failed' }))
-  // The row may not be drawn yet (Done just unfolded): try once more after the redraw.
-  if (moved.deny) $.clock.after(100, () => void $.ui.scroll(to).catch(() => {}))
+  // Once redrawn with the task open: the least move that shows its notes,
+  // then its row (`nearest`: nothing moves when both are in view already).
+  // A row not drawn yet (Done just unfolded) is tried once more.
+  const reveal = async (again: boolean) => {
+    await $.ui.scroll({ to: { key: 'detail' }, in: PANE, block: 'nearest' }).catch(() => {})
+    const moved = await $.ui.scroll({ to: { key: `task:${t.key}` }, in: PANE, block: 'nearest' }).catch(() => ({ deny: 'failed' }))
+    if (moved.deny && again) $.clock.after(200, () => void reveal(false))
+  }
+  $.clock.after(100, () => void reveal(true))
   return true
 }
 
