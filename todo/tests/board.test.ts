@@ -1398,6 +1398,14 @@ test('/todo start #tag starts the tag\'s group; /todo run #tag runs only its tas
   expect(files['TODO.md']).toContain('## Doing\n\n- T-3 Add retry to upload client !1 #upload #release\n')
 })
 
+test('a #tag run waits for an untagged task its tagged task depends on', async ($, on) => {
+  const board = runBoardWith('- T-1 Needs the untagged one #up\n  > Depends: T-9\n- T-9 Untagged prerequisite\n- T-4 Free #up\n')
+  const { prompts } = project(on, { 'TODO.md': board })
+  expect(await run('run #up')($)).toMatchObject({ text: 'Asked Claude to run the board: 1 ready task tagged #up.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toContain('Ready now, in board order: T-4.')
+})
+
 test('the run block names the tag a run is limited to', async ($, on) => {
   const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
   expect(await run('run #upload')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks tagged #upload.' })

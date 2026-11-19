@@ -872,8 +872,13 @@ const readyTasks = (tasks: Task[]) =>
 // A tag's group to start together: its Todo tasks that are Claude's (an H-
 // task never joins a batch).
 const groupOf = (tasks: Task[], tag: string) => tasks.filter(t => t.section === 'todo' && !isHuman(t) && t.tags.includes(tag))
-// What a run limited to a tag takes: only the tasks carrying it.
-const inRun = (tasks: Task[], run: { tag?: string } | null) => (run?.tag ? tasks.filter(t => t.tags.includes(run.tag!)) : tasks)
+// The ready tasks a run takes: for a run limited to a tag, only the ones
+// carrying it. Readiness is judged on the whole board first, so an untagged
+// task a tagged one waits on still holds it back.
+const runReady = (tasks: Task[], run: { tag?: string } | null) => {
+  const ready = readyTasks(tasks)
+  return run?.tag ? ready.filter(t => t.tags.includes(run.tag!)) : ready
+}
 // T- tasks in Todo waiting on an answer: parked.
 const parked = (tasks: Task[]) => tasks.filter(t => t.section === 'todo' && t.id && !isHuman(t) && t.question)
 // The T- tasks a run has in Doing: each one a worker's.
@@ -883,8 +888,8 @@ const running = (tasks: Task[]) => tasks.filter(t => t.section === 'doing' && t.
 // only once this changes, so a wake that started nothing isn't repeated. A
 // ready task counts its answers: one parked again and answered again is new.
 const answers = (t: Task) => t.notes.filter(n => /^A:/i.test(n)).length
-const boardShape = (tasks: Task[]) =>
-  [running(tasks).map(t => t.id), readyTasks(tasks).map(t => `${t.id}:${answers(t)}`), tasks.filter(t => t.section === 'review').map(t => t.id)]
+const boardShape = (tasks: Task[], run: { tag?: string } | null) =>
+  [running(tasks).map(t => t.id), runReady(tasks, run).map(t => `${t.id}:${answers(t)}`), tasks.filter(t => t.section === 'review').map(t => t.id)]
     .map(ids => ids.join(','))
     .join('|')
 
@@ -905,7 +910,7 @@ async function runBoard($: EngineInterface, ready: Task[], woken = false, tag?: 
     ...(r ?? { branch: runBranch(), tasks: [], workers: [], overCap: [], prompted: false, idleNotified: false, wokeAt: null, ...(tag ? { tag } : {}), ...seenNow(tasks) }),
     prompted: true,
     idleNotified: false,
-    wokeAt: boardShape(inRun(tasks, r ?? (tag ? { tag } : null))),
+    wokeAt: boardShape(tasks, r ?? (tag ? { tag } : null)),
   }))
   await autoArchive($)
   const busy = running(tasks).map(t => t.id)
@@ -955,9 +960,9 @@ async function runTick($: EngineInterface) {
   const seen = seenNow(tasks)
   for (const id of seen.review.filter(id => !run.review.includes(id))) void notify($, `${id} is ready for your review.`)
   for (const id of seen.asked.filter(id => !run.asked.includes(id))) void notify($, `${id} is parked: it has a question for you.`)
-  const ready = readyTasks(inRun(tasks, run))
+  const ready = runReady(tasks, run)
   const quiet = !mainBusy && !run.prompted
-  const wake = quiet && busy.length < runWorkers && ready.length > 0 && boardShape(inRun(tasks, run)) !== run.wokeAt
+  const wake = quiet && busy.length < runWorkers && ready.length > 0 && boardShape(tasks, run) !== run.wokeAt
   const idle = quiet && busy.length === 0 && ready.length === 0
   if (idle && !run.idleNotified) {
     void notify($, seen.asked.length ? `Run idle: nothing ready. Waiting on you: ${seen.asked.join(', ')}.` : 'Run idle: nothing ready.')
@@ -1693,7 +1698,7 @@ export const register: Register = (on, options) => {
       if (tag === null) return { text: `Not a tag: ${quoted(tagWord)}. A tag is a letter, then lowercase letters, digits and -.` }
       const live = await read($, runAtom)
       if (live && tag && live.tag !== tag) return { text: `A run is already on${live.tag ? ` for #${live.tag}` : ''}: /todo run stop first.` }
-      const ready = readyTasks(inRun(parse(await current($)), tag ? { tag } : null))
+      const ready = runReady(parse(await current($)), tag ? { tag } : null)
       if (ready.length === 0) {
         return { text: tag ? `No ready tasks tagged #${tag}.` : 'No ready tasks to run: every T- task in Todo has an open question or waits on another.' }
       }
@@ -2214,7 +2219,7 @@ export const register: Register = (on, options) => {
             ))}
             {waiting.length > 0 && <Text color="yellow">  ? waiting on you: {waiting.map(t => t.id).join(', ')}</Text>}
             {review.length > 0 && <Text dimColor>  {review.length} in Review</Text>}
-            {run.tasks.length === 0 && waiting.length === 0 && readyTasks(inRun(tasks, run)).length === 0 && <Text dimColor>  idle: nothing ready</Text>}
+            {run.tasks.length === 0 && waiting.length === 0 && runReady(tasks, run).length === 0 && <Text dimColor>  idle: nothing ready</Text>}
           </Box>
         )}
         <Text> </Text>
