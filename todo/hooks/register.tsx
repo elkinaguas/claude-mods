@@ -105,6 +105,8 @@ const TASK_RE = /^[-*]\s+(?:\[[ xX]\]\s+)?(.+)$/
 // T- tasks are Claude's, H- tasks the engineer's; one number sequence for both.
 const ID_RE = /^([TH]-\d{1,6})\b[:.]?\s*(.*)$/
 const isHuman = (t: { id?: string }) => t.id?.startsWith('H-') === true
+// The most tasks one task can wait on; IDs past it are ignored.
+const MAX_DEPS = 50
 
 // The engineer's marks at the end of a task line, in any order: a priority
 // (`!1` now, `!3` someday; none or `!2` normal) and tags (`#upload`: a
@@ -201,7 +203,11 @@ function parse(text: string): Task[] {
       } else if (/^A:/i.test(note)) {
         task.question = undefined
       } else if (/^Depends:/i.test(note)) {
-        task.deps.push(...(note.match(/\b[TH]-\d{1,6}\b/g) ?? []))
+        // Each ID once, and at most MAX_DEPS: repeats would each draw an arrow.
+        for (const d of note.match(/\b[TH]-\d{1,6}\b/g) ?? []) {
+          if (task.deps.length >= MAX_DEPS) break
+          if (!task.deps.includes(d)) task.deps.push(d)
+        }
       }
     } else if (line.trim()) {
       task = null
@@ -1347,11 +1353,12 @@ const fitCells = (text: string, width: number) => {
 // cells grow faster than tasks).
 const MAX_GRAPH_NODES = 60
 const MAX_GRAPH_CELLS = 300_000
+const MAX_GRAPH_EDGES = 2_000
 
 function drawGraph(input: GraphNode[], zoom: Zoom): Cells | null {
   const shape = shapeFor(zoom, Math.max(3, ...input.map(n => n.id.length)))
   const g = layoutGraph(input, shape)
-  if (g.columns * g.rows > MAX_GRAPH_CELLS) return null
+  if (g.columns * g.rows > MAX_GRAPH_CELLS || g.edges.length > MAX_GRAPH_EDGES) return null
   const columns = Math.max(1, g.columns)
   const rows = Math.max(1, g.rows)
   const char = new Array<string>(columns * rows).fill(' ')
@@ -1385,7 +1392,9 @@ function drawGraph(input: GraphNode[], zoom: Zoom): Cells | null {
   const byLayer = new Map<number, GraphEdge[]>()
   for (const e of g.edges) {
     const l = pos.get(e.to)!.layer
-    byLayer.set(l, [...(byLayer.get(l) ?? []), e])
+    const list = byLayer.get(l)
+    if (list) list.push(e)
+    else byLayer.set(l, [e])
   }
   for (const list of byLayer.values()) {
     const targets = [...new Set(list.map(e => e.to))]

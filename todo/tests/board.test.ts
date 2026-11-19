@@ -1229,6 +1229,18 @@ test('the run prompt lists ready tasks by priority', async ($, on) => {
   expect(prompts[0]).toContain('Ready now, by priority, then board order: T-4, T-8, T-3, T-5.')
 })
 
+test('a Depends line repeating one ID thousands of times draws one arrow, fast', async ($, on) => {
+  // 8000 repeats: before, one draw took close to a minute.
+  const board = `# TODO\n\n## Todo\n\n- T-1 base\n- T-2 mid\n  > Depends: T-1\n- T-3 top\n  > Depends: T-2, ${Array(8000).fill('T-1').join(', ')}\n  > Depends: T-1, T-2\n\n## Done\n`
+  const t0 = Date.now()
+  const { ui } = await panel($, on, { 'TODO.md': board })
+  const text = rasterText(await ui.find({ key: 'graph-cells' }))
+  expect(Date.now() - t0).toBeLessThan(2000)
+  expect(text).toContain('T-3')
+  // One head per target (arrows into a task join): T-2's and T-3's.
+  expect(text.split('▶').length - 1).toBe(2)
+})
+
 test('a CRLF board shows its tasks, and edits keep every line CRLF', async ($, on) => {
   const crlf = BOARD.replace(/\n/g, '\r\n')
   const { ui, files } = await panel($, on, { 'TODO.md': crlf, 'TODO-archive.md': '# TODO archive\r\n' })
