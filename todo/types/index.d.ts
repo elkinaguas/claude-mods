@@ -7,7 +7,7 @@ export type PanelFlags = { doneOpen: boolean; statsOpen: boolean; graphZoom: 1 |
 /** Which tasks the panel lists: all, Claude's (T-) or the engineer's (H-). */
 export type TypeFilter = 'all' | 'T' | 'H'
 
-/** A long run (/todo run) while on: its branch; the T- tasks in Doing and since when (ms); which subagent works which task; the tasks past their time cap; what the mod last saw (to notify on changes); whether it woke Claude since the last turn, and the board's shape when it did. */
+/** A long run (/todo run) while on: its branch (and the tag it is limited to); the T- tasks in Doing and since when (ms); which subagent works which task; the tasks past their time cap; what the mod last saw (to notify on changes); whether it woke Claude since the last turn, and the board's shape when it did. */
 export type RunState = {
   branch: string
   tasks: { id: string; since: number }[]
@@ -18,6 +18,8 @@ export type RunState = {
   prompted: boolean
   idleNotified: boolean
   wokeAt: string | null
+  /** The tag the run is limited to, when started with /todo run #tag. */
+  tag?: string
 }
 
 declare module 'claude-code' {
@@ -36,6 +38,8 @@ declare module 'claude-code' {
       renaming: string | null
       /** The Review task whose Reject field is open, asking what to fix (its key), if any. */
       rejecting: string | null
+      /** The task whose Tag field is open (its key), if any. */
+      tagging: string | null
       /** The Todo tasks marked to start together (their keys), in no order. */
       marked: string[]
       /** The panel element the person's focus is on (`task:<key>` for a row), if known. */

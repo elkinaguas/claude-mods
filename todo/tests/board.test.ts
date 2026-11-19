@@ -1237,6 +1237,119 @@ test('the rules give the engineer the priority mark and order the board by it', 
   expect(files['CLAUDE.md']).toContain('take them by priority, then board order')
 })
 
+// A board with tags: T-3 and T-4 are #upload, H-6 too (the engineer's), T-5 #docs.
+const TAG_BOARD = `# TODO
+
+## Todo
+
+- T-3 Add retry to upload client !1 #upload #release
+  > Decision: how many retries.
+- T-4 Resume big uploads #upload
+- H-6 Ask for a bigger bucket #upload
+- T-5 Fix bug #12 in the readme #docs
+- T-7 Bump node
+
+## Doing
+
+- T-2 Fix flaky auth test
+
+## Done
+
+- T-1 Cache git status #perf (2026-10-08)
+`
+
+test('tags end the line after the priority: shown dim beside the row, kept out of the title; #12 stays in it', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Add retry to upload client')
+  expect((await ui.find({ type: 'Text', text: ' #upload #release' }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ key: 'task:T-5' }))?.props.label).toBe('  T-5 Fix bug #12 in the readme')
+  await ui.press({ key: 'done-heading' })
+  expect((await ui.find({ key: 'task:T-1' }))?.props.label).toBe('  T-1 Cache git status (2026-10-08)')
+  expect(await ui.find({ type: 'Text', text: ' #perf' })).toBeDefined()
+})
+
+test('i opens a Tag field: each word toggles a tag, the priority mark kept; a bad word writes nothing', async ($, on) => {
+  const { ui, files, toasts } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  await ui.press({ key: 'task:T-7' })
+  await ui.press({ key: 'tag-open' })
+  expect(await ui.find({ type: 'Text', text: 'On the board: #upload #release #docs' })).toBeDefined()
+  await ui.input({ key: 'tag', text: '#Docs  release' })
+  expect(files['TODO.md']).toContain('- T-7 Bump node #docs #release\n')
+  expect(await ui.find({ key: 'tag' })).toBeUndefined()
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'tag-open' })
+  await ui.input({ key: 'tag', text: 'upload' })
+  expect(files['TODO.md']).toContain('- T-3 Add retry to upload client !1 #release\n')
+  const before = files['TODO.md']
+  await ui.press({ key: 'tag-open' })
+  await ui.input({ key: 'tag', text: 'no_way' })
+  expect(files['TODO.md']).toBe(before)
+  expect(toasts.at(-1)).toBe('todo: a tag is a letter, then lowercase letters, digits and -')
+  // Setting a priority keeps the tags.
+  await ui.press({ key: 'priority-3' })
+  expect(files['TODO.md']).toContain('- T-3 Add retry to upload client !3 #release\n')
+})
+
+test('Mark #tag marks the tag\'s Todo T- tasks at once, and g starts them as one batch', async ($, on) => {
+  const { ui, prompts } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  await ui.press({ key: 'task:T-4' })
+  expect((await ui.find({ key: 'mark-group:upload' }))?.props.label).toBe('Mark #upload (2)')
+  await ui.press({ key: 'mark-group:upload' })
+  expect((await ui.find({ key: 'mark-group:upload' }))?.props.label).toBe('Unmark #upload (2)')
+  expect((await ui.find({ key: 'start-marked' }))?.props.label).toBe('Start 2 marked')
+  await ui.press({ key: 'start-marked' })
+  expect(prompts[0]).toContain('one at a time in this order:\n1. T-3\n2. T-4\n')
+})
+
+test('/todo start #tag starts the tag\'s group; /todo run #tag runs only its tasks', async ($, on) => {
+  const { prompts, files } = project(on, { 'TODO.md': TAG_BOARD })
+  expect(await run('start #nope')($)).toMatchObject({ text: 'No T- tasks in Todo tagged #nope.' })
+  expect(await run('start #Bad_tag')($)).toMatchObject({ text: expect.stringContaining('Not a tag') })
+  expect(await run('run #docs')($)).toMatchObject({ text: 'Asked Claude to run the board: 1 ready task tagged #docs.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toContain('Ready now, in board order: T-5.')
+  expect(prompts[0]).toContain('This run takes only the tasks tagged #docs.')
+  expect(await run('run #upload')($)).toMatchObject({ text: 'A run is already on for #docs: /todo run stop first.' })
+  await run('run stop')($)
+  expect(await run('start #upload')($)).toMatchObject({ text: 'Started 2 tasks tagged #upload as one batch.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[1]).toContain('1. T-3\n2. T-4\n')
+  expect(files['TODO.md']).toContain('## Doing\n\n- T-3 Add retry to upload client !1 #upload #release\n')
+})
+
+test('the run block names the tag a run is limited to', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect(await run('run #upload')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks tagged #upload.' })
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  const block = await ui.find({ key: 'run-status' })
+  expect(JSON.stringify(block)).toContain('#upload')
+})
+
+test('quick done keeps the tags before the date and drops the priority', async ($, on) => {
+  const { ui, files } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'quick-done' })
+  expect(files['TODO.md']).toMatch(/## Done\n\n- T-3 Add retry to upload client #upload #release \(\d{4}-\d{2}-\d{2}\)\n/)
+})
+
+test('a hostile line of spaces and marks parses fast', async ($, on) => {
+  const line = `- T-3 x${' '.repeat(200_000)}y${' #a !1'.repeat(20_000)}`
+  project(on, { 'TODO.md': BOARD.replace('- T-3 Add retry to upload client', line) })
+  const t0 = Date.now()
+  expect(await run('start #a')($)).toMatchObject({ text: 'Started 1 task tagged #a as one batch.' })
+  expect(Date.now() - t0).toBeLessThan(5000)
+  // The batch it starts runs just after the command.
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+})
+
+test('the rules keep the engineer\'s tags and let enrichment use only existing ones', async ($, on) => {
+  const { files } = project(on, {})
+  await run('init')($)
+  expect(files['CLAUDE.md']).toContain('- **Tags.** A task line may also end with tags, `#name`')
+  expect(files['CLAUDE.md']).toContain('never invent one')
+  expect(files['CLAUDE.md']).toContain('only those carrying the tag, when the prompt names one')
+})
+
 // A chat question dialog: core answers, and the line under the dialog is
 // recorded. The test kit has no scroll for a pane's own `$.ui.scroll`, so the
 // scroll to the row isn't checked here (the mod treats it as best effort).

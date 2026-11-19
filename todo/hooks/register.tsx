@@ -36,6 +36,7 @@ const rulesAtom = atom({ plugin: 'todo', key: 'hasRules' } as const, false)
 const expandedAtom = atom({ plugin: 'todo', key: 'expanded' } as const, null)
 const renamingAtom = atom({ plugin: 'todo', key: 'renaming' } as const, null)
 const rejectingAtom = atom({ plugin: 'todo', key: 'rejecting' } as const, null as string | null)
+const taggingAtom = atom({ plugin: 'todo', key: 'tagging' } as const, null as string | null)
 const markedAtom = atom({ plugin: 'todo', key: 'marked' } as const, [] as string[])
 const focusedAtom = atom({ plugin: 'todo', key: 'focused' } as const, null as string | null)
 const droppingAtom = atom({ plugin: 'todo', key: 'dropping' } as const, null as string | null)
@@ -67,9 +68,10 @@ ${RULES_HEADING}
 - **The engineer's tasks.** An \`H-\` task is the engineer's: never start, work on or log it; they move it through the board themselves, and it skips Review.
 - **Review.** When a task is finished, move it to the end of \`## Review\` (adding that heading before \`## Done\` if missing) and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets. The engineer reviews it: they move it to Done, or back to Doing with a \`> Review: ...\` note saying what to fix; fix that, then move it to Review again with the log updated.
 - **Done.** A reviewed task sits at the top of \`## Done\` with the date appended to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), its log kept. Move a task to Done yourself only when the engineer asks.
-- **Long run.** When asked to run the board, orchestrate it: keep up to the given number of workers busy on ready tasks, without waiting for the engineer between them, until none is ready. A task is ready when it is a \`T-\` task in \`## Todo\` with no open question and nothing in its Depends still in Todo or Doing; take them by priority, then board order, and run two side by side only when their notes point at different files. Only you, the orchestrator, edit the board. All of a run's work goes on its run branch (the name the prompt gives), made from the default branch (main or master), or from the newest run branch whose tasks are still in Review; never check it out in the engineer's folder, never push it or merge it. For each task: move it to Doing, add a git worktree at \`.claude/worktrees/T-<n>\` in the project (listed in \`.git/info/exclude\`; only if it can't be made there, in your session's scratchpad) on a branch \`todo/T-<n>\` from the run branch's tip, set it up so the tests run (install dependencies, copy the untracked files the project needs, such as \`.env\`), and hand the task to a worker subagent in that folder, with a description starting with the task's ID. The worker leaves one commit, \`T-<n> <title>\`. When it reports back, rebase that commit onto the run branch, run the tests, and fast-forward the run branch to it (\`git push . HEAD:<run branch>\` from the worktree); resolve a mechanical conflict yourself, otherwise hand the task to a worker again on the new tip. Then remove the worktree and the \`todo/T-<n>\` branch, and write the task's Review log from the worker's report, naming the run branch and the commit. Fix drifted \`file:line\` references and Depends yourself and say so in the log; a change of scope, a task that looks obsolete or a split goes to the engineer as a \`> Q:\`. When a decision is the engineer's, or a task runs past its time cap (the task panel then refuses its worker's tool calls, so the worker reports back), park it: write the \`> Q:\` under it (for the cap, where it got stuck), remove its worktree, move it back to the top of \`## Todo\`, tell the engineer, and go on; it is ready again once a \`> A:\` answers it. When a Review task comes back with a \`> Review:\` note, fix it with a new commit on the run branch, and add \`> Recheck: built on T-<n>, sent back from review\` to each open or Review task that depends on it. When none is ready and no worker is busy, stop and list what waits on the engineer; the task panel wakes you once a task is ready.
+- **Long run.** When asked to run the board, orchestrate it: keep up to the given number of workers busy on ready tasks, without waiting for the engineer between them, until none is ready. A task is ready when it is a \`T-\` task in \`## Todo\` with no open question and nothing in its Depends still in Todo or Doing; take them by priority, then board order (only those carrying the tag, when the prompt names one), and run two side by side only when their notes point at different files. Only you, the orchestrator, edit the board. All of a run's work goes on its run branch (the name the prompt gives), made from the default branch (main or master), or from the newest run branch whose tasks are still in Review; never check it out in the engineer's folder, never push it or merge it. For each task: move it to Doing, add a git worktree at \`.claude/worktrees/T-<n>\` in the project (listed in \`.git/info/exclude\`; only if it can't be made there, in your session's scratchpad) on a branch \`todo/T-<n>\` from the run branch's tip, set it up so the tests run (install dependencies, copy the untracked files the project needs, such as \`.env\`), and hand the task to a worker subagent in that folder, with a description starting with the task's ID. The worker leaves one commit, \`T-<n> <title>\`. When it reports back, rebase that commit onto the run branch, run the tests, and fast-forward the run branch to it (\`git push . HEAD:<run branch>\` from the worktree); resolve a mechanical conflict yourself, otherwise hand the task to a worker again on the new tip. Then remove the worktree and the \`todo/T-<n>\` branch, and write the task's Review log from the worker's report, naming the run branch and the commit. Fix drifted \`file:line\` references and Depends yourself and say so in the log; a change of scope, a task that looks obsolete or a split goes to the engineer as a \`> Q:\`. When a decision is the engineer's, or a task runs past its time cap (the task panel then refuses its worker's tool calls, so the worker reports back), park it: write the \`> Q:\` under it (for the cap, where it got stuck), remove its worktree, move it back to the top of \`## Todo\`, tell the engineer, and go on; it is ready again once a \`> A:\` answers it. When a Review task comes back with a \`> Review:\` note, fix it with a new commit on the run branch, and add \`> Recheck: built on T-<n>, sent back from review\` to each open or Review task that depends on it. When none is ready and no worker is busy, stop and list what waits on the engineer; the task panel wakes you once a task is ready.
 - **Priority.** A task line may end with the engineer's priority mark: \`!1\` (now) or \`!3\` (someday); no mark is normal. It is theirs to set: keep it when you rewrite, enrich or move the task, keep Todo and Doing ordered by it (\`!1\` tasks first, \`!3\` last), and drop it when a task moves to Done.
-- **Format.** A task is a line \`- T-<n> <title>\` or \`- H-<n> <title>\` (\`- <title>\` before enrichment) at column 0, maybe ending in a priority mark; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
+- **Tags.** A task line may also end with tags, \`#name\` (a lowercase letter, then letters, digits and \`-\`): the engineer's groups. Keep them when you rewrite, enrich or move the task, Done included (before the date). When enriching you may add a tag already on the board that fits; never invent one.
+- **Format.** A task is a line \`- T-<n> <title>\` or \`- H-<n> <title>\` (\`- <title>\` before enrichment) at column 0, maybe ending in a priority mark and tags; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
 ${MARK_END}`
 
 type Section = (typeof SECTIONS)[number]
@@ -81,9 +83,10 @@ type Task = {
   id?: string
   // The ID, or `raw:<title>` (`raw:<title>:<n>` for the nth of a repeated title).
   key: string
-  // The title without the line's trailing marks (its priority).
+  // The title without the line's trailing marks (its priority and tags).
   title: string
   priority: Priority
+  tags: string[]
   notes: string[]
   // The open question's text and its line in the file, while one is open.
   question?: { text: string; line: number }
@@ -103,19 +106,39 @@ const TASK_RE = /^[-*]\s+(?:\[[ xX]\]\s+)?(.+)$/
 const ID_RE = /^([TH]-\d{1,6})\b[:.]?\s*(.*)$/
 const isHuman = (t: { id?: string }) => t.id?.startsWith('H-') === true
 
-// The engineer's priority mark at the end of a task line: `!1` now, `!3`
-// someday; none (or `!2`) is normal. A line that is only a mark is a title.
-const PRIORITY_RE = /\s+!([123])\s*$/
-function splitMarks(text: string): { title: string; priority: Priority } {
-  const m = PRIORITY_RE.exec(text)
-  if (!m || !text.slice(0, m.index).trim()) return { title: text, priority: 2 }
-  return { title: text.slice(0, m.index).trim(), priority: Number(m[1]) as Priority }
+// The engineer's marks at the end of a task line, in any order: a priority
+// (`!1` now, `!3` someday; none or `!2` normal) and tags (`#upload`: a
+// lowercase letter, then letters, digits and `-`). A Done line's date comes
+// after them and stays in the title. Read word by word from the end, with no
+// regex that could backtrack over a hostile line; a line that is only marks
+// is a title.
+const MARK_WORD_RE = /^(?:![123]|#[a-z][a-z0-9-]{0,39})$/
+const DATE_TAIL_RE = /\((?:dropped )?\d{4}-\d{2}-\d{2}\)\s*$/
+type Marks = { title: string; priority: Priority; tags: string[] }
+function splitMarks(text: string): Marks {
+  const date = DATE_TAIL_RE.exec(text)
+  let rest = (date ? text.slice(0, date.index) : text).trimEnd()
+  let priority: Priority | undefined
+  const tags: string[] = []
+  for (;;) {
+    const cut = Math.max(rest.lastIndexOf(' '), rest.lastIndexOf('\t'))
+    const word = rest.slice(cut + 1)
+    const before = rest.slice(0, Math.max(0, cut)).trimEnd()
+    if (cut <= 0 || !before || !MARK_WORD_RE.test(word)) break
+    if (word.startsWith('!')) priority ??= Number(word[1]) as Priority
+    else if (!tags.includes(word.slice(1))) tags.unshift(word.slice(1))
+    rest = before
+  }
+  return { title: date ? `${rest} ${date[0].trim()}` : rest.trim(), priority: priority ?? 2, tags }
 }
 const priorityMark = (p: Priority) => (p === 2 ? '' : ` !${p}`)
-// A task line without its priority mark: what a task moving to Done keeps.
+// The marks a line ends with: the priority, then the tags.
+const marksText = (priority: Priority, tags: string[]) => `${priorityMark(priority)}${tags.map(t => ` #${t}`).join('')}`
+// A task line without its priority mark, tags kept: what a task moving to Done keeps.
 const withoutPriority = (line: string) => {
-  const m = PRIORITY_RE.exec(line)
-  return m && splitMarks(line).priority !== 2 ? line.slice(0, m.index) : line
+  const head = LINE_HEAD_RE.exec(line)?.[1] ?? ''
+  const m = splitMarks(line.slice(head.length))
+  return m.priority === 2 ? line : taskLine(line, m.title, 2, m.tags)
 }
 // Priority first, file order within a level (sort is stable).
 const byPriority = <T extends { priority: Priority }>(ts: T[]) => [...ts].sort((a, b) => a.priority - b.priority)
@@ -139,7 +162,7 @@ function parse(text: string): Task[] {
     const item = TASK_RE.exec(line)
     if (item) {
       const id = ID_RE.exec(item[1]!.trim())
-      const { title, priority } = splitMarks((id ? id[2]! : item[1]!).trim())
+      const { title, priority, tags } = splitMarks((id ? id[2]! : item[1]!).trim())
       const n = id ? 0 : (repeats.get(title) ?? 0) + 1
       if (!id) repeats.set(title, n)
       task = {
@@ -148,6 +171,7 @@ function parse(text: string): Task[] {
         key: id ? id[1]! : n > 1 ? `raw:${title}:${n}` : `raw:${title}`,
         title,
         priority,
+        tags,
         notes: [],
         deps: [],
         start: i,
@@ -246,8 +270,28 @@ function prioritizeTask(text: string, key: string, priority: Priority): string |
   if (!task || task.priority === priority || (task.section !== 'todo' && task.section !== 'doing')) return null
   const lines = text.split('\n')
   const [line, ...notes] = removeBlock(lines, task)
-  return placeBlock(lines, task.section, [taskLine(withoutPriority(line!), task.title, priority), ...notes], priority, false).join('\n')
+  return placeBlock(lines, task.section, [taskLine(line!, task.title, priority, task.tags), ...notes], priority, false).join('\n')
 }
+
+// A tag as typed (`#Upload` or `upload`): lowercase, no `#`; null when it
+// isn't one (a letter, then letters, digits and `-`, 40 at most).
+const asTag = (word: string): string | null => {
+  const tag = word.replace(/^#/, '').toLowerCase()
+  return MARK_WORD_RE.test(`#${tag}`) ? tag : null
+}
+
+// Adds each tag the task lacks and removes each it has; Done lines are left alone.
+function tagTask(text: string, key: string, toggle: string[]): string | null {
+  const task = parse(text).find(t => t.key === key)
+  if (!task || task.section === 'done' || toggle.length === 0) return null
+  const tags = toggle.reduce((acc, tag) => (acc.includes(tag) ? acc.filter(t => t !== tag) : [...acc, tag]), task.tags)
+  const lines = text.split('\n')
+  lines[task.start] = taskLine(lines[task.start]!, task.title, task.priority, tags)
+  return lines.join('\n')
+}
+
+// Every tag on the board's open tasks, in the order first seen.
+const boardTags = (tasks: Task[]) => [...new Set(tasks.filter(t => t.section !== 'done').flatMap(t => t.tags))]
 
 // Swaps a task with its neighbour in the same section and level (-1 up, 1 down).
 function reorderTask(text: string, key: string, dir: -1 | 1): string | null {
@@ -272,17 +316,17 @@ function reorderTask(text: string, key: string, dir: -1 | 1): string | null {
 const LINE_HEAD_RE = /^([-*]\s+(?:\[[ xX]\]\s+)?(?:[TH]-\d+\b[:.]?\s*)?)/
 
 // A task line rebuilt from its old one: bullet, checkbox and ID kept, then
-// the title and the priority mark.
-function taskLine(old: string, title: string, priority: Priority): string {
+// the title and the marks (not for a Done line: its date goes last).
+function taskLine(old: string, title: string, priority: Priority, tags: string[]): string {
   const head = LINE_HEAD_RE.exec(old)?.[1] ?? '- '
-  return `${head}${head.endsWith(' ') ? '' : ' '}${title}${priorityMark(priority)}`
+  return `${head}${head.endsWith(' ') ? '' : ' '}${title}${marksText(priority, tags)}`
 }
 
 function renameTask(text: string, key: string, title: string): { text: string; key: string } | null {
   const task = parse(text).find(t => t.key === key)
   if (!task) return null
   const lines = text.split('\n')
-  lines[task.start] = taskLine(lines[task.start]!, title, task.priority)
+  lines[task.start] = taskLine(lines[task.start]!, title, task.priority, task.tags)
   const next = lines.join('\n')
   // A raw task's key is its title: find it again where it sits.
   const renamed = parse(next).find(t => t.start === task.start)
@@ -774,6 +818,11 @@ const readyTasks = (tasks: Task[]) =>
       t => t.section === 'todo' && t.id && !isHuman(t) && !t.question && !t.deps.some(d => tasks.some(o => o.id === d && (o.section === 'todo' || o.section === 'doing'))),
     ),
   )
+// A tag's group to start together: its Todo tasks that are Claude's (an H-
+// task never joins a batch).
+const groupOf = (tasks: Task[], tag: string) => tasks.filter(t => t.section === 'todo' && !isHuman(t) && t.tags.includes(tag))
+// What a run limited to a tag takes: only the tasks carrying it.
+const inRun = (tasks: Task[], run: { tag?: string } | null) => (run?.tag ? tasks.filter(t => t.tags.includes(run.tag!)) : tasks)
 // T- tasks in Todo waiting on an answer: parked.
 const parked = (tasks: Task[]) => tasks.filter(t => t.section === 'todo' && t.id && !isHuman(t) && t.question)
 // The T- tasks a run has in Doing: each one a worker's.
@@ -799,13 +848,13 @@ const runBranch = () => {
 // until stopped; runTick wakes Claude again when it is idle and a worker is free.
 // The prompt says who sent it: the engineer starting the run (the panel's key
 // leaves no trace in the transcript), or the panel waking Claude in one.
-async function runBoard($: EngineInterface, ready: Task[], woken = false) {
+async function runBoard($: EngineInterface, ready: Task[], woken = false, tag?: string) {
   const tasks = parse(await current($))
   const run = await setRun($, r => ({
-    ...(r ?? { branch: runBranch(), tasks: [], workers: [], overCap: [], prompted: false, idleNotified: false, wokeAt: null, ...seenNow(tasks) }),
+    ...(r ?? { branch: runBranch(), tasks: [], workers: [], overCap: [], prompted: false, idleNotified: false, wokeAt: null, ...(tag ? { tag } : {}), ...seenNow(tasks) }),
     prompted: true,
     idleNotified: false,
-    wokeAt: boardShape(tasks),
+    wokeAt: boardShape(inRun(tasks, r ?? (tag ? { tag } : null))),
   }))
   await autoArchive($)
   const busy = running(tasks).map(t => t.id)
@@ -816,7 +865,8 @@ async function runBoard($: EngineInterface, ready: Task[], woken = false) {
       : 'I started a long run of the board (from the task panel or /todo run). ') +
       `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): run branch ${run!.branch}, up to ${plural(runWorkers, 'worker')} at a time, ` +
       `a time cap of ${plural(runTaskMinutes, 'minute')} per task; don't wait for me between tasks. Ready now, ${ready.some(t => t.priority !== 2) ? 'by priority, then board order' : 'in board order'}: ${ready.map(t => t.id).join(', ')}.` +
-      (busy.length ? ` Already running: ${busy.join(', ')}.` : ''),
+      (busy.length ? ` Already running: ${busy.join(', ')}.` : '') +
+      (run!.tag ? ` This run takes only the tasks tagged #${run!.tag}.` : ''),
   )
 }
 
@@ -854,9 +904,9 @@ async function runTick($: EngineInterface) {
   const seen = seenNow(tasks)
   for (const id of seen.review.filter(id => !run.review.includes(id))) void notify($, `${id} is ready for your review.`)
   for (const id of seen.asked.filter(id => !run.asked.includes(id))) void notify($, `${id} is parked: it has a question for you.`)
-  const ready = readyTasks(tasks)
+  const ready = readyTasks(inRun(tasks, run))
   const quiet = !mainBusy && !run.prompted
-  const wake = quiet && busy.length < runWorkers && ready.length > 0 && boardShape(tasks) !== run.wokeAt
+  const wake = quiet && busy.length < runWorkers && ready.length > 0 && boardShape(inRun(tasks, run)) !== run.wokeAt
   const idle = quiet && busy.length === 0 && ready.length === 0
   if (idle && !run.idleNotified) {
     void notify($, seen.asked.length ? `Run idle: nothing ready. Waiting on you: ${seen.asked.join(', ')}.` : 'Run idle: nothing ready.')
@@ -1031,6 +1081,19 @@ async function flip($: EngineInterface, t: Task) {
 
 async function reorder($: EngineInterface, t: Task, dir: -1 | 1) {
   await editBoard($, text => reorderTask(text, t.key, dir))
+}
+
+// Tags typed in the panel's Tag field, space-separated: each toggles. A word
+// that isn't a tag is refused with a toast and nothing is written.
+async function tag($: EngineInterface, t: Task, value: string) {
+  await update($, taggingAtom, () => null)
+  const words = typed(value).split(' ').filter(Boolean)
+  const tags = words.map(asTag)
+  if (tags.some(w => w === null)) {
+    $.ui.toast('todo: a tag is a letter, then lowercase letters, digits and -')
+    return
+  }
+  await editBoard($, text => tagTask(text, t.key, tags as string[]))
 }
 
 // The engineer's call: the mark is rewritten and the task moves to the end
@@ -1523,7 +1586,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: 'Task board: /todo opens the panel, /todo <task> adds one, /todo init | enrich | realign [T-n] | run [stop] | archive | move | close',
+      description: 'Task board: /todo opens the panel, /todo <task> adds one, /todo init | enrich | realign [T-n] | run [#tag | stop] | start #tag | archive | move | close',
     }).catch((err: unknown) => $.ui.log(`todo: /${COMMAND} not registered: ${String(err)}`))
     await load($).catch(() => {})
     $.clock.every(POLL_MS, () => void load($).then(() => runTick($)).catch(() => {}))
@@ -1561,11 +1624,27 @@ export const register: Register = (on, options) => {
       await stopRun($)
       return { text: 'Run stopped. Claude finishes what it is doing; nothing more is started.' }
     }
-    if (word === 'run') {
-      const ready = readyTasks(parse(await current($)))
-      if (ready.length === 0) return { text: 'No ready tasks to run: every T- task in Todo has an open question or waits on another.' }
-      $.clock.after(0, () => void runBoard($, ready))
-      return { text: `Asked Claude to run the board: ${plural(ready.length, 'ready task')}.` }
+    if (word === 'run' || /^run\s+#/.test(word)) {
+      const tagWord = word.slice('run'.length).trim()
+      const tag = tagWord ? asTag(tagWord) : undefined
+      if (tag === null) return { text: `Not a tag: ${quoted(tagWord)}. A tag is a letter, then lowercase letters, digits and -.` }
+      const live = await read($, runAtom)
+      if (live && tag && live.tag !== tag) return { text: `A run is already on${live.tag ? ` for #${live.tag}` : ''}: /todo run stop first.` }
+      const ready = readyTasks(inRun(parse(await current($)), tag ? { tag } : null))
+      if (ready.length === 0) {
+        return { text: tag ? `No ready tasks tagged #${tag}.` : 'No ready tasks to run: every T- task in Todo has an open question or waits on another.' }
+      }
+      $.clock.after(0, () => void runBoard($, ready, false, tag))
+      return { text: `Asked Claude to run the board: ${plural(ready.length, 'ready task')}${tag ? ` tagged #${tag}` : ''}.` }
+    }
+    if (/^start\s+#?\S+$/.test(word)) {
+      const tagWord = word.slice('start'.length).trim()
+      const tag = asTag(tagWord)
+      if (!tag) return { text: `Not a tag: ${quoted(tagWord)}. A tag is a letter, then lowercase letters, digits and -.` }
+      const group = groupOf(parse(await current($)), tag)
+      if (group.length === 0) return { text: `No T- tasks in Todo tagged #${tag}.` }
+      $.clock.after(0, () => void startBatch($, group))
+      return { text: `Started ${plural(group.length, 'task')} tagged #${tag} as one batch.` }
     }
     if (word === 'close') {
       const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
@@ -1670,6 +1749,8 @@ export const register: Register = (on, options) => {
     const notes = chosen ? (folded ? chosen.notes.slice(0, 1) : chosen.notes) : []
     const renaming = await read($, renamingAtom)
     const rejecting = await read($, rejectingAtom)
+    const tagging = await read($, taggingAtom)
+    const tagsOnBoard = boardTags(tasks)
     const dropping = await read($, droppingAtom)
     // The keyboard goes to a row that stays: the task's own once in Done, or
     // a neighbour when a raw task is deleted.
@@ -1691,6 +1772,11 @@ export const register: Register = (on, options) => {
     // An H- task is never in a batch: batches are Claude's work.
     const markable = (t?: Task) => (t?.section === 'todo' && !isHuman(t) ? t : undefined)
     const markTarget = markable(focusedTask) ?? markable(chosen)
+    // A tag's Todo tasks marked (or unmarked) at once; `g` then starts them.
+    const markGroup = async (group: Task[], add: boolean) => {
+      const keys = group.map(t => t.key)
+      await update($, markedAtom, marked => (add ? [...new Set([...marked, ...keys])] : marked.filter(key => !keys.includes(key))))
+    }
     const toggleMark = async (t: Task) => {
       const key = t.key
       await update($, markedAtom, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key]))
@@ -1711,6 +1797,15 @@ export const register: Register = (on, options) => {
           <Box flexDirection="row" columnGap={2} key="reject-row">
             <Input key={k('reject', true)} label="What to fix:" submitLabel="send back" onSubmit={value => void reject($, t, value)} />
             <Button key={k('reject-cancel')} plain label="Cancel" onPress={() => void update($, rejectingAtom, () => null)} />
+          </Box>
+        )}
+        {tagging === t.key && Input && (
+          <Box flexDirection="column" key="tag-block">
+            <Box flexDirection="row" columnGap={2} key="tag-row">
+              <Input key={k('tag', true)} label="Tag:" placeholder="name (again to remove)" submitLabel="tag" onSubmit={value => void tag($, t, value)} />
+              <Button key={k('tag-cancel')} plain label="Cancel" onPress={() => void update($, taggingAtom, () => null)} />
+            </Box>
+            {tagsOnBoard.length > 0 && <Text dimColor wrap="truncate-end">On the board: {tagsOnBoard.map(g => `#${g}`).join(' ')}</Text>}
           </Box>
         )}
         {t.notes.length === 0 && <Text dimColor>{t.id ? 'No notes.' : 'Not enriched yet.'}</Text>}
@@ -1784,6 +1879,32 @@ export const register: Register = (on, options) => {
               }}
             />
           )}
+          {t.section !== 'done' && Input && tagging !== t.key && (
+            <Button
+              key={k('tag-open')}
+              plain
+              hotkey="i"
+              label="Tag"
+              onPress={async () => {
+                await update($, taggingAtom, () => t.key)
+                await $.ui.focus({ requestId: PANE, key: 'tag' }).catch(() => {})
+              }}
+            />
+          )}
+          {t.section === 'todo' &&
+            !isHuman(t) &&
+            t.tags.map(g => {
+              const group = groupOf(tasks, g)
+              const all = group.every(isMarked)
+              return (
+                <Button
+                  key={k(`mark-group:${g}`, true)}
+                  plain
+                  label={`${all ? 'Unmark' : 'Mark'} #${g} (${group.length})`}
+                  onPress={() => void markGroup(group, !all)}
+                />
+              )
+            })}
           {t.id && t.section !== 'done' && (
             <Button key={k('flip')} plain hotkey="y" label={`Make it ${isHuman(t) ? 'T' : 'H'}${t.id.slice(1)}`} onPress={() => void flip($, t)} />
           )}
@@ -1820,6 +1941,7 @@ export const register: Register = (on, options) => {
       await update($, droppingAtom, () => null)
       await update($, renamingAtom, () => null)
       await update($, rejectingAtom, () => null)
+      await update($, taggingAtom, () => null)
       await update($, selectedAtom, () => key)
     }
     const close = async (focusOn = chosen) => {
@@ -1849,6 +1971,7 @@ export const register: Register = (on, options) => {
             </Button>
             {t.priority === 1 && <Text color="red"> !1</Text>}
             {t.priority === 3 && <Text dimColor> !3</Text>}
+            {t.tags.length > 0 && <Text dimColor wrap="truncate-end">{t.tags.map(g => ` #${g}`).join('')}</Text>}
             {t.question && <Text color="yellow"> ?</Text>}
           </Box>
           {isOpen && detail(t)}
@@ -1987,7 +2110,7 @@ export const register: Register = (on, options) => {
         {run && (
           <Box flexDirection="column" key="run-status">
             <Text>
-              <Text bold color="blue">Run</Text> <Text dimColor>{run.branch} · {run.tasks.length}/{runWorkers} workers</Text>
+              <Text bold color="blue">Run</Text> <Text dimColor>{run.branch}{run.tag ? ` · #${run.tag}` : ''} · {run.tasks.length}/{runWorkers} workers</Text>
             </Text>
             {run.tasks.map(rt => (
               <Text key={`run:${rt.id}`}>
@@ -1997,7 +2120,7 @@ export const register: Register = (on, options) => {
             ))}
             {waiting.length > 0 && <Text color="yellow">  ? waiting on you: {waiting.map(t => t.id).join(', ')}</Text>}
             {review.length > 0 && <Text dimColor>  {review.length} in Review</Text>}
-            {run.tasks.length === 0 && waiting.length === 0 && ready.length === 0 && <Text dimColor>  idle: nothing ready</Text>}
+            {run.tasks.length === 0 && waiting.length === 0 && readyTasks(inRun(tasks, run)).length === 0 && <Text dimColor>  idle: nothing ready</Text>}
           </Box>
         )}
         <Text> </Text>
