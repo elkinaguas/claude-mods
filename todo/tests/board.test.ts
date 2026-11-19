@@ -1126,6 +1126,117 @@ test('the answer goes under the open question, not at the end of the notes; empt
   expect(prompts).toHaveLength(1)
 })
 
+// A board with priority marks: T-8 is now, T-5 someday, the rest normal.
+const PRIORITY_BOARD = `# TODO
+
+## Todo
+
+- T-8 Patch the leak !1
+  > Prod is leaking memory.
+- T-3 Add retry to upload client
+  > Decision: how many retries.
+- T-4 Bump node
+- T-5 Rename the logo !3
+
+## Doing
+
+- T-2 Fix flaky auth test
+
+## Done
+
+- T-1 Cache git status (2026-10-08)
+`
+
+test('a priority mark ends the line: the title is shown without it, !1 red and !3 dim beside the row', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': PRIORITY_BOARD })
+  expect((await ui.find({ key: 'task:T-8' }))?.props.label).toBe('  T-8 Patch the leak')
+  expect((await ui.find({ type: 'Text', text: ' !1' }))?.props.color).toBe('red')
+  expect((await ui.find({ type: 'Text', text: ' !3' }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Add retry to upload client')
+})
+
+test('1, 2 and 3 set a priority: the mark is rewritten and the task moves to the end of its new level', async ($, on) => {
+  const { ui, files, prompts } = await panel($, on, { 'TODO.md': PRIORITY_BOARD })
+  await ui.press({ key: 'task:T-4' })
+  // The current level has no button.
+  expect(await ui.find({ key: 'priority-2' })).toBeUndefined()
+  expect((await ui.find({ key: 'priority-1' }))?.props.label).toBe('Now (!1)')
+  expect((await ui.find({ key: 'priority-3' }))?.props.label).toBe('Someday (!3)')
+  await ui.press({ key: 'priority-1' })
+  expect(files['TODO.md']).toContain('## Todo\n\n- T-8 Patch the leak !1\n  > Prod is leaking memory.\n- T-4 Bump node !1\n- T-3 Add retry to upload client\n')
+  await ui.press({ key: 'priority-3' })
+  expect(files['TODO.md']).toContain('- T-3 Add retry to upload client\n  > Decision: how many retries.\n- T-5 Rename the logo !3\n- T-4 Bump node !3\n\n## Doing')
+  await ui.press({ key: 'priority-2' })
+  expect(files['TODO.md']).toContain('  > Decision: how many retries.\n- T-4 Bump node\n- T-5 Rename the logo !3\n')
+  expect(files['TODO.md']).toBe(PRIORITY_BOARD)
+  // A Doing task too; Done tasks have none.
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'priority-1' })
+  expect(files['TODO.md']).toContain('## Doing\n\n- T-2 Fix flaky auth test !1\n')
+  await ui.press({ key: 'done-heading' })
+  await ui.press({ key: 'task:T-1' })
+  expect(await ui.find({ key: 'priority-1' })).toBeUndefined()
+  expect(prompts).toHaveLength(0)
+})
+
+test('k and j stay within a priority level', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': PRIORITY_BOARD })
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ key: 'up' })).toBeUndefined()
+  expect(await ui.find({ key: 'down' })).toBeDefined()
+  await ui.press({ key: 'task:T-4' })
+  expect(await ui.find({ key: 'up' })).toBeDefined()
+  expect(await ui.find({ key: 'down' })).toBeUndefined()
+})
+
+test('a new task goes before the someday ones, and one typed with a mark to the end of its level', async ($, on) => {
+  const { files } = project(on, { 'TODO.md': PRIORITY_BOARD })
+  await run('write the release notes')($)
+  expect(files['TODO.md']).toContain('- T-4 Bump node\n- write the release notes\n- T-5 Rename the logo !3\n')
+  await run('page the on-call !1')($)
+  expect(files['TODO.md']).toContain('- T-8 Patch the leak !1\n  > Prod is leaking memory.\n- page the on-call !1\n- T-3 Add retry')
+})
+
+test('moving to Done drops the mark; back to Todo goes to the top of its level; rename keeps it', async ($, on) => {
+  const board = PRIORITY_BOARD.replace('- T-2 Fix flaky auth test\n', '- T-2 Fix flaky auth test !3\n- T-6 Ship it !1\n')
+  const { ui, files } = await panel($, on, { 'TODO.md': board })
+  await ui.press({ key: 'task:T-2' })
+  await ui.press({ key: 'back' })
+  expect(files['TODO.md']).toContain('- T-4 Bump node\n- T-2 Fix flaky auth test !3\n- T-5 Rename the logo !3\n')
+  await ui.press({ key: 'rename-open' })
+  expect((await ui.find({ key: 'rename' }))?.props.value).toBe('Fix flaky auth test')
+  await ui.input({ key: 'rename', text: 'Fix the flaky auth test' })
+  expect(files['TODO.md']).toContain('- T-2 Fix the flaky auth test !3\n')
+  await ui.press({ key: 'task:T-6' })
+  await ui.press({ key: 'quick-done' })
+  expect(files['TODO.md']).toMatch(/## Done\n\n- T-6 Ship it \(\d{4}-\d{2}-\d{2}\)\n/)
+})
+
+test('a run and a batch take tasks by priority, then board order', async ($, on) => {
+  const { ui, prompts } = await panel($, on, { 'TODO.md': PRIORITY_BOARD.replace('- T-8 Patch the leak !1\n  > Prod is leaking memory.\n', '').replace('- T-4 Bump node\n', '- T-4 Bump node !1\n') })
+  for (const id of ['T-5', 'T-3', 'T-4']) {
+    await ui.press({ key: `task:${id}` })
+    await ui.press({ key: 'mark' })
+  }
+  await ui.press({ key: 'start-marked' })
+  expect(prompts[0]).toContain('one at a time in this order:\n1. T-4\n2. T-3\n3. T-5\n')
+})
+
+test('the run prompt lists ready tasks by priority', async ($, on) => {
+  const { prompts } = project(on, { 'TODO.md': PRIORITY_BOARD.replace('- T-8 Patch the leak !1', '- T-8 Patch the leak').replace('- T-4 Bump node', '- T-4 Bump node !1') })
+  await run('run')($)
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  expect(prompts[0]).toContain('Ready now, by priority, then board order: T-4, T-8, T-3, T-5.')
+})
+
+test('the rules give the engineer the priority mark and order the board by it', async ($, on) => {
+  const { files } = project(on, {})
+  await run('init')($)
+  expect(files['CLAUDE.md']).toContain('- **Priority.** A task line may end with the engineer\'s priority mark: `!1` (now) or `!3` (someday); no mark is normal.')
+  expect(files['CLAUDE.md']).toContain('drop it when a task moves to Done')
+  expect(files['CLAUDE.md']).toContain('take them by priority, then board order')
+})
+
 // A chat question dialog: core answers, and the line under the dialog is
 // recorded. The test kit has no scroll for a pane's own `$.ui.scroll`, so the
 // scroll to the row isn't checked here (the mod treats it as best effort).

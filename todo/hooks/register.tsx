@@ -67,18 +67,23 @@ ${RULES_HEADING}
 - **The engineer's tasks.** An \`H-\` task is the engineer's: never start, work on or log it; they move it through the board themselves, and it skips Review.
 - **Review.** When a task is finished, move it to the end of \`## Review\` (adding that heading before \`## Done\` if missing) and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets. The engineer reviews it: they move it to Done, or back to Doing with a \`> Review: ...\` note saying what to fix; fix that, then move it to Review again with the log updated.
 - **Done.** A reviewed task sits at the top of \`## Done\` with the date appended to its line (\`- T-12 Fix flaky auth test (2026-10-10)\`), its log kept. Move a task to Done yourself only when the engineer asks.
-- **Long run.** When asked to run the board, orchestrate it: keep up to the given number of workers busy on ready tasks, without waiting for the engineer between them, until none is ready. A task is ready when it is a \`T-\` task in \`## Todo\` with no open question and nothing in its Depends still in Todo or Doing; take them in board order, and run two side by side only when their notes point at different files. Only you, the orchestrator, edit the board. All of a run's work goes on its run branch (the name the prompt gives), made from the default branch (main or master), or from the newest run branch whose tasks are still in Review; never check it out in the engineer's folder, never push it or merge it. For each task: move it to Doing, add a git worktree at \`.claude/worktrees/T-<n>\` in the project (listed in \`.git/info/exclude\`; only if it can't be made there, in your session's scratchpad) on a branch \`todo/T-<n>\` from the run branch's tip, set it up so the tests run (install dependencies, copy the untracked files the project needs, such as \`.env\`), and hand the task to a worker subagent in that folder, with a description starting with the task's ID. The worker leaves one commit, \`T-<n> <title>\`. When it reports back, rebase that commit onto the run branch, run the tests, and fast-forward the run branch to it (\`git push . HEAD:<run branch>\` from the worktree); resolve a mechanical conflict yourself, otherwise hand the task to a worker again on the new tip. Then remove the worktree and the \`todo/T-<n>\` branch, and write the task's Review log from the worker's report, naming the run branch and the commit. Fix drifted \`file:line\` references and Depends yourself and say so in the log; a change of scope, a task that looks obsolete or a split goes to the engineer as a \`> Q:\`. When a decision is the engineer's, or a task runs past its time cap (the task panel then refuses its worker's tool calls, so the worker reports back), park it: write the \`> Q:\` under it (for the cap, where it got stuck), remove its worktree, move it back to the top of \`## Todo\`, tell the engineer, and go on; it is ready again once a \`> A:\` answers it. When a Review task comes back with a \`> Review:\` note, fix it with a new commit on the run branch, and add \`> Recheck: built on T-<n>, sent back from review\` to each open or Review task that depends on it. When none is ready and no worker is busy, stop and list what waits on the engineer; the task panel wakes you once a task is ready.
-- **Format.** A task is a line \`- T-<n> <title>\` or \`- H-<n> <title>\` (\`- <title>\` before enrichment) at column 0; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
+- **Long run.** When asked to run the board, orchestrate it: keep up to the given number of workers busy on ready tasks, without waiting for the engineer between them, until none is ready. A task is ready when it is a \`T-\` task in \`## Todo\` with no open question and nothing in its Depends still in Todo or Doing; take them by priority, then board order, and run two side by side only when their notes point at different files. Only you, the orchestrator, edit the board. All of a run's work goes on its run branch (the name the prompt gives), made from the default branch (main or master), or from the newest run branch whose tasks are still in Review; never check it out in the engineer's folder, never push it or merge it. For each task: move it to Doing, add a git worktree at \`.claude/worktrees/T-<n>\` in the project (listed in \`.git/info/exclude\`; only if it can't be made there, in your session's scratchpad) on a branch \`todo/T-<n>\` from the run branch's tip, set it up so the tests run (install dependencies, copy the untracked files the project needs, such as \`.env\`), and hand the task to a worker subagent in that folder, with a description starting with the task's ID. The worker leaves one commit, \`T-<n> <title>\`. When it reports back, rebase that commit onto the run branch, run the tests, and fast-forward the run branch to it (\`git push . HEAD:<run branch>\` from the worktree); resolve a mechanical conflict yourself, otherwise hand the task to a worker again on the new tip. Then remove the worktree and the \`todo/T-<n>\` branch, and write the task's Review log from the worker's report, naming the run branch and the commit. Fix drifted \`file:line\` references and Depends yourself and say so in the log; a change of scope, a task that looks obsolete or a split goes to the engineer as a \`> Q:\`. When a decision is the engineer's, or a task runs past its time cap (the task panel then refuses its worker's tool calls, so the worker reports back), park it: write the \`> Q:\` under it (for the cap, where it got stuck), remove its worktree, move it back to the top of \`## Todo\`, tell the engineer, and go on; it is ready again once a \`> A:\` answers it. When a Review task comes back with a \`> Review:\` note, fix it with a new commit on the run branch, and add \`> Recheck: built on T-<n>, sent back from review\` to each open or Review task that depends on it. When none is ready and no worker is busy, stop and list what waits on the engineer; the task panel wakes you once a task is ready.
+- **Priority.** A task line may end with the engineer's priority mark: \`!1\` (now) or \`!3\` (someday); no mark is normal. It is theirs to set: keep it when you rewrite, enrich or move the task, keep Todo and Doing ordered by it (\`!1\` tasks first, \`!3\` last), and drop it when a task moves to Done.
+- **Format.** A task is a line \`- T-<n> <title>\` or \`- H-<n> <title>\` (\`- <title>\` before enrichment) at column 0, maybe ending in a priority mark; its notes follow on lines indented two spaces, each starting with \`> \`. Keep to it: the task panel parses this file.
 ${MARK_END}`
 
 type Section = (typeof SECTIONS)[number]
+// 1 now, 2 normal (no mark), 3 someday.
+type Priority = 1 | 2 | 3
 
 type Task = {
   section: Section
   id?: string
   // The ID, or `raw:<title>` (`raw:<title>:<n>` for the nth of a repeated title).
   key: string
+  // The title without the line's trailing marks (its priority).
   title: string
+  priority: Priority
   notes: string[]
   // The open question's text and its line in the file, while one is open.
   question?: { text: string; line: number }
@@ -98,6 +103,24 @@ const TASK_RE = /^[-*]\s+(?:\[[ xX]\]\s+)?(.+)$/
 const ID_RE = /^([TH]-\d{1,6})\b[:.]?\s*(.*)$/
 const isHuman = (t: { id?: string }) => t.id?.startsWith('H-') === true
 
+// The engineer's priority mark at the end of a task line: `!1` now, `!3`
+// someday; none (or `!2`) is normal. A line that is only a mark is a title.
+const PRIORITY_RE = /\s+!([123])\s*$/
+function splitMarks(text: string): { title: string; priority: Priority } {
+  const m = PRIORITY_RE.exec(text)
+  if (!m || !text.slice(0, m.index).trim()) return { title: text, priority: 2 }
+  return { title: text.slice(0, m.index).trim(), priority: Number(m[1]) as Priority }
+}
+const priorityMark = (p: Priority) => (p === 2 ? '' : ` !${p}`)
+// A task line without its priority mark: what a task moving to Done keeps.
+const withoutPriority = (line: string) => {
+  const m = PRIORITY_RE.exec(line)
+  return m && splitMarks(line).priority !== 2 ? line.slice(0, m.index) : line
+}
+// Priority first, file order within a level (sort is stable).
+const byPriority = <T extends { priority: Priority }>(ts: T[]) => [...ts].sort((a, b) => a.priority - b.priority)
+const PRIORITY_NAME = { 1: 'now', 2: 'normal', 3: 'someday' } as const
+
 function parse(text: string): Task[] {
   const lines = text.split('\n')
   const tasks: Task[] = []
@@ -116,7 +139,7 @@ function parse(text: string): Task[] {
     const item = TASK_RE.exec(line)
     if (item) {
       const id = ID_RE.exec(item[1]!.trim())
-      const title = (id ? id[2]! : item[1]!).trim()
+      const { title, priority } = splitMarks((id ? id[2]! : item[1]!).trim())
       const n = id ? 0 : (repeats.get(title) ?? 0) + 1
       if (!id) repeats.set(title, n)
       task = {
@@ -124,6 +147,7 @@ function parse(text: string): Task[] {
         id: id?.[1],
         key: id ? id[1]! : n > 1 ? `raw:${title}:${n}` : `raw:${title}`,
         title,
+        priority,
         notes: [],
         deps: [],
         start: i,
@@ -199,22 +223,40 @@ function moveTask(
   if (!task || task.section === to) return null
   const lines = text.split('\n')
   const block = reshape(removeBlock(lines, task))
-  const first = atTop ? parse(lines.join('\n')).find(t => t.section === to) : undefined
-  if (first) {
-    lines.splice(first.start, 0, ...block)
-    return lines.join('\n')
-  }
-  return insertInto(lines, to, block).join('\n')
+  return placeBlock(lines, to, block, task.priority, atTop).join('\n')
 }
 
-// Swaps a task with its neighbour in the same section (-1 up, 1 down).
+// Puts a task's lines in a section: at its top or end, or, in Todo and
+// Doing (kept ordered by priority), at the top or end of its level there.
+function placeBlock(lines: string[], to: Section, block: string[], priority: Priority, atTop: boolean): string[] {
+  const ordered = to === 'todo' || to === 'doing'
+  const there = parse(lines.join('\n')).filter(t => t.section === to)
+  const before = atTop ? there.find(t => !ordered || t.priority >= priority) : ordered ? there.find(t => t.priority > priority) : undefined
+  if (before) {
+    lines.splice(before.start, 0, ...block)
+    return lines
+  }
+  return insertInto(lines, to, block)
+}
+
+// Gives a Todo or Doing task another priority: its mark rewritten, and the
+// task moved to the end of its new level in its section.
+function prioritizeTask(text: string, key: string, priority: Priority): string | null {
+  const task = parse(text).find(t => t.key === key)
+  if (!task || task.priority === priority || (task.section !== 'todo' && task.section !== 'doing')) return null
+  const lines = text.split('\n')
+  const [line, ...notes] = removeBlock(lines, task)
+  return placeBlock(lines, task.section, [taskLine(withoutPriority(line!), task.title, priority), ...notes], priority, false).join('\n')
+}
+
+// Swaps a task with its neighbour in the same section and level (-1 up, 1 down).
 function reorderTask(text: string, key: string, dir: -1 | 1): string | null {
   const tasks = parse(text)
   const task = tasks.find(t => t.key === key)
   if (!task) return null
   const peers = tasks.filter(t => t.section === task.section)
   const other = peers[peers.indexOf(task) + dir]
-  if (!other) return null
+  if (!other || other.priority !== task.priority) return null
   const [a, b] = dir === -1 ? [other, task] : [task, other]
   const lines = text.split('\n')
   return [
@@ -229,12 +271,18 @@ function reorderTask(text: string, key: string, dir: -1 | 1): string | null {
 // The task line's bullet, checkbox and ID kept, its title replaced.
 const LINE_HEAD_RE = /^([-*]\s+(?:\[[ xX]\]\s+)?(?:[TH]-\d+\b[:.]?\s*)?)/
 
+// A task line rebuilt from its old one: bullet, checkbox and ID kept, then
+// the title and the priority mark.
+function taskLine(old: string, title: string, priority: Priority): string {
+  const head = LINE_HEAD_RE.exec(old)?.[1] ?? '- '
+  return `${head}${head.endsWith(' ') ? '' : ' '}${title}${priorityMark(priority)}`
+}
+
 function renameTask(text: string, key: string, title: string): { text: string; key: string } | null {
   const task = parse(text).find(t => t.key === key)
   if (!task) return null
   const lines = text.split('\n')
-  const head = LINE_HEAD_RE.exec(lines[task.start]!)?.[1] ?? '- '
-  lines[task.start] = `${head}${head.endsWith(' ') ? '' : ' '}${title}`
+  lines[task.start] = taskLine(lines[task.start]!, title, task.priority)
   const next = lines.join('\n')
   // A raw task's key is its title: find it again where it sits.
   const renamed = parse(next).find(t => t.start === task.start)
@@ -496,7 +544,8 @@ async function checkRules($: EngineInterface) {
 
 async function capture($: EngineInterface, title: string) {
   const line = typed(title)
-  if (line) await editBoard($, text => insertInto(text.split('\n'), 'todo', [`- ${line}`]).join('\n'))
+  // At the end of its level: before the someday tasks for a plain title.
+  if (line) await editBoard($, text => placeBlock(text.split('\n'), 'todo', [`- ${line}`], splitMarks(line).priority, false).join('\n'))
 }
 
 // Writes the rules block into CLAUDE.md and AGENTS.md where they exist
@@ -717,10 +766,13 @@ let runTaskMinutes = 60
 let runWorkers = 2
 
 // T- tasks in Todo with no open question and no dep still in Todo or Doing
-// (a dep in Review counts as met: it is on the run branch already).
+// (a dep in Review counts as met: it is on the run branch already), by
+// priority, then board order.
 const readyTasks = (tasks: Task[]) =>
-  tasks.filter(
-    t => t.section === 'todo' && t.id && !isHuman(t) && !t.question && !t.deps.some(d => tasks.some(o => o.id === d && (o.section === 'todo' || o.section === 'doing'))),
+  byPriority(
+    tasks.filter(
+      t => t.section === 'todo' && t.id && !isHuman(t) && !t.question && !t.deps.some(d => tasks.some(o => o.id === d && (o.section === 'todo' || o.section === 'doing'))),
+    ),
   )
 // T- tasks in Todo waiting on an answer: parked.
 const parked = (tasks: Task[]) => tasks.filter(t => t.section === 'todo' && t.id && !isHuman(t) && t.question)
@@ -763,7 +815,7 @@ async function runBoard($: EngineInterface, ready: Task[], woken = false) {
       ? `The task panel woke you: the long run on ${run!.branch} goes on, and a task is ready. `
       : 'I started a long run of the board (from the task panel or /todo run). ') +
       `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): run branch ${run!.branch}, up to ${plural(runWorkers, 'worker')} at a time, ` +
-      `a time cap of ${plural(runTaskMinutes, 'minute')} per task; don't wait for me between tasks. Ready now, in board order: ${ready.map(t => t.id).join(', ')}.` +
+      `a time cap of ${plural(runTaskMinutes, 'minute')} per task; don't wait for me between tasks. Ready now, ${ready.some(t => t.priority !== 2) ? 'by priority, then board order' : 'in board order'}: ${ready.map(t => t.id).join(', ')}.` +
       (busy.length ? ` Already running: ${busy.join(', ')}.` : ''),
   )
 }
@@ -868,13 +920,13 @@ function start($: EngineInterface, t: Task) {
   )
 }
 
-// Starts the marked tasks as one batch, in Todo order with each task after
-// the batch tasks it waits on: all move to Doing, and Claude works them one
-// at a time, each finished before the next.
+// Starts the marked tasks as one batch, by priority then Todo order, each
+// task after the batch tasks it waits on: all move to Doing, and Claude works
+// them one at a time, each finished before the next.
 async function startBatch($: EngineInterface, marked: Task[]) {
   await update($, markedAtom, () => [])
   if (marked.length === 1) return start($, marked[0]!)
-  const ts = readyFirst(marked, (by, t) => t.deps.includes(by.id ?? ''))
+  const ts = readyFirst(byPriority(marked), (by, t) => t.deps.includes(by.id ?? ''))
   const list = ts.map((t, i) => `${i + 1}. ${ref(t)}${t.id ? '' : `: ${ENRICH_FIRST}`}`)
   await startTasks(
     $,
@@ -894,7 +946,7 @@ const today = () => {
 // line saying no log was written: for tasks too small to ask Claude about.
 function quickDone($: EngineInterface, t: Task) {
   return editBoard($, text =>
-    moveTask(text, t.key, 'done', true, ([line, ...notes]) => [`${line!.trimEnd()} (${today()})`, ...notes, '  > Done from the panel, no log.']),
+    moveTask(text, t.key, 'done', true, ([line, ...notes]) => [`${withoutPriority(line!).trimEnd()} (${today()})`, ...notes, '  > Done from the panel, no log.']),
   )
 }
 
@@ -926,7 +978,7 @@ async function answer($: EngineInterface, t: Task, value: string) {
 function dropTask(text: string, key: string, date: string): string | null {
   const task = parse(text).find(t => t.key === key)
   if (!task || task.section === 'done') return null
-  if (task.id) return moveTask(text, key, 'done', true, ([line, ...notes]) => [`${line!.trimEnd()} (dropped ${date})`, ...notes])
+  if (task.id) return moveTask(text, key, 'done', true, ([line, ...notes]) => [`${withoutPriority(line!).trimEnd()} (dropped ${date})`, ...notes])
   const lines = text.split('\n')
   removeBlock(lines, task)
   return lines.join('\n')
@@ -981,6 +1033,12 @@ async function reorder($: EngineInterface, t: Task, dir: -1 | 1) {
   await editBoard($, text => reorderTask(text, t.key, dir))
 }
 
+// The engineer's call: the mark is rewritten and the task moves to the end
+// of its new level; Claude is not asked.
+async function prioritize($: EngineInterface, t: Task, priority: Priority) {
+  await editBoard($, text => prioritizeTask(text, t.key, priority))
+}
+
 async function rename($: EngineInterface, t: Task, value: string) {
   await update($, renamingAtom, () => null)
   const title = typed(value)
@@ -1019,7 +1077,7 @@ function finish($: EngineInterface, t: Task) {
 // A reviewed task goes to the top of Done with today's date, its log as it
 // is: the log was written on entering Review, so Claude is not asked.
 function approve($: EngineInterface, t: Task) {
-  return editBoard($, text => moveTask(text, t.key, 'done', true, ([line, ...notes]) => [`${line!.trimEnd()} (${today()})`, ...notes]))
+  return editBoard($, text => moveTask(text, t.key, 'done', true, ([line, ...notes]) => [`${withoutPriority(line!).trimEnd()} (${today()})`, ...notes]))
 }
 
 // A task that failed review goes back to the end of Doing with a
@@ -1595,6 +1653,8 @@ export const register: Register = (on, options) => {
     const now = run ? await $.clock.now() : 0
     const waiting = parked(tasks)
     const peers = (t: Task) => by(t.section)
+    // Up and Down stay within a task's priority level.
+    const sameLevel = (t: Task, dir: -1 | 1) => peers(t)[peers(t).indexOf(t) + dir]?.priority === t.priority
     // `v` shows all tasks, only Claude's (T-) or only the engineer's (H-);
     // tasks without an ID yet show in every view. The graph shows them all.
     const typeFilter = await read($, typeFilterAtom)
@@ -1694,12 +1754,24 @@ export const register: Register = (on, options) => {
             />
           )}
           {t.section === 'doing' && <Button key={k('back')} plain hotkey="b" label="Back to Todo" onPress={() => void sendBack($, t)} />}
-          {t.section !== 'done' && peers(t).indexOf(t) > 0 && (
+          {t.section !== 'done' && sameLevel(t, -1) && (
             <Button key={k('up')} plain hotkey="k" label="Up" onPress={() => void reorder($, t, -1)} />
           )}
-          {t.section !== 'done' && peers(t).indexOf(t) < peers(t).length - 1 && (
+          {t.section !== 'done' && sameLevel(t, 1) && (
             <Button key={k('down')} plain hotkey="j" label="Down" onPress={() => void reorder($, t, 1)} />
           )}
+          {(t.section === 'todo' || t.section === 'doing') &&
+            ([1, 2, 3] as const)
+              .filter(p => p !== t.priority)
+              .map(p => (
+                <Button
+                  key={k(`priority-${p}`)}
+                  plain
+                  hotkey={String(p)}
+                  label={p === 2 ? 'Normal' : `${capitalized(PRIORITY_NAME[p])} (!${p})`}
+                  onPress={() => void prioritize($, t, p)}
+                />
+              ))}
           {t.section !== 'done' && Input && renaming !== t.key && (
             <Button
               key={k('rename-open')}
@@ -1775,6 +1847,8 @@ export const register: Register = (on, options) => {
               {t.id ? <Text color={SECTION_COLOR[t.section]}>{t.id}</Text> : <Text dimColor>·</Text>}
               {` ${t.title}`}
             </Button>
+            {t.priority === 1 && <Text color="red"> !1</Text>}
+            {t.priority === 3 && <Text dimColor> !3</Text>}
             {t.question && <Text color="yellow"> ?</Text>}
           </Box>
           {isOpen && detail(t)}
