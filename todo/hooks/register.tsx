@@ -156,7 +156,8 @@ const byPriority = <T extends { priority: Priority }>(ts: T[]) => [...ts].sort((
 const PRIORITY_NAME = { 1: 'now', 2: 'normal', 3: 'someday' } as const
 
 function parse(text: string): Task[] {
-  const lines = text.split('\n')
+  // A CRLF file's `\r` goes; line numbers stay those of `text.split('\n')`.
+  const lines = text.split('\n').map(line => (line.endsWith('\r') ? line.slice(0, -1) : line))
   const tasks: Task[] = []
   let section: Section | null = null
   let task: Task | null = null
@@ -573,7 +574,11 @@ async function editBoard(
     for (let attempt = 0; attempt < 3; attempt++) {
       const before = await mtimeOf()
       const text = before === null ? TEMPLATE : await $.fs.read(path)
-      const next = edit(text)
+      // A CRLF board is edited as LF and written back as CRLF, so new
+      // lines get the file's line ending too.
+      const crlf = text.includes('\r\n')
+      const edited = edit(crlf ? text.replace(/\r\n/g, '\n') : text)
+      const next = edited !== null && crlf ? edited.replace(/\r?\n/g, '\r\n') : edited
       if (next === null || next === text) return null
       if ((await mtimeOf()) !== before) continue
       await beforeWrite?.()
@@ -780,7 +785,8 @@ async function archive($: EngineInterface, keep = 0) {
     // The archive is written first, so a failed write loses no task.
     async () => {
       const old = await readBoard($, ARCHIVE, '# TODO archive\n')
-      await $.fs.write(await boardPath($, ARCHIVE), `${old.trimEnd()}\n\n${moved.join('\n')}\n`)
+      const eol = old.includes('\r\n') ? '\r\n' : '\n'
+      await $.fs.write(await boardPath($, ARCHIVE), `${old.trimEnd()}${eol}${eol}${moved.join(eol)}${eol}`)
     },
   )
   return written === null ? 0 : n

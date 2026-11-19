@@ -1229,6 +1229,26 @@ test('the run prompt lists ready tasks by priority', async ($, on) => {
   expect(prompts[0]).toContain('Ready now, by priority, then board order: T-4, T-8, T-3, T-5.')
 })
 
+test('a CRLF board shows its tasks, and edits keep every line CRLF', async ($, on) => {
+  const crlf = BOARD.replace(/\n/g, '\r\n')
+  const { ui, files } = await panel($, on, { 'TODO.md': crlf, 'TODO-archive.md': '# TODO archive\r\n' })
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Add retry to upload client')
+  expect(await ui.find({ text: 'Q: Mock the clock or raise the timeout?' })).toBeUndefined()
+  await ui.press({ key: 'task:T-2' })
+  expect(await ui.find({ text: 'Q: Mock the clock or raise the timeout?' })).toBeDefined()
+  await run('write the release notes')($)
+  await ui.press({ key: 'task:T-3' })
+  await ui.press({ key: 'priority-1' })
+  await ui.press({ key: 'quick-done' })
+  const text = files['TODO.md']!
+  expect(text).toContain('- write the release notes\r\n')
+  expect(text).toMatch(/## Done\r\n\r\n- T-3 Add retry to upload client \(\d{4}-\d{2}-\d{2}\)\r\n/)
+  expect(text.replace(/\r\n/g, '')).not.toContain('\n')
+  await run('archive')($)
+  expect(files['TODO-archive.md']!.replace(/\r\n/g, '')).not.toContain('\n')
+  expect(files['TODO-archive.md']).toContain('- T-1 Cache git status (2026-10-08)\r\n')
+})
+
 test('the rules give the engineer the priority mark and order the board by it', async ($, on) => {
   const { files } = project(on, {})
   await run('init')($)
