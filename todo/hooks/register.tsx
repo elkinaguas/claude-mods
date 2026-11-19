@@ -435,17 +435,21 @@ let seen = -1
 // Folded, hidden and the smallest zoom by default; remembered per project in
 // the plugin's store, one key each. The session's atom caches them (a render
 // can't write state), filled by load while unset, after a start or a /resume.
-const DEFAULT_FLAGS: PanelFlags = { doneOpen: false, statsOpen: false, graphZoom: 1 }
+const DEFAULT_FLAGS: PanelFlags = { doneOpen: false, statsOpen: false, graphZoom: 1, tagFilter: null, priorityFilter: 'all' }
 const flagKey = async ($: EngineInterface, name: keyof PanelFlags) => `${name}:${await $.session.root()}`
 
 async function loadFlags($: EngineInterface) {
   if ((await read($, flagsAtom)) !== null) return
   const stored = async (name: keyof PanelFlags) => $.store.get(await flagKey($, name)).catch(() => undefined)
   const zoom = await stored('graphZoom')
+  const tag = await stored('tagFilter')
+  const level = await stored('priorityFilter')
   const flags: PanelFlags = {
     doneOpen: (await stored('doneOpen')) === true,
     statsOpen: (await stored('statsOpen')) === true,
     graphZoom: zoom === 2 || zoom === 3 ? zoom : 1,
+    tagFilter: typeof tag === 'string' && MARK_WORD_RE.test(`#${tag}`) ? tag : null,
+    priorityFilter: level === 1 || level === 2 || level === 3 ? level : 'all',
   }
   await update($, flagsAtom, () => flags)
 }
@@ -1503,6 +1507,9 @@ async function revealAsked($: EngineInterface, t: Task): Promise<boolean> {
   if (t.section === 'done' && (await read($, flagsAtom))?.doneOpen !== true) await setFlag($, 'doneOpen', true)
   const filter = await read($, typeFilterAtom)
   if (filter !== 'all' && t.id && isHuman(t) !== (filter === 'H')) await update($, typeFilterAtom, () => 'all' as TypeFilter)
+  const flags = await read($, flagsAtom)
+  if (flags?.tagFilter && !t.tags.includes(flags.tagFilter)) await setFlag($, 'tagFilter', null)
+  if (flags && flags.priorityFilter !== 'all' && flags.priorityFilter !== t.priority) await setFlag($, 'priorityFilter', 'all')
   await update($, droppingAtom, () => null)
   await update($, renamingAtom, () => null)
   await update($, rejectingAtom, () => null)
@@ -1738,8 +1745,23 @@ export const register: Register = (on, options) => {
     // tasks without an ID yet show in every view. The graph shows them all.
     const typeFilter = await read($, typeFilterAtom)
     const hasHuman = tasks.some(isHuman)
+    // `4` narrows them to one tag and `5` to one priority level, on top of
+    // `v`, remembered per project. A tag no open task carries any more is no
+    // filter. Unlike `v`, these two apply to tasks without an ID too.
+    const flags = await read($, flagsAtom)
+    const tagsOnBoard = boardTags(tasks)
+    const tagFilter = flags?.tagFilter && tagsOnBoard.includes(flags.tagFilter) ? flags.tagFilter : null
+    const priorityFilter = flags?.priorityFilter ?? 'all'
     const shown = (list: Task[]) =>
-      typeFilter === 'all' ? list : list.filter(t => !t.id || isHuman(t) === (typeFilter === 'H'))
+      list.filter(
+        t =>
+          (typeFilter === 'all' || !t.id || isHuman(t) === (typeFilter === 'H')) &&
+          (!tagFilter || t.tags.includes(tagFilter)) &&
+          (priorityFilter === 'all' || t.priority === priorityFilter),
+      )
+    const nextTag = () => (tagFilter === null ? tagsOnBoard[0] ?? null : tagsOnBoard[tagsOnBoard.indexOf(tagFilter) + 1] ?? null)
+    const nextLevel = (): PanelFlags['priorityFilter'] => (priorityFilter === 'all' ? 1 : priorityFilter === 3 ? 'all' : ((priorityFilter + 1) as 2 | 3))
+    const hasMarks = tasks.some(t => t.section !== 'done' && t.priority !== 2)
     // The open task: its detail shows under its row until Enter or Close folds it.
     const selectedKey = await read($, selectedAtom)
     const chosen = tasks.find(t => t.key === selectedKey)
@@ -1750,7 +1772,6 @@ export const register: Register = (on, options) => {
     const renaming = await read($, renamingAtom)
     const rejecting = await read($, rejectingAtom)
     const tagging = await read($, taggingAtom)
-    const tagsOnBoard = boardTags(tasks)
     const dropping = await read($, droppingAtom)
     // The keyboard goes to a row that stays: the task's own once in Done, or
     // a neighbour when a raw task is deleted.
@@ -1985,7 +2006,6 @@ export const register: Register = (on, options) => {
     )
     // Done folds to its heading (Enter on it, or `t`), so the graph below
     // gets the room. Folding moves the focus off a done row onto the heading.
-    const flags = await read($, flagsAtom)
     const doneOpen = flags?.doneOpen === true
     const statsOpen = flags?.statsOpen === true
     const toggleDone = async () => {
@@ -2092,6 +2112,24 @@ export const register: Register = (on, options) => {
               hotkey="v"
               label={`View: ${typeFilter === 'all' ? 'all' : typeFilter === 'T' ? "Claude's (T)" : 'mine (H)'}`}
               onPress={() => void update($, typeFilterAtom, f => (f === 'all' ? 'T' : f === 'T' ? 'H' : 'all'))}
+            />
+          )}
+          {(tagsOnBoard.length > 0 || tagFilter) && (
+            <Button
+              key={k('tag-filter')}
+              plain
+              hotkey="4"
+              label={`Tag: ${tagFilter ? `#${tagFilter}` : 'all'}`}
+              onPress={() => void setFlag($, 'tagFilter', nextTag())}
+            />
+          )}
+          {(hasMarks || priorityFilter !== 'all') && (
+            <Button
+              key={k('priority-filter')}
+              plain
+              hotkey="5"
+              label={`Priority: ${priorityFilter === 'all' ? 'all' : priorityFilter === 2 ? 'normal' : `!${priorityFilter}`}`}
+              onPress={() => void setFlag($, 'priorityFilter', nextLevel())}
             />
           )}
           {todo.length + doing.length > 0 && (

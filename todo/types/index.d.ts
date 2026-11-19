@@ -1,8 +1,8 @@
 /** TODO.md as last read: whether it exists, its text (and TODO-archive.md's), and why it was refused (a link, not a file). */
 export type TodoFile = { exists: boolean; text: string; archive?: string; refused?: string }
 
-/** The panel's settings, remembered per project: Done unfolded, stats shown, the graph's zoom (1 pills, 2 ovals, 3 ovals with titles). */
-export type PanelFlags = { doneOpen: boolean; statsOpen: boolean; graphZoom: 1 | 2 | 3 }
+/** The panel's settings, remembered per project: Done unfolded, stats shown, the graph's zoom (1 pills, 2 ovals, 3 ovals with titles), and the lists' tag and priority filters (null / 'all': no filter). */
+export type PanelFlags = { doneOpen: boolean; statsOpen: boolean; graphZoom: 1 | 2 | 3; tagFilter: string | null; priorityFilter: 'all' | 1 | 2 | 3 }
 
 /** Which tasks the panel lists: all, Claude's (T-) or the engineer's (H-). */
 export type TypeFilter = 'all' | 'T' | 'H'

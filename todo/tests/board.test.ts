@@ -1350,6 +1350,79 @@ test('the rules keep the engineer\'s tags and let enrichment use only existing o
   expect(files['CLAUDE.md']).toContain('only those carrying the tag, when the prompt names one')
 })
 
+// The task rows the panel lists, by key.
+const rowKeys = async (ui: { findAll: (q: { type: string }) => Promise<{ key?: string; props: Record<string, unknown> }[]> }) =>
+  (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('task:'))
+
+test('4 cycles the lists through the board\'s tags, 5 through the priority levels; they combine with v and are saved', async ($, on) => {
+  const saved: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: saved[e.key] }))
+  on('store.set', (_$, e) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: all')
+  await ui.press({ key: 'done-heading' })
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: #upload')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3', 'task:T-4', 'task:H-6'])
+  // v: Claude's only.
+  await ui.press({ key: 'type-filter' })
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3', 'task:T-4'])
+  await ui.press({ key: 'type-filter' })
+  await ui.press({ key: 'type-filter' })
+  // 5: !1 only.
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: !1')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3'])
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: normal')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-4', 'task:H-6'])
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: !3')
+  expect(await rowKeys(ui as never)).toEqual([])
+  await ui.press({ key: 'priority-filter' })
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: all')
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: #release')
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: #docs')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-5'])
+  // The headings count what is shown.
+  expect(await ui.find({ type: 'Text', text: /^Todo 1$/ })).toBeDefined()
+  expect(saved['tagFilter:/project']).toBe('docs')
+  await ui.press({ key: 'tag-filter' })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect(await rowKeys(ui as never)).toContain('task:T-1')
+})
+
+test('saved filters come back in a new session; a tag no longer on the board is no filter', async ($, on) => {
+  mock.store(on, { 'tagFilter:/project': 'gone', 'priorityFilter:/project': 1 })
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: !1')
+  expect(await rowKeys(ui as never)).toEqual(['task:T-3'])
+})
+
+test('no tag or priority filter on a board without tags or marks', async ($, on) => {
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await ui.find({ key: 'tag-filter' })).toBeUndefined()
+  expect(await ui.find({ key: 'priority-filter' })).toBeUndefined()
+})
+
+test('a question dialog about a task the filters hide clears them', async ($, on) => {
+  const { ask } = dialogs(on)
+  mock.store(on, { 'tagFilter:/project': 'docs', 'priorityFilter:/project': 2 })
+  const { ui } = await panel($, on, { 'TODO.md': TAG_BOARD })
+  expect(await ui.find({ key: 'task:T-3' })).toBeUndefined()
+  await ask($, 'T-3: how many retries?')
+  expect((await ui.find({ key: 'tag-filter' }))?.props.label).toBe('Tag: all')
+  expect((await ui.find({ key: 'priority-filter' }))?.props.label).toBe('Priority: all')
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('▾ T-3 Add retry to upload client')
+})
+
 // A chat question dialog: core answers, and the line under the dialog is
 // recorded. The test kit has no scroll for a pane's own `$.ui.scroll`, so the
 // scroll to the row isn't checked here (the mod treats it as best effort).
