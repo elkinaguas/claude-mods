@@ -45,7 +45,7 @@ To keep every board in one folder you can back up (a git repo of its own, say), 
 
 `TODO.md` may come from someone else's repo, so the mod treats it as data:
 
-- A board recorded in `CLAUDE.local.md` is used only inside the `boardsDir` folder, so a repo shipping its own `CLAUDE.local.md` can't send the board's writes elsewhere.
+- A board recorded in `CLAUDE.local.md` is used only when it is this project's own folder in the `boardsDir` folder (`<owner>/<repo>` from the git remote, as `/todo move` makes it), so a repo shipping its own `CLAUDE.local.md` can't send the board's reads and writes elsewhere, another project's board included.
 - It never reads or writes `TODO.md`, `TODO-archive.md`, `CLAUDE.md` or `AGENTS.md` when one is a symbolic link (even one leading nowhere) or not a regular file; the panel says so instead.
 - A file it can't read is never overwritten as if it were missing.
 - Prompts it sends Claude name tasks by ID. A task without an ID is quoted as a one-line, capped title marked as data, never as an instruction.

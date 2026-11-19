@@ -400,8 +400,10 @@ const isInside = (path: string, root: string) =>
   path.startsWith(`${root}/`) && !path.split('/').some(seg => seg === '.' || seg === '..')
 
 // Reads the board's folder from CLAUDE.local.md's todo:board block. It is
-// used only inside the boardsDir option's folder: a repo shipping its own
-// CLAUDE.local.md can't send the board's writes anywhere else.
+// used only when it is this project's own folder in the boardsDir option's
+// folder (`<boardsDir>/<owner>/<repo>`, as /todo move makes it): a repo
+// shipping its own CLAUDE.local.md can't send the board's reads and writes
+// anywhere else, another project's board included.
 async function findBoardDir($: EngineInterface) {
   // Worked out aside and set once: a poll and a panel edit can overlap, and
   // neither may see the project root while the folder is being re-read.
@@ -413,7 +415,9 @@ async function findBoardDir($: EngineInterface) {
   const path = start === -1 || end === -1 ? undefined : /`(\/[^`]*)\/TODO\.md`/.exec(text.slice(start, end))?.[1]
   if (path) {
     const root = await boardsRoot($)
-    if (root && isInside(path, root)) dir = path
+    const own = root && isInside(path, root) ? `${root}/${await projectSlug($)}` : ''
+    if (own && path === own) dir = path
+    else if (own) refused = `todo: ${LOCAL_FILE} puts the board in ${path}, not this project's folder ${own}; run /todo move to put it there`
     else refused = `todo: ${LOCAL_FILE} puts the board in ${path}, outside the boardsDir option's folder${root ? ` (${root})` : ' (unset)'}; set the option to use it`
   }
   if (dir !== boardDir) seen = -1
@@ -674,6 +678,15 @@ async function init($: EngineInterface) {
   return done
 }
 
+// The slug, worked out once per session and project root: the poll reads
+// the board folder every 1.5 s, and the remote seldom changes.
+let slugCache: { root: string; slug: string } | undefined
+async function projectSlug($: EngineInterface): Promise<string> {
+  const root = await $.session.root()
+  if (slugCache?.root !== root) slugCache = { root, slug: await boardSlug($) }
+  return slugCache.slug
+}
+
 // This project's subfolder in the boards folder: the git remote's
 // owner/repo, else the project folder's name; plain path segments only.
 async function boardSlug($: EngineInterface): Promise<string> {
@@ -711,7 +724,7 @@ async function moveBoard($: EngineInterface): Promise<string> {
   } else {
     const local = await readBoard($, FILE, null)
     const localArchive = await readBoard($, ARCHIVE, null)
-    const dir = `${root}/${await boardSlug($)}`
+    const dir = `${root}/${await projectSlug($)}`
     const there = await readBoard($, FILE, null, dir)
     if (there !== null && local !== null) {
       return `${dir}/${FILE} already exists: merge the two boards by hand, then run /todo move again with one of them.`
@@ -1569,11 +1582,13 @@ export const register: Register = (on, options) => {
   runWorkers = typeof options.runWorkers === 'number' && options.runWorkers >= 1 ? Math.floor(options.runWorkers) : 2
   runLoaded = false
   runSaved = 'null'
+  slugCache = undefined
   // /resume (and /clear) swaps the session's state, empty or an old snapshot,
   // without loading the mod again: forget what the module saw, so the next
   // poll reads the board into the new session.
   on('session.end', ($, e, next) => {
     seen = -1
+    slugCache = undefined
     lastFocus = undefined
     runLoaded = false
     return next(e)

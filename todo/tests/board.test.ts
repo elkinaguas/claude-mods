@@ -1089,6 +1089,23 @@ test('a CLAUDE.local.md pointing outside the boards folder is refused, nothing r
   expect(paths.some(p => p.includes('.ssh'))).toBe(false)
 })
 
+test('a CLAUDE.local.md naming another project\'s folder in the boards folder is refused: its board is neither shown nor edited', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
+  const box: { files?: Record<string, string> } = {}
+  shell(on, () => box.files!, 'git@github.com:attacker/repo.git')
+  const victim = '/home/me/todos/victim/app'
+  const theirs = `# TODO\n\n## Todo\n\n- T-1 victim secret task\n\n## Done\n`
+  const { files, paths } = project(on, { 'TODO.md': BOARD, 'CLAUDE.local.md': LOCAL_NOTE(victim), [`${victim}/TODO.md`]: theirs })
+  box.files = files
+  await start($)
+  const ui = await mount($, 'terminal')
+  expect(await ui.find({ text: /not this project's folder \/home\/me\/todos\/attacker\/repo/ })).toBeDefined()
+  expect(await ui.find({ text: /victim secret task/ })).toBeUndefined()
+  await run('quick')($)
+  await run('archive')($)
+  expect(files[`${victim}/TODO.md`]).toBe(theirs)
+  expect(paths.some(p => p.startsWith(victim))).toBe(false)
+})
+
 test('without a remote the subfolder is the project folder\'s name', { options: { boardsDir: '/home/me/todos' } }, async ($, on) => {
   const box: { files?: Record<string, string> } = {}
   shell(on, () => box.files!)
