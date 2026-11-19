@@ -62,7 +62,7 @@ ${RULES_HEADING}
 
 - **Capture.** The engineer adds tasks as one short line under \`## Todo\` (\`- fix flaky auth test\`), with no ID. Keep their wording.
 - **Enrichment.** When asked to enrich (any time, mid-project included), find every task line with no ID. Give each the next free ID: \`T-<n>\` for a task Claude can do, \`H-<n>\` for one only the engineer can do (a call, a purchase, a decision outside the code). Both share one sequence: \`<n>\` is one more than the highest number in TODO.md and TODO-archive.md, whichever its letter. Never reuse or renumber an ID, and leave tasks that already have one alone. Under the task add 3 to 4 short lines of context for the engineer to decide on: where it lands in the code (\`file:line\`), related code or helpers to reuse, risks, and the decisions that are theirs. No more than 4 lines. When the task can only be done after other open tasks, one of those lines is \`> Depends: T-<n>, H-<m>\`. When a task would be better as several (of either type), show the engineer the split (titles, types, IDs, Depends) and ask before writing it; the first piece keeps the original ID.
-- **Doing.** A task being worked on sits under \`## Doing\`. When a decision is the engineer's, ask them; record each question under the task as \`> Q: ...\` and their answer as \`> A: ...\`. On starting a task, first check its \`file:line\` references against the code and fix any that drifted.
+- **Doing.** A task being worked on sits under \`## Doing\`. When a decision is the engineer's, ask them; record each question under the task as \`> Q: ...\` and their answer as \`> A: ...\`. A question asked in a chat dialog names the task's ID, so the task panel can show that task beside it. On starting a task, first check its \`file:line\` references against the code and fix any that drifted.
 - **Realign.** When asked to realign (one task, or every Todo and Doing task), check each one's notes against the project as it stands: \`file:line\` references, context, Depends, the decisions still open, and whether the task still makes sense. Show the engineer the changes you propose, task by task (and any task that looks obsolete), and write them only once they agree. Never change an ID, the engineer's title wording or a recorded Q/A, and leave Review and Done tasks alone.
 - **The engineer's tasks.** An \`H-\` task is the engineer's: never start, work on or log it; they move it through the board themselves, and it skips Review.
 - **Review.** When a task is finished, move it to the end of \`## Review\` (adding that heading before \`## Done\` if missing) and replace its notes with the log: what was done, the decisions taken and why, the result (tests, behaviour), and the files or commits touched. This one may be longer; keep it to bullets. The engineer reviews it: they move it to Done, or back to Doing with a \`> Review: ...\` note saying what to fix; fix that, then move it to Review again with the log updated.
@@ -1362,6 +1362,37 @@ function graphNodes(tasks: Task[], openKey: string | null): GraphNode[] | null {
 // The deps of `t` not done yet: present in the file and outside Done.
 const unmetDeps = (t: Task, tasks: Task[]) => t.deps.filter(d => tasks.some(o => o.id === d && o.section !== 'done'))
 
+// ---- Questions asked in a chat dialog ----------------------------------------
+// While an AskUserQuestion dialog is up it holds the keys and the panel can't
+// be scrolled, so the panel brings the task asked about into view by itself:
+// the first board task whose ID the questions name (an open one before a done
+// one), else the only T- task in Doing.
+function askedTask(questions: unknown, tasks: Task[]): Task | undefined {
+  const ids = [...new Set(JSON.stringify(questions ?? '').match(/\b[TH]-\d{1,6}\b/g) ?? [])]
+  const named = ids.map(id => tasks.find(t => t.id === id)).filter((t): t is Task => t !== undefined)
+  const doing = tasks.filter(t => t.section === 'doing' && t.id && !isHuman(t))
+  return named.find(t => t.section !== 'done') ?? named[0] ?? (doing.length === 1 ? doing[0] : undefined)
+}
+
+// Opens the task's detail in the panel (unfolding Done or clearing the view
+// filter when either hides it) and scrolls its row to the top of the pane.
+// Only while the panel is open: a question never opens it.
+async function revealAsked($: EngineInterface, t: Task): Promise<boolean> {
+  if (!(await $.ui.panes()).some(pane => pane.id === PANE)) return false
+  if (t.section === 'done' && (await read($, flagsAtom))?.doneOpen !== true) await setFlag($, 'doneOpen', true)
+  const filter = await read($, typeFilterAtom)
+  if (filter !== 'all' && t.id && isHuman(t) !== (filter === 'H')) await update($, typeFilterAtom, () => 'all' as TypeFilter)
+  await update($, droppingAtom, () => null)
+  await update($, renamingAtom, () => null)
+  await update($, rejectingAtom, () => null)
+  await update($, selectedAtom, () => t.key)
+  const to = { to: { key: `task:${t.key}` }, in: PANE, block: 'start' as const }
+  const moved = await $.ui.scroll(to).catch(() => ({ deny: 'failed' }))
+  // The row may not be drawn yet (Done just unfolded): try once more after the redraw.
+  if (moved.deny) $.clock.after(100, () => void $.ui.scroll(to).catch(() => {}))
+  return true
+}
+
 export const register: Register = (on, options) => {
   if (typeof options.autoArchive === 'number') autoArchiveOver = options.autoArchive
   if (typeof options.boardsDir === 'string') boardsDirOption = options.boardsDir
@@ -1413,6 +1444,22 @@ export const register: Register = (on, options) => {
     const id = run?.workers.find(w => w.agentId === e.agentId && run.overCap.includes(w.id))?.id
     if (!id) return next(e)
     return { deny: `todo: ${id} is past its ${plural(runTaskMinutes, 'minute')} cap in the long run. Stop, and report back where you got stuck.` }
+  })
+
+  // A question dialog in the chat holds the keys, so the panel can't be
+  // scrolled: it opens the task asked about and scrolls to it first, and a
+  // line under the dialog says so. The question itself is never touched.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (e.agentId) return next(e)
+    try {
+      const t = askedTask((e as { questions?: unknown }).questions, parse((await read($, fileAtom)).text))
+      if (t && (await revealAsked($, t)) && e.tool_use_id) {
+        $.ui.notice(e.tool_use_id, `Task panel: ${t.id ?? quoted(t.title)} is open there, its notes in view.`)
+      }
+    } catch (err) {
+      $.ui.log(`todo: could not show the asked task: ${String(err)}`)
+    }
+    return next(e)
   })
 
   on('session.start', async ($, e, next) => {

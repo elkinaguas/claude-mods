@@ -1126,6 +1126,63 @@ test('the answer goes under the open question, not at the end of the notes; empt
   expect(prompts).toHaveLength(1)
 })
 
+// A chat question dialog: core answers, and the line under the dialog is
+// recorded. The test kit has no scroll for a pane's own `$.ui.scroll`, so the
+// scroll to the row isn't checked here (the mod treats it as best effort).
+function dialogs(on: On) {
+  const notices: { tool_use_id: string; text: string | undefined }[] = []
+  on('tool.call', () => ({ result: 'answered' }) as never)
+  on('ui.notice', (_$, e) => {
+    notices.push(e)
+    return { value: undefined }
+  })
+  const ask = ($: Engine, question: string) =>
+    $.tool.call({ tool: 'AskUserQuestion', tool_use_id: 'q1', questions: [{ question, header: 'Q', multiSelect: false, options: [{ label: 'A', description: 'a' }, { label: 'B', description: 'b' }] }] } as never)
+  return { notices, ask }
+}
+
+test('a question dialog naming a task opens it in the panel, since the dialog holds the keys', async ($, on) => {
+  const { notices, ask } = dialogs(on)
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  expect(await ask($, 'T-3: how many retries should the upload client make?')).toMatchObject({ result: 'answered' })
+  expect(await ui.find({ text: 'Decision: how many retries.' })).toBeDefined()
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('▾ T-3 Add retry to upload client')
+  expect(notices).toEqual([{ tool_use_id: 'q1', text: 'Task panel: T-3 is open there, its notes in view.' }])
+})
+
+test('a question dialog naming no task shows the only task in Doing; a done task named unfolds Done', async ($, on) => {
+  const { notices, ask } = dialogs(on)
+  const { ui } = await panel($, on, { 'TODO.md': BOARD })
+  await ask($, 'Mock the clock or raise the timeout?')
+  expect(await ui.find({ text: 'Q: Mock the clock or raise the timeout?' })).toBeDefined()
+  expect(notices.at(-1)?.text).toBe('Task panel: T-2 is open there, its notes in view.')
+  await ask($, 'Should T-1 cache for longer?')
+  expect(await ui.find({ key: 'task:T-1' })).toBeDefined()
+  expect(await ui.find({ text: 'Log: cached for 5s.' })).toBeDefined()
+})
+
+test('a question dialog leaves the panel alone when it names no board task and Doing has several, or the panel is closed', async ($, on) => {
+  const { notices, ask } = dialogs(on)
+  const board = BOARD.replace('- T-2 Fix flaky auth test\n', '- T-2 Fix flaky auth test\n- T-7 Second\n')
+  const { ui, panes } = await panel($, on, { 'TODO.md': board })
+  await ask($, 'Which colour, T-99 or blue?')
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  panes.delete('todo')
+  await ask($, 'T-3: how many retries?')
+  expect(await ui.find({ key: 'detail' })).toBeUndefined()
+  expect(notices).toHaveLength(0)
+})
+
+test('a question dialog naming an H- task while the view shows only T- tasks switches the view to all', async ($, on) => {
+  const { ask } = dialogs(on)
+  const { ui } = await panel($, on, { 'TODO.md': MIXED_BOARD })
+  await ui.press({ key: 'type-filter' })
+  expect(await ui.find({ key: 'task:H-4' })).toBeUndefined()
+  await ask($, 'H-4: which certificate vendor?')
+  expect((await ui.find({ key: 'type-filter' }))?.props.label).toBe('View: all')
+  expect((await ui.find({ key: 'task:H-4' }))?.props.label).toBe('▾ H-4 Buy the certificate')
+})
+
 // A board where T-5 waits on T-3, T-6 on T-5 and T-2: three graph columns.
 const DEPS_BOARD = BOARD.replace(
   '- add dark mode to settings\n',
