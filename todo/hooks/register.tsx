@@ -1136,22 +1136,24 @@ function flipTask(text: string, id: string): { text: string; id: string } | null
 
 // Flips a task's type. One in Doing changes hands: Claude stops on a task
 // that became the engineer's, and starts on one that became Claude's.
-async function flip($: EngineInterface, t: Task) {
+// Resolves to the task's new ID, or null when nothing was written.
+async function flip($: EngineInterface, t: Task): Promise<string | null> {
   let id = ''
   const written = await editBoard($, text => {
     const out = flipTask(text, t.id!)
     if (out) id = out.id
     return out?.text ?? null
   })
-  if (written === null) return
+  if (written === null) return null
   await update($, selectedAtom, () => id)
-  if (t.section !== 'doing') return
+  if (t.section !== 'doing') return id
   await ask(
     $,
     isHuman(t)
       ? `${t.id} is now ${id} in ${FILE}, under Doing. Start working on it: ${CHECK_REFS}, then follow the task board rules.`
       : `${t.id} is now ${id} in ${FILE}, a task of mine. Stop working on it and leave its notes as they are.`,
   )
+  return id
 }
 
 async function reorder($: EngineInterface, t: Task, dir: -1 | 1) {
@@ -1177,17 +1179,18 @@ async function prioritize($: EngineInterface, t: Task, priority: Priority) {
   await editBoard($, text => prioritizeTask(text, t.key, priority))
 }
 
-async function rename($: EngineInterface, t: Task, value: string) {
+// Resolves to the task's key afterwards (a raw task's changes with its title).
+async function rename($: EngineInterface, t: Task, value: string): Promise<string> {
   await update($, renamingAtom, () => null)
   const title = typed(value)
-  if (!title || title === t.title) return
+  if (!title || title === t.title) return t.key
   let key = t.key
   const written = await editBoard($, text => {
     const out = renameTask(text, t.key, title)
     if (out) key = out.key
     return out?.text ?? null
   })
-  if (written === null) return
+  if (written === null) return t.key
   await update($, selectedAtom, () => key)
   // Notes written for the old title may no longer fit: Claude reviews them.
   if (t.notes.length > 0) {
@@ -1196,6 +1199,7 @@ async function rename($: EngineInterface, t: Task, value: string) {
       `${t.id ?? `The task now titled ${quoted(title)}`} in ${FILE} was renamed. Check its notes against the new title and update them if they no longer fit, following the task board rules.`,
     )
   }
+  return key
 }
 
 // What Done asks about commits: the log names them; work not yet committed
@@ -1837,13 +1841,11 @@ export const register: Register = (on, options) => {
     const tagsOnBoard = boardTags(tasks)
     const tagFilter = flags?.tagFilter && tagsOnBoard.includes(flags.tagFilter) ? flags.tagFilter : null
     const priorityFilter = flags?.priorityFilter ?? 'all'
-    const shown = (list: Task[]) =>
-      list.filter(
-        t =>
-          (typeFilter === 'all' || !t.id || isHuman(t) === (typeFilter === 'H')) &&
-          (!tagFilter || t.tags.includes(tagFilter)) &&
-          (priorityFilter === 'all' || t.priority === priorityFilter),
-      )
+    type Filters = { type: TypeFilter; tag: string | null; level: PanelFlags['priorityFilter'] }
+    const passes = (t: Task, f: Filters) =>
+      (f.type === 'all' || !t.id || isHuman(t) === (f.type === 'H')) && (!f.tag || t.tags.includes(f.tag)) && (f.level === 'all' || t.priority === f.level)
+    const filters: Filters = { type: typeFilter, tag: tagFilter, level: priorityFilter }
+    const shown = (list: Task[]) => list.filter(t => passes(t, filters))
     const nextTag = () => (tagFilter === null ? tagsOnBoard[0] ?? null : tagsOnBoard[tagsOnBoard.indexOf(tagFilter) + 1] ?? null)
     const nextLevel = (): PanelFlags['priorityFilter'] => (priorityFilter === 'all' ? 1 : priorityFilter === 3 ? 'all' : ((priorityFilter + 1) as 2 | 3))
     const hasMarks = tasks.some(t => t.section !== 'done' && t.priority !== 2)
@@ -1858,14 +1860,34 @@ export const register: Register = (on, options) => {
     const rejecting = await read($, rejectingAtom)
     const tagging = await read($, taggingAtom)
     const dropping = await read($, droppingAtom)
-    // The keyboard goes to a row that stays: the task's own once in Done, or
-    // a neighbour when a raw task is deleted.
+    // The keyboard goes to a row that stays (the task leaves its section).
     const drop = async (t: Task) => {
-      const row = peers(t)
-      const i = row.indexOf(t)
-      const stays = t.id ? t : row[i + 1] ?? row[i - 1]
-      await close(stays)
+      await focusOn(survivor(t))
+      await select(null)
       await editBoard($, text => dropTask(text, t.key, today()))
+    }
+    // When the element holding the keyboard goes (a row that moves away or
+    // changes key, a field that closes), the pane hands the keys back to the
+    // prompt and the next hotkey types into the chat. So before each such
+    // change the focus moves to something that stays drawn.
+    const focusOn = (key: string) => $.ui.focus({ requestId: PANE, key }).catch(() => {})
+    // Where the focus goes when `t` leaves the lists: the next row shown in its
+    // section, else the one before, else Done's heading (always drawn).
+    const survivor = (t: Task) => {
+      const row = shown(peers(t))
+      const i = row.indexOf(t)
+      const other = row[i + 1] ?? row[i - 1]
+      return other ? `task:${other.key}` : 'done-heading'
+    }
+    // A row whose key changes (a flip, a raw task renamed): the focus waits on
+    // a neighbour, then lands on the new key once it is drawn.
+    const refocus = (key: string | null) => {
+      if (key) $.clock.after(100, () => void focusOn(`task:${key}`))
+    }
+    // A filter change that would hide the focused row: the focus moves to the
+    // filter's own button, or Done's heading when that button goes too.
+    const filterTo = async (next: Filters, button: string | null) => {
+      if (focusedTask && !passes(focusedTask, next)) await focusOn(button ?? 'done-heading')
     }
     // Marks of tasks that left Todo (started, renamed, removed) drop out here.
     const markedKeys = await read($, markedAtom)
@@ -1895,21 +1917,31 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" paddingLeft={4} key="detail">
         {renaming === t.key && Input && (
           <Box flexDirection="row" columnGap={2} key="rename-row">
-            <Input key={k('rename', true)} value={view(t.title, MAX_TYPED)} submitLabel="save" onSubmit={value => void rename($, t, value)} />
-            <Button key={k('rename-cancel')} plain label="Cancel" onPress={() => void update($, renamingAtom, () => null)} />
+            <Input
+              key={k('rename', true)}
+              value={view(t.title, MAX_TYPED)}
+              submitLabel="save"
+              onSubmit={async value => {
+                // An ID task keeps its key; a raw one's changes with the title.
+                await focusOn(t.id ? `task:${t.key}` : survivor(t))
+                const key = await rename($, t, value)
+                if (!t.id) refocus(key)
+              }}
+            />
+            <Button key={k('rename-cancel')} plain label="Cancel" onPress={async () => (await focusOn(`task:${t.key}`), update($, renamingAtom, () => null))} />
           </Box>
         )}
         {rejecting === t.key && Input && (
           <Box flexDirection="row" columnGap={2} key="reject-row">
-            <Input key={k('reject', true)} label="What to fix:" submitLabel="send back" onSubmit={value => void reject($, t, value)} />
-            <Button key={k('reject-cancel')} plain label="Cancel" onPress={() => void update($, rejectingAtom, () => null)} />
+            <Input key={k('reject', true)} label="What to fix:" submitLabel="send back" onSubmit={async value => (await focusOn(`task:${t.key}`), reject($, t, value))} />
+            <Button key={k('reject-cancel')} plain label="Cancel" onPress={async () => (await focusOn(`task:${t.key}`), update($, rejectingAtom, () => null))} />
           </Box>
         )}
         {tagging === t.key && Input && (
           <Box flexDirection="column" key="tag-block">
             <Box flexDirection="row" columnGap={2} key="tag-row">
-              <Input key={k('tag', true)} label="Tag:" placeholder="name (again to remove)" submitLabel="tag" onSubmit={value => void tag($, t, value)} />
-              <Button key={k('tag-cancel')} plain label="Cancel" onPress={() => void update($, taggingAtom, () => null)} />
+              <Input key={k('tag', true)} label="Tag:" placeholder="name (again to remove)" submitLabel="tag" onSubmit={async value => (await focusOn(`task:${t.key}`), tag($, t, value))} />
+              <Button key={k('tag-cancel')} plain label="Cancel" onPress={async () => (await focusOn(`task:${t.key}`), update($, taggingAtom, () => null))} />
             </Box>
             {tagsOnBoard.length > 0 && <Text dimColor wrap="truncate-end">On the board: {tagsOnBoard.map(g => `#${g}`).join(' ')}</Text>}
           </Box>
@@ -1922,13 +1954,13 @@ export const register: Register = (on, options) => {
         ))}
         {folded && <Text dimColor>+{t.notes.length - 1} more</Text>}
         {t.question && Input && (
-          <Input key={k('answer', true)} label="Answer:" submitLabel="answer" onSubmit={value => void answer($, t, value)} />
+          <Input key={k('answer', true)} label="Answer:" submitLabel="answer" onSubmit={async value => (await focusOn(`task:${t.key}`), answer($, t, value))} />
         )}
         <Box flexDirection="row" flexWrap="wrap" columnGap={2} key="actions">
           {t.section === 'todo' && <Button key={k('start')} plain hotkey="s" label="Start" onPress={() => void start($, t)} />}
           {t.section === 'doing' && !isHuman(t) && <Button key={k('done')} plain hotkey="d" label="To review" onPress={() => void finish($, t)} />}
-          {isHuman(t) && t.section !== 'done' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={() => void approve($, t)} />}
-          {t.section === 'review' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={() => void approve($, t)} />}
+          {isHuman(t) && t.section !== 'done' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={async () => (await focusOn(survivor(t)), approve($, t))} />}
+          {t.section === 'review' && <Button key={k('approve')} plain hotkey="d" label="Done" onPress={async () => (await focusOn(survivor(t)), approve($, t))} />}
           {t.section === 'review' && rejecting !== t.key && (
             <Button
               key={k('reject-open')}
@@ -1943,7 +1975,7 @@ export const register: Register = (on, options) => {
             />
           )}
           {t.section !== 'done' && t.section !== 'review' && !isHuman(t) && (
-            <Button key={k('quick-done')} plain hotkey="q" label="Quick done" onPress={() => void quickDone($, t)} />
+            <Button key={k('quick-done')} plain hotkey="q" label="Quick done" onPress={async () => (await focusOn(survivor(t)), quickDone($, t))} />
           )}
           {t.section !== 'done' && (
             <Button
@@ -2012,7 +2044,7 @@ export const register: Register = (on, options) => {
               )
             })}
           {t.id && t.section !== 'done' && (
-            <Button key={k('flip')} plain hotkey="y" label={`Make it ${isHuman(t) ? 'T' : 'H'}${t.id.slice(1)}`} onPress={() => void flip($, t)} />
+            <Button key={k('flip')} plain hotkey="y" label={`Make it ${isHuman(t) ? 'T' : 'H'}${t.id.slice(1)}`} onPress={async () => (await focusOn(survivor(t)), refocus(await flip($, t)))} />
           )}
           {t.id && (t.section === 'todo' || t.section === 'doing') && (
             <Button key={k('realign')} plain hotkey="u" label="Realign" onPress={() => void realign($, t)} />
@@ -2196,7 +2228,11 @@ export const register: Register = (on, options) => {
               plain
               hotkey="v"
               label={`View: ${typeFilter === 'all' ? 'all' : typeFilter === 'T' ? "Claude's (T)" : 'mine (H)'}`}
-              onPress={() => void update($, typeFilterAtom, f => (f === 'all' ? 'T' : f === 'T' ? 'H' : 'all'))}
+              onPress={async () => {
+                const type: TypeFilter = typeFilter === 'all' ? 'T' : typeFilter === 'T' ? 'H' : 'all'
+                await filterTo({ ...filters, type }, hasHuman || type !== 'all' ? 'type-filter' : null)
+                await update($, typeFilterAtom, () => type)
+              }}
             />
           )}
           {(tagsOnBoard.length > 0 || tagFilter) && (
@@ -2205,7 +2241,11 @@ export const register: Register = (on, options) => {
               plain
               hotkey="4"
               label={`Tag: ${tagFilter ? `#${tagFilter}` : 'all'}`}
-              onPress={() => void setFlag($, 'tagFilter', nextTag())}
+              onPress={async () => {
+                const tag = nextTag()
+                await filterTo({ ...filters, tag }, 'tag-filter')
+                await setFlag($, 'tagFilter', tag)
+              }}
             />
           )}
           {(hasMarks || priorityFilter !== 'all') && (
@@ -2214,7 +2254,11 @@ export const register: Register = (on, options) => {
               plain
               hotkey="5"
               label={`Priority: ${priorityFilter === 'all' ? 'all' : priorityFilter === 2 ? 'normal' : `!${priorityFilter}`}`}
-              onPress={() => void setFlag($, 'priorityFilter', nextLevel())}
+              onPress={async () => {
+                const level = nextLevel()
+                await filterTo({ ...filters, level }, hasMarks || level !== 'all' ? 'priority-filter' : null)
+                await setFlag($, 'priorityFilter', level)
+              }}
             />
           )}
           {todo.length + doing.length > 0 && (
