@@ -99,11 +99,12 @@ type Task = {
 
 
 const SECTION_RE = /^##\s+(todo|doing|review|done)\s*$/i
-const TASK_RE = /^[-*]\s+(?:\[[ xX]\]\s+)?(.+)$/
+// `[^]`, not `.`: a title may hold U+2028, which `.` doesn't match.
+const TASK_RE = /^[-*]\s+(?:\[[ xX]\]\s+)?([^]+)$/
 // IDs up to 6 digits: a longer run is no ID, so a hostile file can't make
 // one node absurdly wide.
 // T- tasks are Claude's, H- tasks the engineer's; one number sequence for both.
-const ID_RE = /^([TH]-\d{1,6})\b[:.]?\s*(.*)$/
+const ID_RE = /^([TH]-\d{1,6})\b[:.]?\s*([^]*)$/
 const isHuman = (t: { id?: string }) => t.id?.startsWith('H-') === true
 // The most tasks one task can wait on; IDs past it are ignored.
 const MAX_DEPS = 50
@@ -433,7 +434,17 @@ async function readBoard<T>($: EngineInterface, file: string, fallback: T, at?: 
 // One line of plain text: control and format characters (newlines, escapes,
 // bidi marks) become spaces, runs of spaces one. Typed text is capped too, so
 // a paste can't add lines (a fake `## Done`) to TODO.md.
-const clean = (text: string) => text.replace(/[\p{Cc}\p{Cf}]+/gu, ' ').replace(/\s+/g, ' ').trim()
+const clean = (text: string) => text.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\s+/g, ' ').trim()
+// Board text as drawn (rows, notes, the status line, toasts): one clean line,
+// capped. The engine refuses a whole tree holding a control character, so
+// one hostile title would otherwise blank the panel.
+const MAX_SHOWN = 1000
+const UNSHOWN_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu
+const view = (text: string, max = MAX_SHOWN) => {
+  // Spaces inside are kept (a note may line things up); only the unshown go.
+  const line = (text.length > max * 4 ? text.slice(0, max * 4) : text).replace(UNSHOWN_RE, ' ').trim()
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line
+}
 const MAX_TYPED = 300
 const typed = (text: string) => clean(text).slice(0, MAX_TYPED)
 
@@ -546,7 +557,7 @@ async function showStatus($: EngineInterface) {
   const run = await read($, runAtom)
   const doing = tasks.filter(t => t.section === 'doing')
   const first = doing[0]
-  let text = first ? `▸ ${first.id ? `${first.id} ` : ''}${first.title}${doing.length > 1 ? ` (+${doing.length - 1})` : ''}` : undefined
+  let text = first ? `▸ ${first.id ? `${first.id} ` : ''}${view(first.title, 200)}${doing.length > 1 ? ` (+${doing.length - 1})` : ''}` : undefined
   if (run) {
     const waiting = parked(tasks).length
     const parts = [run.tasks.length ? `${run.tasks.length}/${runWorkers} workers` : 'idle', ...(waiting ? [`${waiting} wait on you`] : [])]
@@ -956,7 +967,7 @@ function enrichAll($: EngineInterface, n: number) {
 function warnUnmet($: EngineInterface, ts: Task[], tasks: Task[], alsoDone: Task[]) {
   const notes = ts.flatMap(t => {
     const unmet = unmetDeps(t, tasks).filter(d => !alsoDone.some(o => o.id === d))
-    return unmet.length ? [`${t.id ?? t.title} waits on ${unmet.join(', ')}`] : []
+    return unmet.length ? [`${t.id ?? view(t.title, 120)} waits on ${unmet.join(', ')}`] : []
   })
   if (notes.length) void $.ui.toast(`todo: ${notes.join('; ')}`)
 }
@@ -1340,7 +1351,11 @@ function cellChar(ch: string): string {
   const wide =
     (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
     (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6)
-  return c < 0x20 || (c >= 0x7f && c < 0xa0) || c > 0xffff || wide ? '?' : ch
+  // Only printable characters: letters, digits, punctuation, symbols and plain
+  // spaces (a format character such as U+202E or a soft hyphen makes Raster
+  // refuse the whole tree).
+  const printable = /^[\p{L}\p{N}\p{P}\p{S}\p{Zs}]$/u.test(ch)
+  return !printable || c < 0x20 || (c >= 0x7f && c < 0xa0) || c > 0xffff || wide ? '?' : ch
 }
 
 const fitCells = (text: string, width: number) => {
@@ -1735,7 +1750,7 @@ export const register: Register = (on, options) => {
     const hasRules = await read($, rulesAtom)
     const draft = await read($, draftAtom)
 
-    if (file.refused) return <Text color="yellow">{file.refused}.</Text>
+    if (file.refused) return <Text color="yellow">{view(file.refused)}.</Text>
     if (!file.exists) {
       return (
         <Box flexDirection="column">
@@ -1836,7 +1851,7 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" paddingLeft={4} key="detail">
         {renaming === t.key && Input && (
           <Box flexDirection="row" columnGap={2} key="rename-row">
-            <Input key={k('rename', true)} value={t.title} submitLabel="save" onSubmit={value => void rename($, t, value)} />
+            <Input key={k('rename', true)} value={view(t.title, MAX_TYPED)} submitLabel="save" onSubmit={value => void rename($, t, value)} />
             <Button key={k('rename-cancel')} plain label="Cancel" onPress={() => void update($, renamingAtom, () => null)} />
           </Box>
         )}
@@ -1858,7 +1873,7 @@ export const register: Register = (on, options) => {
         {t.notes.length === 0 && <Text dimColor>{t.id ? 'No notes.' : 'Not enriched yet.'}</Text>}
         {notes.map(n => (
           <Text dimColor={!/^[QA]:/i.test(n)} color={/^Q:/i.test(n) ? 'yellow' : undefined} wrap={folded ? 'truncate-end' : undefined}>
-            {n}
+            {view(n, 4000)}
           </Text>
         ))}
         {folded && <Text dimColor>+{t.notes.length - 1} more</Text>}
@@ -2009,12 +2024,12 @@ export const register: Register = (on, options) => {
               key={k(`task:${t.key}`, true)}
               plain
               dimColor={isDone}
-              label={`${marker} ${t.id ?? '·'} ${t.title}`}
+              label={`${marker} ${t.id ?? '·'} ${view(t.title)}`}
               onPress={() => void toggle(t)}
             >
               {`${marker} `}
               {t.id ? <Text color={SECTION_COLOR[t.section]}>{t.id}</Text> : <Text dimColor>·</Text>}
-              {` ${t.title}`}
+              {` ${view(t.title)}`}
             </Button>
             {t.priority === 1 && <Text color="red"> !1</Text>}
             {t.priority === 3 && <Text dimColor> !3</Text>}
@@ -2127,7 +2142,7 @@ export const register: Register = (on, options) => {
               key={k('mark')}
               plain
               hotkey="m"
-              label={`${isMarked(markTarget) ? 'Unmark' : 'Mark'} ${markTarget.id ?? markTarget.title}`}
+              label={`${isMarked(markTarget) ? 'Unmark' : 'Mark'} ${markTarget.id ?? view(markTarget.title, 60)}`}
               onPress={() => void toggleMark(markTarget)}
             />
           )}

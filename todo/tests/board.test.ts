@@ -1229,6 +1229,38 @@ test('the run prompt lists ready tasks by priority', async ($, on) => {
   expect(prompts[0]).toContain('Ready now, by priority, then board order: T-4, T-8, T-3, T-5.')
 })
 
+// A board whose T-3 and T-2 carry `title` (T-5 waits on T-3, so a graph shows).
+const hostileBoard = (title: string, note = 'fine') => `# TODO
+
+## Todo
+
+- T-3 ${title}
+  > ${note}
+- T-5 Next
+  > Depends: T-3
+
+## Doing
+
+- T-2 ${title}
+
+## Done
+`
+
+test('control and format characters in board text never blank the panel; the status line gets them cleaned', async ($, on) => {
+  const { ui, statuses } = await panel($, on, { 'TODO.md': hostileBoard('Fix \x1b[2J login now', 'see \x1b]0;pwn\x07 here') })
+  expect((await ui.find({ key: 'task:T-3' }))?.props.label).toBe('  T-3 Fix  [2J login now')
+  await ui.press({ key: 'task:T-3' })
+  expect(await ui.find({ text: 'see  ]0;pwn  here' })).toBeDefined()
+  expect(statuses.at(-1)).toBe('▸ T-2 Fix  [2J login now')
+})
+
+test('a format character or soft hyphen in a title draws as ? in the zoom-3 graph instead of breaking it', async ($, on) => {
+  mock.store(on, { 'graphZoom:/project': 3 })
+  const { ui } = await panel($, on, { 'TODO.md': hostileBoard('Fix ‮rob­ust') })
+  const text = rasterText(await ui.find({ key: 'graph-cells' }))
+  expect(text).toContain('Fix ?rob?ust')
+})
+
 test('a Depends line repeating one ID thousands of times draws one arrow, fast', async ($, on) => {
   // 8000 repeats: before, one draw took close to a minute.
   const board = `# TODO\n\n## Todo\n\n- T-1 base\n- T-2 mid\n  > Depends: T-1\n- T-3 top\n  > Depends: T-2, ${Array(8000).fill('T-1').join(', ')}\n  > Depends: T-1, T-2\n\n## Done\n`

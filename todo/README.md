@@ -50,6 +50,7 @@ To keep every board in one folder you can back up (a git repo of its own, say), 
 - A file it can't read is never overwritten as if it were missing.
 - Prompts it sends Claude name tasks by ID. A task without an ID is quoted as a one-line, capped title marked as data, never as an instruction.
 - Text typed into the panel is written as one clean line, and a very large dependency graph is not drawn.
+- Board text is drawn without its control and format characters (escapes, bidi marks, line separators), in the panel, the graph and the status line, so a hostile title can't blank the panel or reach the terminal.
 
 ## Commands
 
