@@ -261,7 +261,7 @@ test('/todo run asks Claude to orchestrate the ready tasks: T- in Todo, no open 
   expect(await run('run')($)).toMatchObject({ text: 'Asked Claude to run the board: 2 ready tasks.' })
   await new Promise<void>(resolve => setTimeout(resolve, 20))
   expect(prompts[0]).toMatch(
-    /^I started a long run of the board \(from the task panel or \/todo run\)\. Run the board in TODO\.md in long-running mode, following the task board rules \(Long run\): run branch run\/\d{4}-\d{2}-\d{2}-\d{4}, up to 2 workers at a time, a time cap of 60 minutes per task; don't wait for me between tasks\. Ready now, in board order: T-5, T-9\. Already running: T-2\.$/,
+    /^I started a long run of the board \(from the task panel or \/todo run\)\. Run the board in TODO\.md in long-running mode, following the task board rules \(Long run\): run branch run\/\d{4}-\d{2}-\d{2}-\d{4}, up to 2 workers at a time, a time cap of 60 minutes per task; don't wait for me between tasks\. Ready now, in board order: T-5, T-9\. In Doing from before this run, not part of it \(no worker slot\): T-2\.$/,
   )
 })
 
@@ -377,6 +377,37 @@ test('a long run keeps two workers busy, stops only the one past its cap, notifi
   await clock.advance(1600)
   expect(prompts).toHaveLength(3)
   expect(statuses.at(-1)).toBeUndefined()
+})
+
+test('tasks already in Doing when a run starts take no worker slot: the run still wakes and goes idle', async ($, on) => {
+  const clock = mock.clock(on)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
+  const before = '- T-2 Old task\n- T-3 Another old task\n'
+  const { prompts, notes, statuses, writeOutside } = project(on, { 'TODO.md': runBoardWith('- T-5 Later\n  > Q: Which?\n- T-9 Ready\n', before) }, { realClock: true })
+  await start($)
+  await clock.advance(1600)
+  await run('run')($)
+  await clock.advance(10)
+  expect(prompts[0]).toContain('Ready now, in board order: T-9.')
+  expect(prompts[0]).not.toContain('Already running')
+  expect(prompts[0]).toContain('In Doing from before this run, not part of it (no worker slot): T-2, T-3.')
+  // Claude starts T-9; then the engineer answers T-5: a slot is free, so the run wakes.
+  await turn($, 'start')
+  writeOutside('TODO.md', runBoardWith('- T-5 Later\n  > Q: Which?\n', `${before}- T-9 Ready\n`))
+  await turn($, 'complete')
+  await clock.advance(1600)
+  expect(statuses.at(-1)).toBe('▸ T-2 Old task (+2) · run: 1/2 workers · 1 wait on you')
+  writeOutside('TODO.md', runBoardWith('- T-5 Later\n  > Q: Which?\n  > A: This.\n', `${before}- T-9 Ready\n`))
+  await clock.advance(1600)
+  expect(prompts).toHaveLength(2)
+  expect(prompts[1]).toContain('Ready now, in board order: T-5.')
+  // Once T-9 and T-5 are in Review, the run goes idle though T-2 and T-3 stay in Doing.
+  await turn($, 'start')
+  await turn($, 'complete')
+  writeOutside('TODO.md', runBoardWith('', before, '- T-9 Ready\n- T-5 Later\n'))
+  await clock.advance(1600)
+  expect(notes).toContain('Run idle: nothing ready.')
 })
 
 test('a long run outlives its session: a new one picks it up on the same branch, only stop forgets it, and the stored run wins over a resumed one', async ($, on) => {

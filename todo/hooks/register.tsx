@@ -881,8 +881,12 @@ const runReady = (tasks: Task[], run: { tag?: string } | null) => {
 }
 // T- tasks in Todo waiting on an answer: parked.
 const parked = (tasks: Task[]) => tasks.filter(t => t.section === 'todo' && t.id && !isHuman(t) && t.question)
-// The T- tasks a run has in Doing: each one a worker's.
+// The T- tasks in Doing.
 const running = (tasks: Task[]) => tasks.filter(t => t.section === 'doing' && t.id && !isHuman(t))
+// The ones that are the run's: each a worker's. Tasks already in Doing when
+// the run started (`foreign`) aren't, while they stay there: they would
+// fill the worker slots and keep the run from ever waking or going idle.
+const runWorkersBusy = (tasks: Task[], run: { foreign?: string[] }) => running(tasks).filter(t => !(run.foreign ?? []).includes(t.id!))
 
 // What the board looked like when the run last woke Claude: it wakes again
 // only once this changes, so a wake that started nothing isn't repeated. A
@@ -907,13 +911,25 @@ const runBranch = () => {
 async function runBoard($: EngineInterface, ready: Task[], woken = false, tag?: string) {
   const tasks = parse(await current($))
   const run = await setRun($, r => ({
-    ...(r ?? { branch: runBranch(), tasks: [], workers: [], overCap: [], prompted: false, idleNotified: false, wokeAt: null, ...(tag ? { tag } : {}), ...seenNow(tasks) }),
+    ...(r ?? {
+      branch: runBranch(),
+      tasks: [],
+      workers: [],
+      overCap: [],
+      prompted: false,
+      idleNotified: false,
+      wokeAt: null,
+      foreign: running(tasks).map(t => t.id!),
+      ...(tag ? { tag } : {}),
+      ...seenNow(tasks),
+    }),
     prompted: true,
     idleNotified: false,
     wokeAt: boardShape(tasks, r ?? (tag ? { tag } : null)),
   }))
   await autoArchive($)
-  const busy = running(tasks).map(t => t.id)
+  const busy = runWorkersBusy(tasks, run!).map(t => t.id)
+  const before = (run!.foreign ?? []).filter(id => running(tasks).some(t => t.id === id))
   await ask(
     $,
     (woken
@@ -922,6 +938,7 @@ async function runBoard($: EngineInterface, ready: Task[], woken = false, tag?: 
       `Run the board in ${FILE} in long-running mode, following the task board rules (Long run): run branch ${run!.branch}, up to ${plural(runWorkers, 'worker')} at a time, ` +
       `a time cap of ${plural(runTaskMinutes, 'minute')} per task; don't wait for me between tasks. Ready now, ${ready.some(t => t.priority !== 2) ? 'by priority, then board order' : 'in board order'}: ${ready.map(t => t.id).join(', ')}.` +
       (busy.length ? ` Already running: ${busy.join(', ')}.` : '') +
+      (before.length ? ` In Doing from before this run, not part of it (no worker slot): ${before.join(', ')}.` : '') +
       (run!.tag ? ` This run takes only the tasks tagged #${run!.tag}.` : ''),
   )
 }
@@ -952,7 +969,9 @@ async function runTick($: EngineInterface) {
   if (!run) return
   const tasks = parse((await read($, fileAtom)).text)
   const now = await $.clock.now()
-  const busy = running(tasks)
+  // A task from before the run that left Doing is no longer set apart.
+  const foreign = (run.foreign ?? []).filter(id => running(tasks).some(t => t.id === id))
+  const busy = runWorkersBusy(tasks, { foreign })
   const timed = busy.map(t => run.tasks.find(o => o.id === t.id) ?? { id: t.id!, since: now })
   const overCap = timed.filter(t => now - t.since >= runTaskMinutes * 60_000).map(t => t.id)
   // A worker whose task left Doing is done.
@@ -968,7 +987,7 @@ async function runTick($: EngineInterface) {
     void notify($, seen.asked.length ? `Run idle: nothing ready. Waiting on you: ${seen.asked.join(', ')}.` : 'Run idle: nothing ready.')
   }
   // A run stopped meanwhile stays stopped.
-  const left = await setRun($, r => r && { ...r, ...seen, tasks: timed, workers, overCap, idleNotified: idle ? true : wake ? false : r.idleNotified })
+  const left = await setRun($, r => r && { ...r, ...seen, foreign, tasks: timed, workers, overCap, idleNotified: idle ? true : wake ? false : r.idleNotified })
   if (wake && left) await runBoard($, ready, true)
   await showStatus($)
 }

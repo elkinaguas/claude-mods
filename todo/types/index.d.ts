@@ -20,6 +20,8 @@ export type RunState = {
   wokeAt: string | null
   /** The tag the run is limited to, when started with /todo run #tag. */
   tag?: string
+  /** T- tasks already in Doing when the run started, not its workers' while they stay there. */
+  foreign?: string[]
 }
 
 declare module 'claude-code' {
