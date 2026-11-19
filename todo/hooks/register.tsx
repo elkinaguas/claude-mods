@@ -109,27 +109,38 @@ const isHuman = (t: { id?: string }) => t.id?.startsWith('H-') === true
 // The engineer's marks at the end of a task line, in any order: a priority
 // (`!1` now, `!3` someday; none or `!2` normal) and tags (`#upload`: a
 // lowercase letter, then letters, digits and `-`). A Done line's date comes
-// after them and stays in the title. Read word by word from the end, with no
-// regex that could backtrack over a hostile line; a line that is only marks
-// is a title.
+// after them and stays in the title. Read word by word from the end with an
+// index, each character looked at once (no regex over the line, no copy of
+// the rest per word), and at most MAX_MARKS words: a hostile line costs one
+// pass. A line that is only marks is a title.
 const MARK_WORD_RE = /^(?:![123]|#[a-z][a-z0-9-]{0,39})$/
 const DATE_TAIL_RE = /\((?:dropped )?\d{4}-\d{2}-\d{2}\)\s*$/
+const MAX_MARKS = 32
+const isBlank = (ch: string | undefined) => ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n'
 type Marks = { title: string; priority: Priority; tags: string[] }
 function splitMarks(text: string): Marks {
   const date = DATE_TAIL_RE.exec(text)
-  let rest = (date ? text.slice(0, date.index) : text).trimEnd()
+  const body = date ? text.slice(0, date.index) : text
+  // `end`: where the text still to read ends, trailing blanks skipped.
+  let end = body.length
+  while (end > 0 && isBlank(body[end - 1])) end--
   let priority: Priority | undefined
   const tags: string[] = []
-  for (;;) {
-    const cut = Math.max(rest.lastIndexOf(' '), rest.lastIndexOf('\t'))
-    const word = rest.slice(cut + 1)
-    const before = rest.slice(0, Math.max(0, cut)).trimEnd()
-    if (cut <= 0 || !before || !MARK_WORD_RE.test(word)) break
+  for (let n = 0; n < MAX_MARKS; n++) {
+    let from = end
+    while (from > 0 && !isBlank(body[from - 1])) from--
+    let before = from
+    while (before > 0 && isBlank(body[before - 1])) before--
+    // The word must be a mark, with a title before it.
+    if (from === 0 || before === 0 || end - from > 41) break
+    const word = body.slice(from, end)
+    if (!MARK_WORD_RE.test(word)) break
     if (word.startsWith('!')) priority ??= Number(word[1]) as Priority
     else if (!tags.includes(word.slice(1))) tags.unshift(word.slice(1))
-    rest = before
+    end = before
   }
-  return { title: date ? `${rest} ${date[0].trim()}` : rest.trim(), priority: priority ?? 2, tags }
+  const rest = body.slice(0, end).trim()
+  return { title: date ? `${rest} ${date[0].trim()}` : rest, priority: priority ?? 2, tags }
 }
 const priorityMark = (p: Priority) => (p === 2 ? '' : ` !${p}`)
 // The marks a line ends with: the priority, then the tags.

@@ -1332,12 +1332,13 @@ test('quick done keeps the tags before the date and drops the priority', async (
   expect(files['TODO.md']).toMatch(/## Done\n\n- T-3 Add retry to upload client #upload #release \(\d{4}-\d{2}-\d{2}\)\n/)
 })
 
-test('a hostile line of spaces and marks parses fast', async ($, on) => {
-  const line = `- T-3 x${' '.repeat(200_000)}y${' #a !1'.repeat(20_000)}`
+test('a hostile line of spaces and marks parses in one pass', async ($, on) => {
+  // 1.4 MB on one line: 400k spaces, then 200k marks (quadratic, this took minutes).
+  const line = `- T-3 x${' '.repeat(400_000)}y${' #a !1'.repeat(200_000)}`
   project(on, { 'TODO.md': BOARD.replace('- T-3 Add retry to upload client', line) })
   const t0 = Date.now()
   expect(await run('start #a')($)).toMatchObject({ text: 'Started 1 task tagged #a as one batch.' })
-  expect(Date.now() - t0).toBeLessThan(5000)
+  expect(Date.now() - t0).toBeLessThan(2000)
   // The batch it starts runs just after the command.
   await new Promise<void>(resolve => setTimeout(resolve, 50))
 })
